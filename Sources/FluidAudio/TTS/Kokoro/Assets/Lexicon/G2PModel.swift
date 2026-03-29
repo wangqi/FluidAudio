@@ -162,13 +162,32 @@ actor G2PModel {
 
     // MARK: - Private
 
+    // Returns the URL for an asset, preferring kokoroDir but falling back to the
+    // overrideCacheDirectory root when the app manages its own flat download layout
+    // (DownloadManagerCoreML places files at the override root, not in Models/kokoro/).
+    // wangqi modified 2026-03-29
+    private func resolveAssetURL(fileName: String, in kokoroDir: URL) -> URL {
+        let primary = kokoroDir.appendingPathComponent(fileName)
+        if FileManager.default.fileExists(atPath: primary.path) {
+            return primary
+        }
+        if let override = TtsModels.overrideCacheDirectory {
+            let fallback = override.appendingPathComponent(fileName)
+            if FileManager.default.fileExists(atPath: fallback.path) {
+                return fallback
+            }
+        }
+        return primary
+    }
+
     private func loadIfNeeded() throws {
         if graphemeToId != nil && encoder != nil && decoder != nil { return }
 
         let kokoroDir = try TtsModels.cacheDirectoryURL().appendingPathComponent("Models/kokoro")
 
-        // Load g2p_vocab.json from cache directory
-        let vocabURL = kokoroDir.appendingPathComponent(ModelNames.G2P.vocabularyFile)
+        // Load g2p_vocab.json — prefer Models/kokoro/, fall back to override root
+        // wangqi modified 2026-03-29
+        let vocabURL = resolveAssetURL(fileName: ModelNames.G2P.vocabularyFile, in: kokoroDir)
         guard FileManager.default.fileExists(atPath: vocabURL.path) else {
             throw G2PModelError.vocabLoadFailed("\(ModelNames.G2P.vocabularyFile) not found at \(vocabURL.path)")
         }
@@ -203,12 +222,13 @@ actor G2PModel {
 
         logger.info("Loaded G2P vocab (\(gMap.count) graphemes, \(pMap.count) phonemes)")
 
-        // Load CoreML models from cache directory
-        let encoderURL = kokoroDir.appendingPathComponent(ModelNames.G2P.encoderFile)
+        // Load CoreML models — prefer Models/kokoro/, fall back to override root
+        // wangqi modified 2026-03-29
+        let encoderURL = resolveAssetURL(fileName: ModelNames.G2P.encoderFile, in: kokoroDir)
         guard FileManager.default.fileExists(atPath: encoderURL.path) else {
             throw G2PModelError.modelLoadFailed("\(ModelNames.G2P.encoderFile) not found at \(encoderURL.path)")
         }
-        let decoderURL = kokoroDir.appendingPathComponent(ModelNames.G2P.decoderFile)
+        let decoderURL = resolveAssetURL(fileName: ModelNames.G2P.decoderFile, in: kokoroDir)
         guard FileManager.default.fileExists(atPath: decoderURL.path) else {
             throw G2PModelError.modelLoadFailed("\(ModelNames.G2P.decoderFile) not found at \(decoderURL.path)")
         }

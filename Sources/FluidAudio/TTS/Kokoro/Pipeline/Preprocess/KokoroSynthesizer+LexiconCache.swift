@@ -25,7 +25,17 @@ extension KokoroSynthesizer {
         func ensureLoaded(kokoroDirectory: URL, allowedTokens: Set<String>) async throws {
             if isLoaded && !caseSensitiveWordToPhonemes.isEmpty { return }
 
-            let cacheURL = kokoroDirectory.appendingPathComponent("us_lexicon_cache.json")
+            // Fall back to overrideCacheDirectory root when app manages its own flat download layout
+            // wangqi modified 2026-03-29
+            var cacheURL = kokoroDirectory.appendingPathComponent("us_lexicon_cache.json")
+            if !FileManager.default.fileExists(atPath: cacheURL.path),
+                let override = TtsModels.overrideCacheDirectory
+            {
+                let rootURL = override.appendingPathComponent("us_lexicon_cache.json")
+                if FileManager.default.fileExists(atPath: rootURL.path) {
+                    cacheURL = rootURL
+                }
+            }
             if await loadFromCache(cacheURL, allowedTokens: allowedTokens) {
                 return
             }

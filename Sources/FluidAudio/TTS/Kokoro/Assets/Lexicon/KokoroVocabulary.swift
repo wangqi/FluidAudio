@@ -25,7 +25,17 @@ public actor KokoroVocabulary {
     private func loadVocabulary() async throws {
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
-        let vocabURL = kokoroDir.appendingPathComponent("vocab_index.json")
+        // Fall back to overrideCacheDirectory root when app manages its own flat download layout
+        // wangqi modified 2026-03-29
+        var vocabURL = kokoroDir.appendingPathComponent("vocab_index.json")
+        if !FileManager.default.fileExists(atPath: vocabURL.path),
+            let override = TtsModels.overrideCacheDirectory
+        {
+            let rootURL = override.appendingPathComponent("vocab_index.json")
+            if FileManager.default.fileExists(atPath: rootURL.path) {
+                vocabURL = rootURL
+            }
+        }
 
         if !FileManager.default.fileExists(atPath: vocabURL.path) {
             logger.info("Vocabulary file not found in cache, downloading...")
