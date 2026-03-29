@@ -17,8 +17,15 @@ public enum PocketTtsResourceDownloader {
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> URL {
         let targetDir = try directory ?? cacheDirectory()
-        let modelsDirectory = targetDir.appendingPathComponent(
-            PocketTtsConstants.defaultModelsSubdirectory)
+        // When directory is provided externally, models are already there — skip Models/ subdirectory.
+        // When using default cache, append Models/ for standard FluidAudio layout.
+        // wangqi modified 2026-03-28
+        let modelsDirectory: URL
+        if directory != nil {
+            modelsDirectory = targetDir
+        } else {
+            modelsDirectory = targetDir.appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
+        }
 
         let repoDir = modelsDirectory.appendingPathComponent(Repo.pocketTts.folderName)
 
@@ -30,6 +37,16 @@ public enum PocketTtsResourceDownloader {
         }
 
         if !allPresent {
+            // Flat fallback: models may live directly in modelsDirectory (app download layout)
+            // wangqi modified 2026-03-28
+            let flatPresent = requiredModels.allSatisfy { model in
+                FileManager.default.fileExists(
+                    atPath: modelsDirectory.appendingPathComponent(model).path)
+            }
+            if flatPresent {
+                logger.info("PocketTTS models found in flat layout at \(modelsDirectory.path)")
+                return modelsDirectory
+            }
             logger.info("Downloading PocketTTS models from HuggingFace...")
             try await DownloadUtils.downloadRepo(.pocketTts, to: modelsDirectory, progressHandler: progressHandler)
         } else {

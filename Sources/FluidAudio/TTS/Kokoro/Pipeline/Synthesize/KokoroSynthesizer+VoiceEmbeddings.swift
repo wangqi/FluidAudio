@@ -83,7 +83,11 @@ extension KokoroSynthesizer {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 
         func resolveVector(for voiceID: String) throws -> ([Float]?, URL, Bool) {
-            let candidates = candidateVoiceEmbeddingURLs(for: voiceID, cwd: cwd, voicesDir: voicesDir)
+            var candidates = candidateVoiceEmbeddingURLs(for: voiceID, cwd: cwd, voicesDir: voicesDir)
+            // When overrideCacheDirectory is set, voice files may be at <cacheDir>/voices/ (flat download layout)
+            // rather than at Models/kokoro/voices/; add that path as a fallback.
+            // wangqi modified 2026-03-28
+            candidates.append(cacheDir.appendingPathComponent("voices/\(voiceID).json"))
             do {
                 let payload = try cachedVoiceEmbeddingPayload(for: voiceID, candidates: candidates)
                 let key = VoiceEmbeddingCacheKey(voiceID: voiceID, phonemeCount: phonemeCount)

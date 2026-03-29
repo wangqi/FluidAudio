@@ -31,7 +31,10 @@ let package = Package(
             path: "Sources/FluidAudio",
             exclude: [
                 "Frameworks"
-            ]
+            ],
+            // Build under Swift 5 language mode until strict concurrency issues are resolved
+            // wangqi modified 2026-03-24
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .target(
             name: "FastClusterWrapper",

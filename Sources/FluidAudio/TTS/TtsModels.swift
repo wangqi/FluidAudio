@@ -30,8 +30,15 @@ public struct TtsModels: Sendable {
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
         let targetDir = try directory ?? getCacheDirectory()
-        // Pass Models subdirectory so models end up in ~/.cache/fluidaudio/Models/kokoro/
-        let modelsDirectory = targetDir.appendingPathComponent(TtsConstants.defaultModelsSubdirectory)
+        // When directory is provided externally, models are already there — skip the Models/ subdirectory.
+        // When using default cache, append Models/ so models end up in ~/.cache/fluidaudio/Models/kokoro/
+        // wangqi modified 2026-03-28
+        let modelsDirectory: URL
+        if directory != nil {
+            modelsDirectory = targetDir
+        } else {
+            modelsDirectory = targetDir.appendingPathComponent(TtsConstants.defaultModelsSubdirectory)
+        }
         let targetVariants: [ModelNames.TTS.Variant] = {
             if let requested = requestedVariants, !requested.isEmpty {
                 return requested.sorted { $0.fileName < $1.fileName }
@@ -101,7 +108,17 @@ public struct TtsModels: Sendable {
         return cacheDirectory
     }
 
+    // Allow app code to redirect all TTS asset lookups to a custom directory (e.g. our download folder)
+    // instead of the default Library/Caches/fluidaudio path.
+    // wangqi modified 2026-03-28
+    public static var overrideCacheDirectory: URL?
+
     public static func cacheDirectoryURL() throws -> URL {
+        // Use app-supplied override if set; falls back to default fluidaudio cache
+        // wangqi modified 2026-03-28
+        if let override = overrideCacheDirectory {
+            return override
+        }
         return try getCacheDirectory()
     }
 

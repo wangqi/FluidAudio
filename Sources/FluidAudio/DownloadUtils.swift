@@ -174,12 +174,25 @@ public class DownloadUtils {
 
         let repoPath = directory.appendingPathComponent(repo.folderName)
         let requiredModels = ModelNames.getRequiredModelNames(for: repo, variant: variant)
+        // Flat layout fallback: when the app provides an external directory, models may live
+        // directly in `directory` rather than the default `directory/folderName/` subdirectory.
+        // wangqi modified 2026-03-28
         let allModelsExist = requiredModels.allSatisfy { model in
-            let modelPath = repoPath.appendingPathComponent(model)
-            return FileManager.default.fileExists(atPath: modelPath.path)
+            FileManager.default.fileExists(atPath: repoPath.appendingPathComponent(model).path)
+        }
+        var effectivePath = repoPath
+        var modelsAlreadyPresent = allModelsExist
+        if !allModelsExist {
+            let flatExists = requiredModels.allSatisfy { model in
+                FileManager.default.fileExists(atPath: directory.appendingPathComponent(model).path)
+            }
+            if flatExists {
+                effectivePath = directory
+                modelsAlreadyPresent = true
+            }
         }
 
-        if !allModelsExist {
+        if !modelsAlreadyPresent {
             logger.info("Models not found in cache at \(repoPath.path)")
             try await downloadRepo(repo, to: directory, variant: variant, progressHandler: progressHandler)
         } else {
@@ -194,7 +207,7 @@ public class DownloadUtils {
 
         var models: [String: MLModel] = [:]
         for (index, name) in modelNames.enumerated() {
-            let modelPath = repoPath.appendingPathComponent(name)
+            let modelPath = effectivePath.appendingPathComponent(name)
             guard FileManager.default.fileExists(atPath: modelPath.path) else {
                 throw CocoaError(
                     .fileNoSuchFile,

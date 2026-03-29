@@ -92,8 +92,18 @@ public enum Repo: String, CaseIterable {
         }
     }
 
+    // Allow app code to remap the local folder name for a repo (e.g. "FluidInference_parakeet-tdt-0.6b-v3-coreml"
+    // instead of the default "parakeet-tdt-0.6b-v3-coreml") so DownloadUtils finds files in our download folder.
+    // wangqi modified 2026-03-28
+    public static var overrideFolderNames: [Repo: String] = [:]
+
     /// Local folder name used for caching
     public var folderName: String {
+        // Check override first
+        // wangqi modified 2026-03-28
+        if let override = Repo.overrideFolderNames[self] {
+            return override
+        }
         switch self {
         case .kokoro:
             return "kokoro"

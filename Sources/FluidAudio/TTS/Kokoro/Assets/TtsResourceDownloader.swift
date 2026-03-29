@@ -33,8 +33,16 @@ public enum TtsResourceDownloader {
         let jsonFile = "\(voice).json"
         let jsonURL = voicesDir.appendingPathComponent(jsonFile)
 
-        // Skip if already cached
+        // Skip if already cached at standard path
         if FileManager.default.fileExists(atPath: jsonURL.path) {
+            return
+        }
+
+        // Also check flat voices dir relative to cacheDir (used when overrideCacheDirectory is set
+        // and voice files were downloaded to <cacheDir>/voices/ rather than Models/kokoro/voices/)
+        // wangqi modified 2026-03-28
+        let flatVoiceURL = cacheDir.appendingPathComponent("voices/\(jsonFile)")
+        if FileManager.default.fileExists(atPath: flatVoiceURL.path) {
             return
         }
 

@@ -127,11 +127,13 @@ public actor VadManager {
     ) async throws {
         let baseDirectory = directory ?? getDefaultBaseDirectory()
 
-        // Use DownloadUtils to load the model (handles downloading if needed)
+        // When directory is provided externally, models are already in baseDirectory — skip Models/.
+        // When using default app-support path, append Models/ for standard FluidAudio layout.
+        // wangqi modified 2026-03-28
         let models = try await DownloadUtils.loadModels(
             .vad,
             modelNames: Array(ModelNames.VAD.requiredModels),
-            directory: baseDirectory.appendingPathComponent("Models"),
+            directory: (directory != nil) ? baseDirectory : baseDirectory.appendingPathComponent("Models"),
             computeUnits: config.computeUnits,
             progressHandler: progressHandler
         )
