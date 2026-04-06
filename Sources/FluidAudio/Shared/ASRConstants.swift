@@ -27,8 +27,23 @@ public enum ASRConstants {
     /// Each encoder frame represents ~80ms of audio at 16kHz
     public static let samplesPerEncoderFrame: Int = melHopSize * encoderSubsampling  // 1280
 
+    /// Duration of one encoder frame in seconds (80ms)
+    public static let secondsPerEncoderFrame: Double = Double(samplesPerEncoderFrame) / Double(sampleRate)  // 0.08
+
     /// WER threshold for detailed error analysis in benchmarks
     public static let highWERThreshold: Double = 0.15
+
+    /// Punctuation token IDs (period, question mark, exclamation mark)
+    public static let punctuationTokens: [Int] = [7883, 7952, 7948]
+
+    /// Standard overlap in encoder frames (2.0s = 25 frames at 0.08s per frame)
+    public static let standardOverlapFrames: Int = 25
+
+    /// Minimum confidence score (for empty or very uncertain transcriptions)
+    public static let minConfidence: Float = 0.1
+
+    /// Maximum confidence score (perfect confidence)
+    public static let maxConfidence: Float = 1.0
 
     /// Calculate encoder frames from audio samples using proper ceiling division
     /// - Parameter samples: Number of audio samples

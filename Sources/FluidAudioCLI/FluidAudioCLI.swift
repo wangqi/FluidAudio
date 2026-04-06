@@ -66,6 +66,16 @@ struct FluidAudioCLI {
             await Qwen3TranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
         case "g2p-benchmark":
             await G2PBenchmark.run(arguments: Array(arguments.dropFirst(2)))
+        case "nemotron-benchmark":
+            await NemotronBenchmark.run(arguments: Array(arguments.dropFirst(2)))
+        case "nemotron-transcribe":
+            await NemotronTranscribe.run(arguments: Array(arguments.dropFirst(2)))
+        case "ctc-zh-cn-transcribe":
+            await CtcZhCnTranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
+        case "ctc-zh-cn-benchmark":
+            await CtcZhCnBenchmark.run(arguments: Array(arguments.dropFirst(2)))
+        case "ja-benchmark":
+            await JapaneseAsrBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "help", "--help", "-h":
             printUsage()
         default:
@@ -98,7 +108,14 @@ struct FluidAudioCLI {
                 sortformer-benchmark    Run Sortformer benchmark on AMI dataset
                 lseend                  Run LS-EEND diarization on a single file
                 lseend-benchmark        Run LS-EEND benchmark on AMI dataset
+                qwen3-benchmark         Run Qwen3 ASR benchmark
+                qwen3-transcribe        Transcribe using Qwen3 ASR
                 g2p-benchmark           Run multilingual G2P benchmark
+                nemotron-benchmark      Run Nemotron 0.6B streaming ASR benchmark
+                nemotron-transcribe     Transcribe custom audio files with Nemotron
+                ctc-zh-cn-transcribe    Transcribe Mandarin Chinese audio with Parakeet CTC
+                ctc-zh-cn-benchmark     Run CTC zh-CN benchmark on THCHS-30 dataset
+                ja-benchmark            Run Japanese ASR benchmark on JSUT/Common Voice
                 download                Download evaluation datasets
                 help                    Show this help message
 
@@ -122,6 +139,10 @@ struct FluidAudioCLI {
                 fluidaudio vad-analyze audio.wav --streaming
 
                 fluidaudio download --dataset ami-sdm
+
+                fluidaudio ja-benchmark --dataset jsut --samples 100
+
+                fluidaudio ja-benchmark --dataset cv-test --samples 500 --auto-download
             """
         )
     }

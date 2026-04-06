@@ -1,3 +1,4 @@
+import Accelerate
 @preconcurrency import CoreML
 import Foundation
 import OSLog
@@ -23,10 +24,20 @@ public struct TtsModels: Sendable {
         kokoroModels[variant]
     }
 
+    /// Downloads and compiles Kokoro CoreML models.
+    ///
+    /// - Parameters:
+    ///   - requestedVariants: Which model variants to download. Pass `nil` for all.
+    ///   - repo: HuggingFace repository to download from.
+    ///   - directory: Optional override for the cache directory.
+    ///   - computeUnits: CoreML compute units for model compilation. Defaults to `.all`.
+    ///     Use `.cpuAndGPU` on iOS 26+ to work around ANE compiler regressions.
+    ///   - progressHandler: Optional download progress callback.
     public static func download(
         variants requestedVariants: Set<ModelNames.TTS.Variant>? = nil,
         from repo: String = TtsConstants.defaultRepository,
         directory: URL? = nil,
+        computeUnits: MLComputeUnits = .all,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
         let targetDir = try directory ?? getCacheDirectory()
@@ -52,8 +63,7 @@ public struct TtsModels: Sendable {
             .kokoro,
             modelNames: modelNames,
             directory: modelsDirectory,
-            // Only a small fraction of the model can run on ANE, and compile time takes a long time because of the complicated arch
-            computeUnits: .cpuAndGPU,
+            computeUnits: computeUnits,
             variant: variantFilter,
             progressHandler: progressHandler
         )
@@ -169,12 +179,56 @@ public struct TtsModels: Sendable {
                 randomPhases[index] = NSNumber(value: Float(0))
             }
 
-            let features = try MLDictionaryFeatureProvider(dictionary: [
+            var inputDict: [String: Any] = [
                 "input_ids": inputIds,
                 "attention_mask": attentionMask,
                 "ref_s": refStyle,
                 "random_phases": randomPhases,
-            ])
+            ]
+
+            // Source noise only required for v2 models (macOS)
+            // v1 models (iOS) don't have this input
+            if model.modelDescription.inputDescriptionsByName["source_noise"] != nil {
+                let maxSeconds = variant.maxDurationSeconds
+                let noiseLength = TtsConstants.audioSampleRate * maxSeconds
+                let sourceNoise = try MLMultiArray(
+                    shape: [1, NSNumber(value: noiseLength), 9],
+                    dataType: .float16
+                )
+                // Generate random Float32 values and convert to Float16 using vImage
+                // This avoids direct Float16 usage which isn't available in all build configurations
+                let totalElements = noiseLength * 9
+                let floatBuffer = [Float](unsafeUninitializedCapacity: totalElements) { buffer, initializedCount in
+                    for i in 0..<totalElements {
+                        buffer[i] = Float.random(in: -1...1)
+                    }
+                    initializedCount = totalElements
+                }
+
+                let noisePointer = sourceNoise.dataPointer.bindMemory(to: UInt16.self, capacity: totalElements)
+
+                // Convert Float32 to Float16 (UInt16) using vImage
+                floatBuffer.withUnsafeBytes { floatBytes in
+                    var sourceBuffer = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: floatBytes.baseAddress!),
+                        height: 1,
+                        width: vImagePixelCount(totalElements),
+                        rowBytes: totalElements * MemoryLayout<Float>.stride
+                    )
+
+                    var destBuffer = vImage_Buffer(
+                        data: noisePointer,
+                        height: 1,
+                        width: vImagePixelCount(totalElements),
+                        rowBytes: totalElements * MemoryLayout<UInt16>.stride
+                    )
+
+                    vImageConvert_PlanarFtoPlanar16F(&sourceBuffer, &destBuffer, 0)
+                }
+                inputDict["source_noise"] = sourceNoise
+            }
+
+            let features = try MLDictionaryFeatureProvider(dictionary: inputDict)
 
             let options: MLPredictionOptions = optimizedPredictionOptions()
             _ = try await model.compatPrediction(from: features, options: options)

@@ -10,6 +10,10 @@ A guide to each CoreML model pipeline in FluidAudio.
 |-------|-------------|---------|
 | **Parakeet TDT v2** | Batch speech-to-text, English only (0.6B params). TDT architecture. | First ASR model added. |
 | **Parakeet TDT v3** | Batch speech-to-text, 25 European languages (0.6B params). Default ASR model. | Released after v2 to add multilingual support. |
+| **Parakeet TDT-CTC-110M** | Hybrid TDT-CTC batch model (110M params). 3.01% WER on LibriSpeech test-clean. 96.5x RTFx on M2 Mac. Fused preprocessor+encoder for reduced memory footprint. iOS compatible. | Smaller, faster alternative to v3 with competitive accuracy. |
+| **Parakeet CTC Japanese** | Batch speech-to-text, Japanese only (0.6B params). CTC architecture. 6.85% CER on JSUT dataset. 10.1x RTFx on M2 Mac. | First Japanese ASR model. Uses CTC greedy decoder. |
+| **Parakeet TDT Japanese** | Batch speech-to-text, Japanese only (0.6B params). TDT architecture. 6.85% CER on JSUT dataset. 10.8x RTFx on M2 Mac. Hybrid model (CTC preprocessor/encoder + TDT decoder/joint). | Alternative Japanese decoder using TDT for potentially better accuracy on complex speech. |
+| **Parakeet CTC Chinese** | Batch speech-to-text, Mandarin Chinese (0.6B params). CTC architecture. 8.37% mean CER on THCHS-30 dataset. Int8 encoder (0.55GB) or FP32 (1.1GB). | First Mandarin Chinese ASR model. Uses CTC greedy decoder. |
 
 TDT models process audio in chunks (~15s with overlap) as batch operations. Fast enough for dictation-style workflows. Not suitable for word-by-word live captions.
 
@@ -18,6 +22,7 @@ TDT models process audio in chunks (~15s with overlap) as batch operations. Fast
 | Model | Description | Context |
 |-------|-------------|---------|
 | **Parakeet EOU** | Streaming speech-to-text with end-of-utterance detection (120M params). Processes 160ms/320ms frames for true real-time results as the user speaks. | Added after TDT was released. Smaller model (120M vs 0.6B). |
+| **Nemotron Speech Streaming 0.6B** | RNNT streaming ASR with 4 chunk size variants (80ms, 160ms, 560ms, 1120ms). English-only (0.6B params). Int8 encoder quantization. Supports ultra-low latency (80ms chunks) to high accuracy (1120ms chunks). | Contributed by Muesli app developer. Larger model than EOU (0.6B vs 120M) with flexible latency tradeoffs. |
 
 ### Custom Vocabulary / Keyword Spotting
 
@@ -47,14 +52,14 @@ TDT models process audio in chunks (~15s with overlap) as batch operations. Fast
 | **Kokoro TTS** | Text-to-speech synthesis (82M params), 48 voices, minimal RAM usage on iOS. Generates all frames at once via flow matching over mel spectrograms + Vocos vocoder. Uses CoreML G2P model for phonemization. | First TTS backend added. |
 | **PocketTTS** | Second TTS backend (~155M params). Autoregressive frame-by-frame generation with dynamic audio chunking. No phoneme stage — works directly on text tokens. | Different tradeoffs: streaming-capable, simpler chunking, dynamic inputs & longer token counts |
 
-## Evaluated Models (Not Shipped)
+## Evaluated Models (Not Supported)
 
-Models we converted and tested but haven't shipped yet — either still in development or superseded by better approaches.
+Models we converted and tested but are not supported: too large for on-device deployment, limitations or superseded by better approaches.
 
 | Model | Status |
 |-------|--------|
-| **Nemotron Speech Streaming 0.6B** ([#254](https://github.com/FluidInference/FluidAudio/pull/254)) | Streaming model with 1.12s chunks. Not significantly faster or more accurate than existing Parakeet models: streaming (EOU) and batch (TDT) modes. |
-| **Qwen3-TTS** ([FluidAudio#290](https://github.com/FluidInference/FluidAudio/pull/290), [mobius#20](https://github.com/FluidInference/mobius/pull/20), [HF](https://huggingface.co/alexwengg/qwen3-tts-coreml)) | ~5.9GB CoreML is too large for on-device. Low upstream adoption (Qwen ASR CoreML model downloads). |
+| **KittenTTS** ([FluidAudio#409](https://github.com/FluidInference/FluidAudio/pull/409), [HF](https://huggingface.co/alexwengg/kittentts-coreml)) | Not supported due to inefficient espeak alternatives. Nano (15M) and Mini (82M) variants. |
+| **Qwen3-TTS** ([FluidAudio#290](https://github.com/FluidInference/FluidAudio/pull/290), [mobius#20](https://github.com/FluidInference/mobius/pull/20), [HF](https://huggingface.co/alexwengg/qwen3-tts-coreml)) | Now 1.1GB but too slow. Needs further testing. |
 | **Qwen3-ForcedAligner-0.6B** ([FluidAudio#315](https://github.com/FluidInference/FluidAudio/pull/315), [mobius#21](https://github.com/FluidInference/mobius/pull/21), [HF](https://huggingface.co/alexwengg/Qwen3-ForcedAligner-0.6B-Coreml)) | 5-model CoreML pipeline, large footprint. Low upstream adoption (Qwen ASR CoreML model downloads). |
 
 ## Model Sources
@@ -63,6 +68,10 @@ Models we converted and tested but haven't shipped yet — either still in devel
 |-------|-----------------|
 | Parakeet TDT v3 | [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) |
 | Parakeet TDT v2 | [FluidInference/parakeet-tdt-0.6b-v2-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v2-coreml) |
+| Parakeet TDT-CTC-110M | [FluidInference/parakeet-tdt-ctc-110m-coreml](https://huggingface.co/FluidInference/parakeet-tdt-ctc-110m-coreml) |
+| Parakeet CTC Japanese | [FluidInference/parakeet-ctc-0.6b-ja-coreml](https://huggingface.co/FluidInference/parakeet-ctc-0.6b-ja-coreml) |
+| Parakeet TDT Japanese | [FluidInference/parakeet-ctc-0.6b-ja-coreml](https://huggingface.co/FluidInference/parakeet-ctc-0.6b-ja-coreml) (hybrid: CTC preprocessor/encoder + TDT v2 decoder/joint) |
+| Parakeet CTC Chinese | [FluidInference/parakeet-ctc-0.6b-zh-cn-coreml](https://huggingface.co/FluidInference/parakeet-ctc-0.6b-zh-cn-coreml) |
 | Parakeet CTC 110M | [FluidInference/parakeet-ctc-110m-coreml](https://huggingface.co/FluidInference/parakeet-ctc-110m-coreml) |
 | Parakeet CTC 0.6B | [FluidInference/parakeet-ctc-0.6b-coreml](https://huggingface.co/FluidInference/parakeet-ctc-0.6b-coreml) |
 | Parakeet EOU | [FluidInference/parakeet-realtime-eou-120m-coreml](https://huggingface.co/FluidInference/parakeet-realtime-eou-120m-coreml) |
@@ -72,3 +81,4 @@ Models we converted and tested but haven't shipped yet — either still in devel
 | Sortformer | [FluidInference/diar-streaming-sortformer-coreml](https://huggingface.co/FluidInference/diar-streaming-sortformer-coreml) |
 | Kokoro TTS | [FluidInference/kokoro-82m-coreml](https://huggingface.co/FluidInference/kokoro-82m-coreml) |
 | PocketTTS | [FluidInference/pocket-tts-coreml](https://huggingface.co/FluidInference/pocket-tts-coreml) |
+| Nemotron Streaming | [FluidInference/nemotron-speech-streaming-en-0.6b-coreml](https://huggingface.co/FluidInference/nemotron-speech-streaming-en-0.6b-coreml) |

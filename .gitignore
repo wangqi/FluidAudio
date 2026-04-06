@@ -102,6 +102,8 @@ Resources/
 !Sources/FluidAudio/Resources/
 !Sources/FluidAudio/Resources/**
 scripts/
+!Scripts/parakeet_subset_benchmark.sh
+!Scripts/diarizer_subset_benchmark.sh
 Documentation/parakeet-tdt/
 docs/parakeet-tdt/
 

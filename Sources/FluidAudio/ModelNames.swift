@@ -7,9 +7,14 @@ public enum Repo: String, CaseIterable {
     case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
     case parakeetCtc110m = "FluidInference/parakeet-ctc-110m-coreml"
     case parakeetCtc06b = "FluidInference/parakeet-ctc-0.6b-coreml"
+    case parakeetCtcZhCn = "FluidInference/parakeet-ctc-0.6b-zh-cn-coreml"
+    case parakeetCtcJa = "FluidInference/parakeet-ctc-0.6b-ja-coreml"
+    case parakeetTdtJa = "FluidInference/parakeet-tdt-0.6b-ja-coreml"
     case parakeetEou160 = "FluidInference/parakeet-realtime-eou-120m-coreml/160ms"
     case parakeetEou320 = "FluidInference/parakeet-realtime-eou-120m-coreml/320ms"
     case parakeetEou1280 = "FluidInference/parakeet-realtime-eou-120m-coreml/1280ms"
+    case nemotronStreaming1120 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/1120ms"
+    case nemotronStreaming560 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/560ms"
     case diarizer = "FluidInference/speaker-diarization-coreml"
     case kokoro = "FluidInference/kokoro-82m-coreml"
     case sortformer = "FluidInference/diar-streaming-sortformer-coreml"
@@ -17,6 +22,8 @@ public enum Repo: String, CaseIterable {
     case pocketTts = "FluidInference/pocket-tts-coreml"
     case qwen3Asr = "FluidInference/qwen3-asr-0.6b-coreml/f32"
     case qwen3AsrInt8 = "FluidInference/qwen3-asr-0.6b-coreml/int8"
+    case multilingualG2p = "FluidInference/charsiu-g2p-byt5-coreml"
+    case parakeetTdtCtc110m = "FluidInference/parakeet-tdt-ctc-110m-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
@@ -31,12 +38,22 @@ public enum Repo: String, CaseIterable {
             return "parakeet-ctc-110m-coreml"
         case .parakeetCtc06b:
             return "parakeet-ctc-0.6b-coreml"
+        case .parakeetCtcZhCn:
+            return "parakeet-ctc-0.6b-zh-cn-coreml"
+        case .parakeetCtcJa:
+            return "parakeet-ctc-0.6b-ja-coreml"
+        case .parakeetTdtJa:
+            return "parakeet-tdt-0.6b-ja-coreml"
         case .parakeetEou160:
             return "parakeet-realtime-eou-120m-coreml/160ms"
         case .parakeetEou320:
             return "parakeet-realtime-eou-120m-coreml/320ms"
         case .parakeetEou1280:
             return "parakeet-realtime-eou-120m-coreml/1280ms"
+        case .nemotronStreaming1120:
+            return "nemotron-speech-streaming-en-0.6b-coreml/1120ms"
+        case .nemotronStreaming560:
+            return "nemotron-speech-streaming-en-0.6b-coreml/560ms"
         case .diarizer:
             return "speaker-diarization-coreml"
         case .kokoro:
@@ -51,6 +68,10 @@ public enum Repo: String, CaseIterable {
             return "qwen3-asr-0.6b-coreml/f32"
         case .qwen3AsrInt8:
             return "qwen3-asr-0.6b-coreml/int8"
+        case .multilingualG2p:
+            return "charsiu-g2p-byt5-coreml"
+        case .parakeetTdtCtc110m:
+            return "parakeet-tdt-ctc-110m-coreml"
         }
     }
 
@@ -63,12 +84,16 @@ public enum Repo: String, CaseIterable {
             return "FluidInference/parakeet-ctc-0.6b-coreml"
         case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return "FluidInference/parakeet-realtime-eou-120m-coreml"
+        case .nemotronStreaming1120, .nemotronStreaming560:
+            return "FluidInference/nemotron-speech-streaming-en-0.6b-coreml"
         case .sortformer:
             return "FluidInference/diar-streaming-sortformer-coreml"
         case .lseend:
             return "FluidInference/ls-eend-coreml"
         case .qwen3Asr, .qwen3AsrInt8:
             return "FluidInference/qwen3-asr-0.6b-coreml"
+        case .parakeetTdtCtc110m:
+            return "FluidInference/parakeet-tdt-ctc-110m-coreml"
         default:
             return "FluidInference/\(name)"
         }
@@ -87,6 +112,10 @@ public enum Repo: String, CaseIterable {
             return "f32"
         case .qwen3AsrInt8:
             return "int8"
+        case .nemotronStreaming1120:
+            return "nemotron_coreml_1120ms"
+        case .nemotronStreaming560:
+            return "nemotron_coreml_560ms"
         default:
             return nil
         }
@@ -113,14 +142,26 @@ public enum Repo: String, CaseIterable {
             return "parakeet-eou-streaming/320ms"
         case .parakeetEou1280:
             return "parakeet-eou-streaming/1280ms"
+        case .nemotronStreaming1120:
+            return "nemotron-streaming/1120ms"
+        case .nemotronStreaming560:
+            return "nemotron-streaming/560ms"
         case .sortformer:
             return "sortformer"
-        case .lseend:
-            return "ls-eend"
-        case .pocketTts:
-            return "pocket-tts"
+        case .parakeetCtc110m:
+            return "parakeet-ctc-110m-coreml"
+        case .parakeetCtc06b:
+            return "parakeet-ctc-0.6b-coreml"
+        case .parakeetCtcZhCn:
+            return "parakeet-ctc-zh-cn"
+        case .parakeetCtcJa:
+            return "parakeet-ctc-ja"
+        case .parakeetTdtJa:
+            return "parakeet-tdt-ja"
+        case .parakeetTdtCtc110m:
+            return "parakeet-tdt-ctc-110m"
         default:
-            return name
+            return name.replacingOccurrences(of: "-coreml", with: "")
         }
     }
 }
@@ -148,6 +189,7 @@ public enum ModelNames {
         public static let fbank = "FBank"
         public static let embedding = "Embedding"
         public static let pldaRho = "PldaRho"
+        public static let pldaParameters = "plda-parameters.json"
 
         public static let segmentationFile = segmentation + ".mlmodelc"
         public static let fbankFile = fbank + ".mlmodelc"
@@ -164,6 +206,7 @@ public enum ModelNames {
             fbankPath,
             embeddingPath,
             pldaRhoPath,
+            pldaParameters,
         ]
     }
 
@@ -173,6 +216,7 @@ public enum ModelNames {
         public static let encoder = "Encoder"
         public static let decoder = "Decoder"
         public static let joint = "JointDecision"
+        public static let ctcHead = "CtcHead"
 
         // Shared vocabulary file across all model versions
         public static let vocabularyFile = "parakeet_vocab.json"
@@ -181,6 +225,7 @@ public enum ModelNames {
         public static let encoderFile = encoder + ".mlmodelc"
         public static let decoderFile = decoder + ".mlmodelc"
         public static let jointFile = joint + ".mlmodelc"
+        public static let ctcHeadFile = ctcHead + ".mlmodelc"
 
         public static let requiredModels: Set<String> = [
             preprocessorFile,
@@ -189,8 +234,16 @@ public enum ModelNames {
             jointFile,
         ]
 
+        /// Required models for fused frontend (110m hybrid: preprocessor contains encoder)
+        public static let requiredModelsFused: Set<String> = [
+            preprocessorFile,
+            decoderFile,
+            jointFile,
+        ]
+
         /// Get vocabulary filename for specific model version
         public static func vocabulary(for repo: Repo) -> String {
+            // All Parakeet models use the same vocabulary file (format varies: dict for v2/v3, array for 110m)
             return vocabularyFile
         }
     }
@@ -209,6 +262,73 @@ public enum ModelNames {
         public static let requiredModels: Set<String> = [
             melSpectrogramPath,
             audioEncoderPath,
+        ]
+    }
+
+    /// CTC zh-CN model names (full pipeline: Preprocessor + Encoder + CTC Decoder)
+    public enum CTCZhCn {
+        public static let preprocessor = "Preprocessor"
+        public static let encoder = "Encoder-v2-int8"  // Default to int8 quantized version
+        public static let encoderFp32 = "Encoder-v1-fp32"
+        public static let decoder = "Decoder"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let encoderFp32File = encoderFp32 + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+
+        // Vocabulary JSON path
+        public static let vocabularyFile = "vocab.json"
+
+        // Download both encoder variants (int8 and fp32) so users can choose at runtime
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            encoderFile,  // int8 encoder
+            encoderFp32File,  // fp32 encoder
+            decoderFile,
+        ]
+    }
+
+    /// CTC ja (Japanese) model names (full pipeline: Preprocessor + Encoder + CTC Decoder)
+    public enum CTCJa {
+        public static let preprocessor = "Preprocessor"
+        public static let encoder = "Encoder"
+        public static let decoder = "CtcDecoder"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+
+        // Vocabulary JSON path
+        public static let vocabularyFile = "vocab.json"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            encoderFile,
+            decoderFile,
+        ]
+    }
+
+    /// TDT ja (Japanese) model names (hybrid model: CTC preprocessor/encoder + TDT decoder/joint v2)
+    /// NOTE: Uses parakeetCtcJa repo where v2 models are uploaded
+    public enum TDTJa {
+        public static let preprocessor = "Preprocessor"
+        public static let encoder = "Encoder"
+        public static let decoder = "Decoderv2"  // v2: newly converted TDT decoder (uploaded to CTC repo)
+        public static let joint = "Jointerv2"  // v2: newly converted TDT joint (uploaded to CTC repo)
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+        public static let jointFile = joint + ".mlmodelc"
+
+        public static let vocabularyFile = "vocab.json"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            encoderFile,
+            decoderFile,
+            jointFile,
         ]
     }
 
@@ -239,6 +359,34 @@ public enum ModelNames {
             decoderFile,
             jointFile,
             vocab,
+        ]
+    }
+
+    /// Nemotron Speech Streaming 0.6B model names
+    /// NVIDIA's streaming FastConformer RNNT with encoder cache
+    public enum NemotronStreaming {
+        public static let preprocessor = "preprocessor"
+        public static let encoder = "encoder"
+        public static let decoder = "decoder"
+        public static let joint = "joint"
+        public static let tokenizer = "tokenizer.json"
+        public static let metadata = "metadata.json"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+        public static let jointFile = joint + ".mlmodelc"
+
+        // Encoder in subdirectory (int8 quantized only)
+        public static let encoderInt8File = "encoder/encoder_int8.mlmodelc"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            encoderInt8File,
+            decoderFile,
+            jointFile,
+            tokenizer,
+            metadata,
         ]
     }
 
@@ -376,7 +524,7 @@ public enum ModelNames {
 
     /// Qwen3-ASR model names
     public enum Qwen3ASR {
-        public static let audioEncoderFile = "qwen3_asr_audio_encoder.mlmodelc"
+        public static let audioEncoderFile = "qwen3_asr_audio_encoder_v2.mlmodelc"
         public static let embeddingFile = "qwen3_asr_embedding.mlmodelc"
         public static let decoderStatefulFile = "qwen3_asr_decoder_stateful.mlmodelc"
         public static let decoderFullFile = "qwen3_asr_decoder_full.mlmodelc"
@@ -474,6 +622,7 @@ public enum ModelNames {
 
             /// Underlying model bundle filename.
             public var fileName: String {
+                // Use v1 models on all platforms - v2 has source_noise issues
                 switch self {
                 case .fiveSecond:
                     return "kokoro_21_5s.mlmodelc"
@@ -518,10 +667,20 @@ public enum ModelNames {
             return ModelNames.VAD.requiredModels
         case .parakeet, .parakeetV2:
             return ModelNames.ASR.requiredModels
+        case .parakeetTdtCtc110m:
+            return ModelNames.ASR.requiredModelsFused
         case .parakeetCtc110m, .parakeetCtc06b:
             return ModelNames.CTC.requiredModels
+        case .parakeetCtcZhCn:
+            return ModelNames.CTCZhCn.requiredModels
+        case .parakeetCtcJa:
+            return ModelNames.CTCJa.requiredModels
+        case .parakeetTdtJa:
+            return ModelNames.TDTJa.requiredModels
         case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return ModelNames.ParakeetEOU.requiredModels
+        case .nemotronStreaming1120, .nemotronStreaming560:
+            return ModelNames.NemotronStreaming.requiredModels
         case .diarizer:
             if variant == "offline" {
                 return ModelNames.OfflineDiarizer.requiredModels
@@ -550,6 +709,8 @@ public enum ModelNames {
             return ModelNames.LSEEND.requiredModels
         case .qwen3Asr, .qwen3AsrInt8:
             return ModelNames.Qwen3ASR.requiredModelsFull
+        case .multilingualG2p:
+            return ModelNames.MultilingualG2P.requiredModels
         }
     }
 }

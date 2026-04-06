@@ -17,6 +17,7 @@ public struct OfflineDiarizerModels: Sendable {
     private static func loadPLDAPsi(from directory: URL) throws -> [Double] {
         let candidatePaths = [
             directory.appendingPathComponent("plda-parameters.json", isDirectory: false),
+            directory.appendingPathComponent("speaker-diarization/plda-parameters.json", isDirectory: false),
             directory.appendingPathComponent("speaker-diarization-coreml/plda-parameters.json", isDirectory: false),
             directory.appendingPathComponent("speaker-diarization-offline/plda-parameters.json", isDirectory: false),
         ]
@@ -67,18 +68,11 @@ public struct OfflineDiarizerModels: Sendable {
     }
 
     public static func defaultModelsDirectory() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return
-            base
-            .appendingPathComponent("FluidAudio", isDirectory: true)
-            .appendingPathComponent("Models", isDirectory: true)
+        MLModelConfigurationUtils.defaultModelsDirectory()
     }
 
     private static func defaultConfiguration() -> MLModelConfiguration {
-        let configuration = MLModelConfiguration()
-        configuration.allowLowPrecisionAccumulationOnGPU = true
-        configuration.computeUnits = .all
-        return configuration
+        MLModelConfigurationUtils.defaultConfiguration(computeUnits: .all)
     }
 
     public static func load(

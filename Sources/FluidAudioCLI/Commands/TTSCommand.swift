@@ -379,7 +379,7 @@ public struct TTS {
                     // Load ASR models and initialize
                     let models = try await AsrModels.downloadAndLoad()
                     let asr = AsrManager()
-                    try await asr.initialize(models: models)
+                    try await asr.loadModels(models)
 
                     // Transcribe the generated audio file
                     let transcription = try await asr.transcribe(outURL)
@@ -395,7 +395,7 @@ public struct TTS {
                     logger.info(String(format: "WER: %.1f%%", werValue! * 100))
 
                     // Clean up ASR resources
-                    asr.cleanup()
+                    await asr.cleanup()
                 } catch {
                     logger.warning("ASR evaluation failed: \(error.localizedDescription)")
                 }
@@ -585,7 +585,7 @@ public struct TTS {
                 do {
                     let asrModels = try await AsrModels.downloadAndLoad()
                     let asr = AsrManager()
-                    try await asr.initialize(models: asrModels)
+                    try await asr.loadModels(asrModels)
 
                     let transcription = try await asr.transcribe(outURL)
                     asrHypothesis = transcription.text
@@ -598,7 +598,7 @@ public struct TTS {
                     logger.info("Hypothesis: \(transcription.text)")
                     logger.info(String(format: "WER: %.1f%%", werValue! * 100))
 
-                    asr.cleanup()
+                    await asr.cleanup()
                 } catch {
                     logger.warning("ASR evaluation failed: \(error.localizedDescription)")
                 }
