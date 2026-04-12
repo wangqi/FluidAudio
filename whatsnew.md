@@ -1,126 +1,128 @@
 # FluidAudio What's New
 
-## Upgrade: tag-20260403 → tag-20260406
+## Upgrade: tag-20260406 to tag-20260412
 
 ### New Features
 
-#### TTS: PocketTTS Session API (#471)
-`PocketTtsSession` is a new actor for long-running streaming TTS. Previous behavior paid the full
-voice prefill cost (~125 CoreML predictions) on every `synthesizeStreaming()` call, resetting Mimi
-decoder state between utterances, causing latency and audio discontinuity.
+#### ASR: Parallelized Batch Transcription, 2.2-2.8x Faster (#507)
+`AsrManager` now distributes independent audio chunks across a worker pool (default: 4 concurrent
+workers) for long-file transcription. Benchmarked on Apple M3 and iPhone SE 3:
 
-The session performs voice prefill **once** at creation and accepts streamed text via `enqueue()`.
-Each subsequent utterance only pays the text prefill cost. Mimi decoder state persists across
-utterances for seamless audio continuity. Cancellation is awaitable: `await session.cancel()`
-blocks until the Neural Engine is free, preventing inference loop stacking.
+| Model | Before | After | Speedup | Memory Delta |
+|---|---|---|---|---|
+| Parakeet TDT v2 | 31.84 s | 11.25 s | 2.83x | +21.4 MiB |
+| Parakeet TDT v3 | 31.37 s | 12.75 s | 2.46x | +31.0 MiB |
+| Parakeet TDT-CTC 110M | 19.89 s | 9.08 s | 2.19x | +19.7 MiB |
 
-`AudioFrame` now includes `utteranceIndex` for text synchronization on the consumer side.
+Concurrency is controlled by `ASRConfig.parallelChunkConcurrency` (default `4`). Transcript content
+and word timings are bit-identical to the serial path. This only affects batch (file) transcription;
+the streaming path is unchanged.
 
-#### ASR: Japanese CTC Model (#478)
-New `CtcJaManager` and `CtcJaModels` for Japanese speech recognition.
-- **Model**: `FluidInference/parakeet-ctc-0.6b-ja-coreml`
-- **Architecture**: 600M parameter CTC-only, 3,072 vocab SentencePiece tokens
-- **Accuracy**: 6.5% CER on JSUT basic5000, 13.3% on Mozilla Common Voice 16.1
-- **API**: Synchronous `transcribe(audio: [Float])` — model id `fa-parakeet-ctc-ja`
+**iOS note:** Peak RAM increases ~20-30 MiB per transcription session. The benchmark was run on
+iPhone SE 3, which has 4 GB RAM, so this is considered acceptable on modern iPhones.
 
-#### ASR: Mandarin Chinese CTC Model — Experimental (#476)
-New `CtcZhCnManager` and `CtcZhCnModels` for Mandarin Chinese speech recognition.
-- **Model**: `FluidInference/parakeet-ctc-0.6b-zh-cn-coreml` (int8: 571 MB, fp32: 1.1 GB)
-- **Accuracy**: 8.23% mean CER on THCHS-30 (2,495 samples), 14.83x RTFx
-- **API**: Synchronous `transcribe(audio: [Float])` — model id `fa-parakeet-ctc-zh-cn`
-- **Note**: Experimental — API and accuracy may change in future releases
+#### ASR: Nemotron Streaming with 160ms and 80ms Chunk Sizes (#490)
+Two finer-grained chunk size variants are now exposed in the public API via new `Repo` enum cases
+`.nemotronStreaming160` and `.nemotronStreaming80`:
 
-#### ASR: PunctuationCommitLayer (#466)
-New `PunctuationCommitLayer` actor wrapping any streaming ASR engine for smart text segmentation.
-Separates "committed" (finalized) text from "ghost" (speculative) text at sentence boundaries.
-- Commits at `.`, `!`, `?`; configurable debounce timeout behavior
-- Engine-agnostic: works with any `StreamingAsrManager`
-- Swift 6 actor-safe with Sendable types
+| Chunk | Latency | Use Case |
+|---|---|---|
+| 1120ms | 1.12s | Best accuracy (original) |
+| 560ms | 0.56s | Lower latency |
+| 160ms | 0.16s | Very low latency |
+| 80ms | 0.08s | Ultra-low latency |
 
-#### Diarizer: Embedding Skip Strategy (#480)
-New `EmbeddingSkipStrategy` opt-in for `OfflineDiarizerConfig`. Skips embedding model calls when
-consecutive segmentation windows have highly similar speaker masks (cosine similarity >= threshold).
+#### Diarizer: Custom Segment Activity Reporting (#493)
+`DiarizerTimeline` now supports a `DiarizerActivityType` enum with two modes:
+- `.sigmoids` (default): segment activity reported as mean probability score
+- `.logits`: segment activity reported as mean logit value (covariance-compatible)
 
-- **Recommended threshold**: 0.95 (benchmarked across VoxConverse, SCOTUS, Earnings-21)
-- **Speedup at higher overlap** (stepRatio=0.15): up to **2.29x** on 74-min SCOTUS audio
-- **Zero quality loss**: identical DER across all test corpora
-- **Default**: `.none` — opt-in only, backward compatible
+Useful for applications that need raw logits for downstream analytics.
 
 ---
 
 ### Bug Fixes
 
-#### iOS: Kokoro Compute Units for iOS 26 ANE Regression (#482)
-iOS 26 beta ANE compiler regression causes Kokoro models to fail with
-`Cannot retrieve vector from IRValue format int32`. Fix: `KokoroTtsManager(computeUnits: .cpuAndGPU)`
-bypasses the ANE on iOS 26+. Default remains `.all` for iOS 17-18.
-
-**Our implementation already uses `.cpuOnly`** (different fix for the BNNS warm-up crash on device),
-which also sidesteps this regression. No code change required.
-
-#### TTS: Kokoro Audio Trimming Fixed (#447)
-All platforms now use v1 models (was: macOS used v2 fp16). v2 models had broken `audio_length_samples`
-output (always returns 0), causing 5-second silent padding. Fix: compute audio length from `pred_dur`
-output (sum(pred_dur) * 600 samples/frame). "Hello world" now correctly generates 1.5s audio.
-
-#### ASR: Use-After-Free Crash on Concurrent Transcription (#473)
-`resetDecoderState()` was resetting **both** mic and system decoder states. When mic+system transcribed
-concurrently, whichever finished first freed the other's in-flight `MLMultiArray` objects, causing
-`EXC_BAD_ACCESS` in the autorelease pool. Fix: `resetDecoderState(for: source)` resets only the
-completed source's state. Critical for meeting recorder scenarios.
-
-#### ASR: EOU 320ms Frame Count (#444)
-`StreamingEouAsrManager` with 320ms chunks produced 63 frames instead of 64, causing shape
-mismatches. Fix: updated mel spectrogram formula to account for nFFT/2 center padding, matching
-NeMo's computation. Our streaming ASR uses 320ms chunks as its first preference — this fix is
-directly applicable.
-
-#### ASR: Cancellation No Longer Triggers Error Recovery (#481)
-`SlidingWindowAsrManager.processWindow()` previously triggered decoder reset and model re-download
-when the task was intentionally cancelled. Fixed by guarding catch sites against `CancellationError`.
+#### ASR: Japanese CTC Model Fails to Load After Download (#516)
+`AsrModels.load()` and `AsrModels.download()` previously accepted CTC-only model versions
+(`.ctcJa`, `.ctcZhCn`) and downloaded correctly, but then failed at load time with a cryptic
+"Model file not found: Decoder.mlmodelc" error (TDT decoder name, not CTC). Both methods now
+reject these versions immediately with a clear error: "CTC-only model .ctcJa must be loaded via
+CtcJaManager, not AsrModels."
 
 ---
 
-### Architecture Changes
+### Refactors and Breaking Changes
 
-#### Breaking API: `AsrManager.initialize(models:)` → `loadModels(_:)` (#468)
-**Impact on our code**: `FluidAudioASR.swift` line 158 must change from
-`try await mgr.initialize(models: models)` to `try await mgr.loadModels(models)`.
+#### BREAKING: `Repo.parakeetCtcJa` Renamed to `Repo.parakeetJa` (#520)
+The HuggingFace repository `FluidInference/parakeet-ctc-0.6b-ja-coreml` contains both CTC and TDT
+v2 models, so the name `parakeetCtcJa` was misleading. Renamed to `parakeetJa`. The separate
+`parakeetTdtJa` case (which previously pointed to a non-existent separate TDT repo) was removed;
+both Japanese CTC and TDT models now resolve to `parakeetJa`.
 
-#### ASR Architecture Cleanup and Renames (#468, #440)
-- `StreamingAsrManager` protocol → `SlidingWindowAsrManager` (no impact — we use concrete types)
-- `EouStreamingAsrManager` → `StreamingEouAsrManager` (already updated in our code)
-- `AsrManager.resetState()` → `reset()` (we do not call this directly)
-- Directory reorganized into `Parakeet/` and `Qwen3/` families
+**Action required:** Any call site using `Repo.overrideFolderNames[.parakeetCtcJa]` must change
+`.parakeetCtcJa` to `.parakeetJa`.
 
-#### Dependency: swift-transformers Removed (#449)
-Replaced with a 145-line minimal BPE tokenizer. Eliminates dependency conflict with WhisperKit.
-No functional change to our usage.
+#### Standardized Model Loading API Across All ASR Managers (#506)
+All ASR managers now share a consistent API surface:
+
+```swift
+manager.loadModels(from: URL)                      // Load from local directory
+manager.loadModels(_ models: PreloadedModels)       // Use pre-loaded models
+manager.loadModels(to: URL?, progressHandler:)      // Download then load
+```
+
+| Manager | Old | New |
+|---|---|---|
+| `AsrManager` | `configure(models:)` | `loadModels(_:)` (deprecated old name) |
+| `SlidingWindowAsrManager` | `start()` | `startStreaming()` with model loading separated |
+| `StreamingEouAsrManager` | `loadModelsFromHuggingFace()` | `loadModels(from:)` |
+| `StreamingNemotronAsrManager` | `loadModels(modelDir:)` | `loadModels(from:)` |
+
+Our code already uses `mgr.loadModels(models)` (introduced at tag-20260406). No change needed.
+
+#### File Reorganization: Batch Managers Moved into SlidingWindow/ (#502)
+24 source files and 10 test files reorganized under `SlidingWindow/`:
+```
+SlidingWindow/
+├── SlidingWindowAsrManager.swift   (public API)
+├── TDT/                            (AsrManager, TdtJaManager, Decoder/)
+└── CTC/                            (CtcJaManager, CtcZhCnManager)
+```
+Internal reorganization only. Public API and our calling code unaffected.
+
+#### Language Model Files Deduplicated (#492)
+`CtcJaModels`, `CtcZhCnModels`, `TdtJaModels` refactored from ~250 lines each into a shared
+`ParakeetLanguageModels<Config>` generic with a `ParakeetLanguageModelConfig` protocol. Each
+language file is now ~22 lines (config + typealias). No API change for callers.
+
+#### `AudioConverter` Now `Sendable` (#505)
+Swift 6 concurrency conformance. No behavior change.
 
 ---
 
-### Upgrade Risk Assessment
+### Documentation
 
-| Area | Risk | Notes |
-|------|------|-------|
-| `AsrManager.loadModels(_:)` API rename | **High** — build error | Must update `FluidAudioASR.swift` |
-| Kokoro audio trimming (v1 models) | Low | Audio quality improvement; v1 models our Kokoro already used |
-| Concurrent transcription crash fix | Low | We don't use concurrent mic+system |
-| EOU 320ms frame count fix | Low-Medium | We try 320ms first; this is a correctness fix |
-| CTC JA/ZH-CN new managers | None | Additive; opt-in by model ID |
-| PocketTTS session API | None | Additive; new API alongside existing `synthesize()` |
-| Diarizer skip strategy | None | Additive opt-in |
-| swift-transformers removal | None | Package dependency change only |
+- Diarization pipeline version distinction clarified: online/streaming uses Pyannote 3.1;
+  offline batch uses Pyannote Community-1.
+- ASR API reference completed and reorganized under `Documentation/`.
 
 ---
 
-### New Speakers/ASR/VAD Needed?
+### Upgrade Risk Assessment for Privacy AI
 
-**Do not create new dedicated Speaker/ASR/VAD classes.** The new models integrate into existing classes:
+| Change | Risk | Action |
+|---|---|---|
+| `Repo.parakeetCtcJa` → `Repo.parakeetJa` | **High** — build error without fix | Update `FluidAudioASR.swift` line 186 |
+| Parallel batch transcription (+20-30 MiB RAM) | Low | Automatic improvement, no code change |
+| Standardized loading API | None | Our code already uses the new form |
+| File reorganization | None | Internal; public API stable |
+| Language model deduplication | None | No caller-visible change |
+| Nemotron 160ms/80ms chunk sizes | None | New option; not yet integrated |
+| Diarizer activity type | None | Advanced opt-in feature |
 
-1. **Japanese ASR** → `FluidAudioASR` (add `fa-parakeet-ctc-ja` model ID via `CtcJaManager`)
-2. **Mandarin ASR** → `FluidAudioASR` (add `fa-parakeet-ctc-zh-cn` model ID via `CtcZhCnManager`)
-3. **PocketTTS sessions** → `FluidAudioPocketTTSSpeaker` (optional streaming upgrade)
-4. **Diarizer skip strategy** → `FluidAudioDiarizer` (performance opt-in for offline mode)
+### New Speakers/ASR/VAD/Diarizer Classes Needed?
 
-No new speaker, ASR, VAD, or diarizer classes are warranted by this upgrade.
+No new classes are required for this upgrade. The existing classes cover all new functionality:
+- Nemotron 160ms/80ms → can be added to `FluidAudioASR` if Nemotron streaming is integrated
+- Diarizer activity type → opt-in via `DiarizerActivityType` on the existing `FluidAudioDiarizer`
