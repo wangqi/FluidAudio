@@ -35,14 +35,14 @@ Want to convert your own model? Check [möbius](https://github.com/FluidInferenc
 
 ## Highlights
 
-- **Automatic Speech Recognition (ASR)**: Parakeet TDT v3 (0.6b) for batch transcription supporting 25 European languages; Parakeet EOU (120m) for streaming ASR with end-of-utterance detection (English only)
+- **Automatic Speech Recognition (ASR)**: [Parakeet TDT v3](Documentation/Models.md#batch-transcription-near-real-time) (0.6b) and other TDT/CTC models for batch transcription supporting 25 European languages, Japanese, and Chinese; [Parakeet EOU](Documentation/Models.md#streaming-transcription-true-real-time) (120m) for streaming ASR with end-of-utterance detection (English only). See all [ASR models](Documentation/Models.md#asr-models).
 - **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs)
 - **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (English only)
 - **Speaker Diarization (Online + Offline)**: Speaker separation and identification across audio streams. Streaming pipeline for real-time processing and offline batch pipeline with advanced clustering.
 - **Speaker Embedding Extraction**: Generate speaker embeddings for voice comparison and clustering, you can use this for speaker identification
 - **Voice Activity Detection (VAD)**: Voice activity detection with Silero models
 - **Apple Neural Engine**: Models run efficiently on Apple's ANE for maximum performance with minimal power consumption
-- **Open-Source Models**: All models are publicly available on HuggingFace — converted and optimized by our team; permissive licenses
+- **Open-Source Models**: All models are publicly available on HuggingFace — converted and optimized by our team; permissive licenses. See [full model catalog](Documentation/Models.md).
 
 ## Video Demos
 
@@ -100,6 +100,7 @@ Make a PR if you want to add your app, please keep it in chronological order.
 | **[VivaDicta](https://github.com/n0an/VivaDicta)** | Open-source iOS voice-to-text app with system-wide AI voice keyboard — dictate and AI-process text in any app. 15+ AI providers, 40+ AI presets. Uses Parakeet ASR. |
 | **[MimicScribe](https://mimicscribe.app/)** | macOS menu bar app combining Parakeet TDT streaming ASR, PyanNote Community 1 speaker diarization, and cloud LLMs to provide AI-generated talking points during meetings, derived from the live transcript and user-provided instructions. Features meeting summarization, natural language search, an MCP server for agent integration, and a keyboard- and voice-forward UI. |
 | **[Action Phrase](https://actionphrase.com/)** | Voice-controlled live production app for iOS, iPadOS, and macOS. Control cameras, graphics, layouts, and production workflows with natural voice commands. Integrates with popular tools including OBS, vMix, ProPresenter, Bitfocus Companion, and more. Uses Parakeet TDT ASR and Sortformer diarization. |
+| **[Sayboard](https://github.com/stanlsv/sayboard)** | Privacy-first AI voice keyboard for iOS. Local models, no servers, no tracking, no subscriptions, no ads, no in-app purchases. Fully offline and open-source. |
 
 ## Installation
 
@@ -372,7 +373,7 @@ Both LS-EEND and Sortformer emit results into a `DiarizerTimeline` with ultra-lo
 
 ### Streaming/Online Speaker Diarization (Pyannote)
 
-This pipeline uses segmentation plus speaker embeddings and is the third choice behind LS-EEND and Sortformer. It can be useful if you specifically want the classic multi-stage pipeline, but it is much slower than LS-EEND or Sortformer for live diarization.
+Pyannote 3.1 pipeline (segmentation + WeSpeaker embeddings) for online/streaming diarization. This is the third choice behind LS-EEND and Sortformer. It can be useful if you specifically want the classic multi-stage pipeline, but it is much slower than LS-EEND or Sortformer for live diarization.
 
 Why use the WeSpeaker/Pyannote pipeline:
 - More modular pipeline if you want separate segmentation and embedding stages

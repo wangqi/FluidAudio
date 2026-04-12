@@ -20,8 +20,8 @@ public enum AsrModelVersion: Sendable {
         case .v3: return .parakeet
         case .tdtCtc110m: return .parakeetTdtCtc110m
         case .ctcZhCn: return .parakeetCtcZhCn
-        case .ctcJa: return .parakeetCtcJa
-        case .tdtJa: return .parakeetCtcJa  // TDT v2 models uploaded to CTC repo
+        case .ctcJa: return .parakeetJa
+        case .tdtJa: return .parakeetJa  // Both CTC and TDT models in same repo
         }
     }
 
@@ -180,6 +180,24 @@ extension AsrModels {
         version: AsrModelVersion = .v3,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> AsrModels {
+        // Validate that CTC-only models use their dedicated managers
+        if version.isCtcOnly {
+            switch version {
+            case .ctcJa:
+                throw AsrModelsError.loadingFailed(
+                    "CTC-only model .ctcJa must be loaded via CtcJaManager, not AsrModels"
+                )
+            case .ctcZhCn:
+                throw AsrModelsError.loadingFailed(
+                    "CTC-only model .ctcZhCn must be loaded via CtcZhCnManager, not AsrModels"
+                )
+            default:
+                throw AsrModelsError.loadingFailed(
+                    "CTC-only models must be loaded via their dedicated manager classes"
+                )
+            }
+        }
+
         logger.info("Loading ASR models from: \(directory.path)")
 
         let config = configuration ?? defaultConfiguration()
@@ -402,6 +420,24 @@ extension AsrModels {
         version: AsrModelVersion = .v3,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> URL {
+        // Validate that CTC-only models use their dedicated managers
+        if version.isCtcOnly {
+            switch version {
+            case .ctcJa:
+                throw AsrModelsError.downloadFailed(
+                    "CTC-only model .ctcJa must be downloaded via CtcJaModels, not AsrModels"
+                )
+            case .ctcZhCn:
+                throw AsrModelsError.downloadFailed(
+                    "CTC-only model .ctcZhCn must be downloaded via CtcZhCnModels, not AsrModels"
+                )
+            default:
+                throw AsrModelsError.downloadFailed(
+                    "CTC-only models must be downloaded via their dedicated model classes"
+                )
+            }
+        }
+
         let targetDir = directory ?? defaultCacheDirectory(for: version)
         logger.info("Downloading ASR models to: \(targetDir.path)")
         let parentDir = targetDir.deletingLastPathComponent()
@@ -533,11 +569,6 @@ extension AsrModels {
 
     public static func defaultCacheDirectory(for version: AsrModelVersion = .v3) -> URL {
         MLModelConfigurationUtils.defaultModelsDirectory(for: version.repo)
-    }
-
-    // Legacy method for backward compatibility
-    public static func defaultCacheDirectory() -> URL {
-        return defaultCacheDirectory(for: .v3)
     }
 }
 

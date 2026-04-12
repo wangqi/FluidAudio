@@ -1,20 +1,21 @@
 import Foundation
 
 /// Model repositories on HuggingFace
-public enum Repo: String, CaseIterable {
+public enum Repo: String, CaseIterable, Sendable {
     case vad = "FluidInference/silero-vad-coreml"
     case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
     case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
     case parakeetCtc110m = "FluidInference/parakeet-ctc-110m-coreml"
     case parakeetCtc06b = "FluidInference/parakeet-ctc-0.6b-coreml"
     case parakeetCtcZhCn = "FluidInference/parakeet-ctc-0.6b-zh-cn-coreml"
-    case parakeetCtcJa = "FluidInference/parakeet-ctc-0.6b-ja-coreml"
-    case parakeetTdtJa = "FluidInference/parakeet-tdt-0.6b-ja-coreml"
+    case parakeetJa = "FluidInference/parakeet-ctc-0.6b-ja-coreml"  // Contains both CTC and TDT models
     case parakeetEou160 = "FluidInference/parakeet-realtime-eou-120m-coreml/160ms"
     case parakeetEou320 = "FluidInference/parakeet-realtime-eou-120m-coreml/320ms"
     case parakeetEou1280 = "FluidInference/parakeet-realtime-eou-120m-coreml/1280ms"
     case nemotronStreaming1120 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/1120ms"
     case nemotronStreaming560 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/560ms"
+    case nemotronStreaming160 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/160ms"
+    case nemotronStreaming80 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/80ms"
     case diarizer = "FluidInference/speaker-diarization-coreml"
     case kokoro = "FluidInference/kokoro-82m-coreml"
     case sortformer = "FluidInference/diar-streaming-sortformer-coreml"
@@ -40,10 +41,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-ctc-0.6b-coreml"
         case .parakeetCtcZhCn:
             return "parakeet-ctc-0.6b-zh-cn-coreml"
-        case .parakeetCtcJa:
+        case .parakeetJa:
             return "parakeet-ctc-0.6b-ja-coreml"
-        case .parakeetTdtJa:
-            return "parakeet-tdt-0.6b-ja-coreml"
         case .parakeetEou160:
             return "parakeet-realtime-eou-120m-coreml/160ms"
         case .parakeetEou320:
@@ -54,6 +53,10 @@ public enum Repo: String, CaseIterable {
             return "nemotron-speech-streaming-en-0.6b-coreml/1120ms"
         case .nemotronStreaming560:
             return "nemotron-speech-streaming-en-0.6b-coreml/560ms"
+        case .nemotronStreaming160:
+            return "nemotron-speech-streaming-en-0.6b-coreml/160ms"
+        case .nemotronStreaming80:
+            return "nemotron-speech-streaming-en-0.6b-coreml/80ms"
         case .diarizer:
             return "speaker-diarization-coreml"
         case .kokoro:
@@ -84,7 +87,7 @@ public enum Repo: String, CaseIterable {
             return "FluidInference/parakeet-ctc-0.6b-coreml"
         case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return "FluidInference/parakeet-realtime-eou-120m-coreml"
-        case .nemotronStreaming1120, .nemotronStreaming560:
+        case .nemotronStreaming1120, .nemotronStreaming560, .nemotronStreaming160, .nemotronStreaming80:
             return "FluidInference/nemotron-speech-streaming-en-0.6b-coreml"
         case .sortformer:
             return "FluidInference/diar-streaming-sortformer-coreml"
@@ -116,6 +119,10 @@ public enum Repo: String, CaseIterable {
             return "nemotron_coreml_1120ms"
         case .nemotronStreaming560:
             return "nemotron_coreml_560ms"
+        case .nemotronStreaming160:
+            return "nemotron_coreml_160ms"
+        case .nemotronStreaming80:
+            return "nemotron_coreml_80ms"
         default:
             return nil
         }
@@ -146,6 +153,10 @@ public enum Repo: String, CaseIterable {
             return "nemotron-streaming/1120ms"
         case .nemotronStreaming560:
             return "nemotron-streaming/560ms"
+        case .nemotronStreaming160:
+            return "nemotron-streaming/160ms"
+        case .nemotronStreaming80:
+            return "nemotron-streaming/80ms"
         case .sortformer:
             return "sortformer"
         case .parakeetCtc110m:
@@ -154,10 +165,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-ctc-0.6b-coreml"
         case .parakeetCtcZhCn:
             return "parakeet-ctc-zh-cn"
-        case .parakeetCtcJa:
+        case .parakeetJa:
             return "parakeet-ctc-ja"
-        case .parakeetTdtJa:
-            return "parakeet-tdt-ja"
         case .parakeetTdtCtc110m:
             return "parakeet-tdt-ctc-110m"
         default:
@@ -673,13 +682,11 @@ public enum ModelNames {
             return ModelNames.CTC.requiredModels
         case .parakeetCtcZhCn:
             return ModelNames.CTCZhCn.requiredModels
-        case .parakeetCtcJa:
+        case .parakeetJa:
             return ModelNames.CTCJa.requiredModels
-        case .parakeetTdtJa:
-            return ModelNames.TDTJa.requiredModels
         case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return ModelNames.ParakeetEOU.requiredModels
-        case .nemotronStreaming1120, .nemotronStreaming560:
+        case .nemotronStreaming1120, .nemotronStreaming560, .nemotronStreaming160, .nemotronStreaming80:
             return ModelNames.NemotronStreaming.requiredModels
         case .diarizer:
             if variant == "offline" {

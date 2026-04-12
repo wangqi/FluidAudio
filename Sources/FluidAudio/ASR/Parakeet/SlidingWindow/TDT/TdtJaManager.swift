@@ -114,6 +114,11 @@ public actor TdtJaManager {
         let encoderLength = encoderLengthOutput[0].intValue
 
         // Step 3: TDT Decoding (encoder features → tokens)
+        // Validate joint model is present (required for TDT)
+        guard let jointModel = models.joint else {
+            throw ASRError.processingFailed("TDT models require a joint model")
+        }
+
         // Extract decoder and state to local variables for inout passing
         var localDecoderState = decoderState
         let localTdtDecoder = tdtDecoder
@@ -122,7 +127,7 @@ public actor TdtJaManager {
             encoderSequenceLength: encoderLength,
             actualAudioFrames: encoderLength,
             decoderModel: models.decoder,
-            jointModel: models.joint,
+            jointModel: jointModel,
             decoderState: &localDecoderState,
             contextFrameAdjustment: 0,
             isLastChunk: true,
