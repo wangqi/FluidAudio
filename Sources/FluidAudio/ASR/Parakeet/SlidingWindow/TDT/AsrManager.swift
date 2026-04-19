@@ -257,10 +257,6 @@ public actor AsrManager {
             throw ASRError.processingFailed(
                 "CTC-only model .ctcZhCn does not support TDT decoding. Use CtcZhCnManager instead."
             )
-        case .ctcJa:
-            throw ASRError.processingFailed(
-                "CTC-only model .ctcJa does not support TDT decoding. Use CtcJaManager instead."
-            )
         }
     }
 
@@ -336,7 +332,8 @@ public actor AsrManager {
         )
 
         let totalSamples = sampleSource.sampleCount
-        guard totalSamples >= config.sampleRate else {
+        let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
+        guard totalSamples >= minimumRequiredSamples else {
             sampleSource.cleanup()
             throw ASRError.invalidAudioData
         }

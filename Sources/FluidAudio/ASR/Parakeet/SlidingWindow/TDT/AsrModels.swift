@@ -9,8 +9,6 @@ public enum AsrModelVersion: Sendable {
     case tdtCtc110m
     /// 600M parameter CTC-only model for Mandarin Chinese (zh-CN)
     case ctcZhCn
-    /// 600M parameter CTC-only model for Japanese (ja)
-    case ctcJa
     /// 600M parameter TDT model for Japanese (ja) - hybrid CTC preprocessor/encoder + TDT decoder/joint v2
     case tdtJa
 
@@ -20,8 +18,7 @@ public enum AsrModelVersion: Sendable {
         case .v3: return .parakeet
         case .tdtCtc110m: return .parakeetTdtCtc110m
         case .ctcZhCn: return .parakeetCtcZhCn
-        case .ctcJa: return .parakeetJa
-        case .tdtJa: return .parakeetJa  // Both CTC and TDT models in same repo
+        case .tdtJa: return .parakeetJa
         }
     }
 
@@ -36,7 +33,7 @@ public enum AsrModelVersion: Sendable {
     /// Whether this model is CTC-only (no TDT decoder+joint)
     public var isCtcOnly: Bool {
         switch self {
-        case .ctcZhCn, .ctcJa: return true
+        case .ctcZhCn: return true
         default: return false
         }
     }
@@ -45,7 +42,7 @@ public enum AsrModelVersion: Sendable {
     public var encoderHiddenSize: Int {
         switch self {
         case .tdtCtc110m: return 512
-        case .ctcZhCn, .ctcJa, .tdtJa: return 1024
+        case .ctcZhCn, .tdtJa: return 1024
         default: return 1024
         }
     }
@@ -56,7 +53,7 @@ public enum AsrModelVersion: Sendable {
         case .v2, .tdtCtc110m: return 1024
         case .v3: return 8192
         case .ctcZhCn: return 7000
-        case .ctcJa, .tdtJa: return 3072
+        case .tdtJa: return 3072
         }
     }
 
@@ -160,6 +157,36 @@ extension AsrModels {
     // Use centralized model names
     private typealias Names = ModelNames.ASR
 
+    /// Get version-specific file names for decoder and joint models
+    private static func getModelFileNames(
+        version: AsrModelVersion
+    ) -> (decoder: String, joint: String, vocabulary: String) {
+        switch version {
+        case .tdtJa:
+            return (
+                decoder: ModelNames.TDTJa.decoderFile,
+                joint: ModelNames.TDTJa.jointFile,
+                vocabulary: ModelNames.TDTJa.vocabularyFile
+            )
+        default:
+            return (
+                decoder: Names.decoderFile,
+                joint: Names.jointFile,
+                vocabulary: Names.vocabularyFile
+            )
+        }
+    }
+
+    /// Get version-specific required models set
+    private static func getRequiredModels(version: AsrModelVersion) -> Set<String> {
+        switch version {
+        case .tdtJa:
+            return ModelNames.TDTJa.requiredModels
+        default:
+            return version.hasFusedEncoder ? Names.requiredModelsFused : Names.requiredModels
+        }
+    }
+
     /// Load ASR models from a directory
     ///
     /// - Parameters:
@@ -182,20 +209,9 @@ extension AsrModels {
     ) async throws -> AsrModels {
         // Validate that CTC-only models use their dedicated managers
         if version.isCtcOnly {
-            switch version {
-            case .ctcJa:
-                throw AsrModelsError.loadingFailed(
-                    "CTC-only model .ctcJa must be loaded via CtcJaManager, not AsrModels"
-                )
-            case .ctcZhCn:
-                throw AsrModelsError.loadingFailed(
-                    "CTC-only model .ctcZhCn must be loaded via CtcZhCnManager, not AsrModels"
-                )
-            default:
-                throw AsrModelsError.loadingFailed(
-                    "CTC-only models must be loaded via their dedicated manager classes"
-                )
-            }
+            throw AsrModelsError.loadingFailed(
+                "CTC-only model \(version) must be loaded via its dedicated manager class (e.g., CtcZhCnManager)"
+            )
         }
 
         logger.info("Loading ASR models from: \(directory.path)")
@@ -233,17 +249,20 @@ extension AsrModels {
             throw AsrModelsError.loadingFailed("Failed to load encoder model (required for split frontend)")
         }
 
+        // Get version-specific file names
+        let fileNames = getModelFileNames(version: version)
+
         // Load decoder and joint as well
         let decoderAndJoint = try await DownloadUtils.loadModels(
             version.repo,
-            modelNames: [Names.decoderFile, Names.jointFile],
+            modelNames: [fileNames.decoder, fileNames.joint],
             directory: parentDirectory,
             computeUnits: config.computeUnits,
             progressHandler: progressHandler
         )
 
-        guard let decoderModel = decoderAndJoint[Names.decoderFile],
-            let jointModel = decoderAndJoint[Names.jointFile]
+        guard let decoderModel = decoderAndJoint[fileNames.decoder],
+            let jointModel = decoderAndJoint[fileNames.joint]
         else {
             throw AsrModelsError.loadingFailed("Failed to load decoder or joint model")
         }
@@ -303,14 +322,15 @@ extension AsrModels {
     }
 
     private static func loadVocabulary(from directory: URL, version: AsrModelVersion) throws -> [Int: String] {
-        let vocabPath = repoPath(from: directory, version: version).appendingPathComponent(
-            Names.vocabulary(for: version.repo))
+        // Get version-specific vocabulary file name
+        let vocabularyFileName = getModelFileNames(version: version).vocabulary
+        let vocabPath = repoPath(from: directory, version: version).appendingPathComponent(vocabularyFileName)
 
         if !FileManager.default.fileExists(atPath: vocabPath.path) {
             logger.warning(
                 "Vocabulary file not found at \(vocabPath.path). Please ensure the vocab file is downloaded with the models."
             )
-            throw AsrModelsError.modelNotFound(Names.vocabulary(for: version.repo), vocabPath)
+            throw AsrModelsError.modelNotFound(vocabularyFileName, vocabPath)
         }
 
         do {
@@ -422,20 +442,9 @@ extension AsrModels {
     ) async throws -> URL {
         // Validate that CTC-only models use their dedicated managers
         if version.isCtcOnly {
-            switch version {
-            case .ctcJa:
-                throw AsrModelsError.downloadFailed(
-                    "CTC-only model .ctcJa must be downloaded via CtcJaModels, not AsrModels"
-                )
-            case .ctcZhCn:
-                throw AsrModelsError.downloadFailed(
-                    "CTC-only model .ctcZhCn must be downloaded via CtcZhCnModels, not AsrModels"
-                )
-            default:
-                throw AsrModelsError.downloadFailed(
-                    "CTC-only models must be downloaded via their dedicated model classes"
-                )
-            }
+            throw AsrModelsError.downloadFailed(
+                "CTC-only model \(version) must be downloaded via its dedicated model class (e.g., CtcZhCnModels)"
+            )
         }
 
         let targetDir = directory ?? defaultCacheDirectory(for: version)
@@ -512,8 +521,7 @@ extension AsrModels {
 
     public static func modelsExist(at directory: URL, version: AsrModelVersion) -> Bool {
         let fileManager = FileManager.default
-        let requiredFiles =
-            version.hasFusedEncoder ? ModelNames.ASR.requiredModelsFused : ModelNames.ASR.requiredModels
+        let requiredFiles = getRequiredModels(version: version)
 
         // Check in the DownloadUtils repo structure
         let repoPath = repoPath(from: directory, version: version)
@@ -524,7 +532,8 @@ extension AsrModels {
         }
 
         // Also check for vocabulary file associated with the version
-        let vocabPath = repoPath.appendingPathComponent(Names.vocabulary(for: version.repo))
+        let vocabularyFileName = getModelFileNames(version: version).vocabulary
+        let vocabPath = repoPath.appendingPathComponent(vocabularyFileName)
         let vocabPresent = fileManager.fileExists(atPath: vocabPath.path)
 
         return modelsPresent && vocabPresent
