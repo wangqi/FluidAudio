@@ -1,128 +1,115 @@
-# FluidAudio What's New
+# FluidAudio What's New: tag-20260412 → tag-20260419
 
-## Upgrade: tag-20260406 to tag-20260412
+## Commits Included
 
-### New Features
-
-#### ASR: Parallelized Batch Transcription, 2.2-2.8x Faster (#507)
-`AsrManager` now distributes independent audio chunks across a worker pool (default: 4 concurrent
-workers) for long-file transcription. Benchmarked on Apple M3 and iPhone SE 3:
-
-| Model | Before | After | Speedup | Memory Delta |
-|---|---|---|---|---|
-| Parakeet TDT v2 | 31.84 s | 11.25 s | 2.83x | +21.4 MiB |
-| Parakeet TDT v3 | 31.37 s | 12.75 s | 2.46x | +31.0 MiB |
-| Parakeet TDT-CTC 110M | 19.89 s | 9.08 s | 2.19x | +19.7 MiB |
-
-Concurrency is controlled by `ASRConfig.parallelChunkConcurrency` (default `4`). Transcript content
-and word timings are bit-identical to the serial path. This only affects batch (file) transcription;
-the streaming path is unchanged.
-
-**iOS note:** Peak RAM increases ~20-30 MiB per transcription session. The benchmark was run on
-iPhone SE 3, which has 4 GB RAM, so this is considered acceptable on modern iPhones.
-
-#### ASR: Nemotron Streaming with 160ms and 80ms Chunk Sizes (#490)
-Two finer-grained chunk size variants are now exposed in the public API via new `Repo` enum cases
-`.nemotronStreaming160` and `.nemotronStreaming80`:
-
-| Chunk | Latency | Use Case |
-|---|---|---|
-| 1120ms | 1.12s | Best accuracy (original) |
-| 560ms | 0.56s | Lower latency |
-| 160ms | 0.16s | Very low latency |
-| 80ms | 0.08s | Ultra-low latency |
-
-#### Diarizer: Custom Segment Activity Reporting (#493)
-`DiarizerTimeline` now supports a `DiarizerActivityType` enum with two modes:
-- `.sigmoids` (default): segment activity reported as mean probability score
-- `.logits`: segment activity reported as mean logit value (covariance-compatible)
-
-Useful for applications that need raw logits for downstream analytics.
+| Hash | Author | PR | Summary |
+|------|--------|----|---------|
+| 4ef33f0 | Alex | #521 | Fix Japanese TDT models and consolidate to unified AsrModels API |
+| 3dc57c8 | Phoenix | #531 | Fix: Lower ASR minimum audio guard from 1s to 300ms |
+| 38a15e4 | wangqi | — | Merge branch 'FluidInference:main' into main |
 
 ---
 
-### Bug Fixes
+## PR #521 — Fix Japanese TDT models and consolidate to unified AsrModels API
 
-#### ASR: Japanese CTC Model Fails to Load After Download (#516)
-`AsrModels.load()` and `AsrModels.download()` previously accepted CTC-only model versions
-(`.ctcJa`, `.ctcZhCn`) and downloaded correctly, but then failed at load time with a cryptic
-"Model file not found: Decoder.mlmodelc" error (TDT decoder name, not CTC). Both methods now
-reject these versions immediately with a clear error: "CTC-only model .ctcJa must be loaded via
-CtcJaManager, not AsrModels."
+### What Changed
 
----
+**Three bugs fixed in the Japanese ASR path:**
 
-### Refactors and Breaking Changes
+1. **Model download broken**: `TdtJaModels.getRequiredModelNames()` only returned CTC models from `parakeet-ctc-0.6b-ja-coreml`, omitting the TDT-specific `Decoderv2.mlmodelc` and `Jointerv2.mlmodelc`. Japanese TDT models silently failed to download.
 
-#### BREAKING: `Repo.parakeetCtcJa` Renamed to `Repo.parakeetJa` (#520)
-The HuggingFace repository `FluidInference/parakeet-ctc-0.6b-ja-coreml` contains both CTC and TDT
-v2 models, so the name `parakeetCtcJa` was misleading. Renamed to `parakeetJa`. The separate
-`parakeetTdtJa` case (which previously pointed to a non-existent separate TDT repo) was removed;
-both Japanese CTC and TDT models now resolve to `parakeetJa`.
+2. **AsrModels file name mismatch**: `AsrModels` used hardcoded names (`Decoder.mlmodelc`, `JointDecision.mlmodelc`) that do not match the Japanese TDT file names (`Decoderv2.mlmodelc`, `Jointerv2.mlmodelc`), blocking use of `AsrManager` with Japanese TDT.
 
-**Action required:** Any call site using `Repo.overrideFolderNames[.parakeetCtcJa]` must change
-`.parakeetCtcJa` to `.parakeetJa`.
+3. **Code duplication**: Four specialized managers (`TdtJaManager`, `CtcJaManager`, `TdtJaModels`, `CtcJaModels`) duplicated functionality already in `AsrModels`/`AsrManager`.
 
-#### Standardized Model Loading API Across All ASR Managers (#506)
-All ASR managers now share a consistent API surface:
+### Breaking API Removals
+
+The following public types were **deleted**:
+
+| Removed Type | Replacement |
+|---|---|
+| `CtcJaManager` | Use `AsrManager` with `AsrModels.load(version: .tdtJa, ...)` |
+| `CtcJaModels` | Removed; load via `AsrModels.load(version: .tdtJa, ...)` |
+| `TdtJaManager` | Use `AsrManager` with `AsrModels.load(version: .tdtJa, ...)` |
+| `TdtJaModels` | Removed; load via `AsrModels.load(version: .tdtJa, ...)` |
+| `AsrModelVersion.ctcJa` | Removed; use `.tdtJa` (TDT is superior, same repo) |
+
+### New Unified API for Japanese ASR
 
 ```swift
-manager.loadModels(from: URL)                      // Load from local directory
-manager.loadModels(_ models: PreloadedModels)       // Use pre-loaded models
-manager.loadModels(to: URL?, progressHandler:)      // Download then load
+// Load Japanese TDT models (now same repo as old CTC: parakeet-ctc-0.6b-ja-coreml)
+let models = try await AsrModels.load(from: modelDir, version: .tdtJa)
+let manager = AsrManager()
+try await manager.loadModels(models)
+
+// Transcribe with timing info — previously unavailable via TdtJaManager
+var state = TdtDecoderState.make()
+let result = try await manager.transcribe(audioSamples, decoderState: &state)
+print(result.text)
+print(result.timings)  // now available
 ```
 
-| Manager | Old | New |
-|---|---|---|
-| `AsrManager` | `configure(models:)` | `loadModels(_:)` (deprecated old name) |
-| `SlidingWindowAsrManager` | `start()` | `startStreaming()` with model loading separated |
-| `StreamingEouAsrManager` | `loadModelsFromHuggingFace()` | `loadModels(from:)` |
-| `StreamingNemotronAsrManager` | `loadModels(modelDir:)` | `loadModels(from:)` |
+### File System Changes
 
-Our code already uses `mgr.loadModels(models)` (introduced at tag-20260406). No change needed.
+The old split CI cache path (`parakeet-tdt-ja` + `parakeet-ctc-ja`) is merged to a single path:
+- Old: `~/Library/Application Support/FluidAudio/Models/parakeet-tdt-ja`
+- Old: `~/Library/Application Support/FluidAudio/Models/parakeet-ctc-ja`
+- New: `~/Library/Application Support/FluidAudio/Models/parakeet-ja`
 
-#### File Reorganization: Batch Managers Moved into SlidingWindow/ (#502)
-24 source files and 10 test files reorganized under `SlidingWindow/`:
-```
-SlidingWindow/
-├── SlidingWindowAsrManager.swift   (public API)
-├── TDT/                            (AsrManager, TdtJaManager, Decoder/)
-└── CTC/                            (CtcJaManager, CtcZhCnManager)
-```
-Internal reorganization only. Public API and our calling code unaffected.
+### Impact on iOS App
 
-#### Language Model Files Deduplicated (#492)
-`CtcJaModels`, `CtcZhCnModels`, `TdtJaModels` refactored from ~250 lines each into a shared
-`ParakeetLanguageModels<Config>` generic with a `ParakeetLanguageModelConfig` protocol. Each
-language file is now ~22 lines (config + typealias). No API change for callers.
+**High risk — breaking build.** `FluidAudioASR.swift` held `CtcJaManager` and `CtcJaModels` references that no longer compile. Required migration: replace `CtcJaManager`/`CtcJaModels` with `AsrManager` + `AsrModels.load(version: .tdtJa, from:)`.
 
-#### `AudioConverter` Now `Sendable` (#505)
-Swift 6 concurrency conformance. No behavior change.
+Benefit: Japanese ASR now provides token timings, previously only available via English TDT models.
 
 ---
 
-### Documentation
+## PR #531 — Fix: Lower ASR minimum audio guard from 1s to 300ms
 
-- Diarization pipeline version distinction clarified: online/streaming uses Pyannote 3.1;
-  offline batch uses Pyannote Community-1.
-- ASR API reference completed and reorganized under `Documentation/`.
+### What Changed
+
+Short single-word utterances ("yes", "no", "stop") are typically 500-700 ms and were silently rejected by `AsrManager` with `ASRError.invalidAudioData` before any transcription ran. The guard was `audioSamples.count >= sampleRate` (16,000 samples = 1 s).
+
+**New minimum**: 300 ms = 4,800 samples at 16 kHz.
+
+### New Public API
+
+```swift
+// New constant in ASRConstants:
+ASRConstants.minimumAudioDurationSeconds   // = 0.3
+
+// New helper — same pattern as calculateEncoderFrames(from:):
+ASRConstants.minimumRequiredSamples(forSampleRate: 16_000)   // = 4_800
+```
+
+### Changed Behavior
+
+| Location | Old behavior | New behavior |
+|---|---|---|
+| `AsrManager.transcribe(_:decoderState:)` | Throws if < 16,000 samples | Throws if < 4,800 samples |
+| `AsrManager.transcribeDiskBacked(...)` | Throws if < 16,000 samples | Throws if < 4,800 samples |
+| `ASRError.invalidAudioData` message | "at least 1 second" | "at least 300ms" |
+
+### Impact on iOS App
+
+**Low risk — no API changes.** The guard is now less strict. If the app pre-validated audio length before calling `transcribe`, those guards may now allow audio through that was previously blocked. Recommended: update any app-side minimum-duration documentation or UI hints that referenced "1 second minimum".
 
 ---
 
-### Upgrade Risk Assessment for Privacy AI
+## Risk Summary
 
-| Change | Risk | Action |
+| Change | Risk Level | Action Required |
 |---|---|---|
-| `Repo.parakeetCtcJa` → `Repo.parakeetJa` | **High** — build error without fix | Update `FluidAudioASR.swift` line 186 |
-| Parallel batch transcription (+20-30 MiB RAM) | Low | Automatic improvement, no code change |
-| Standardized loading API | None | Our code already uses the new form |
-| File reorganization | None | Internal; public API stable |
-| Language model deduplication | None | No caller-visible change |
-| Nemotron 160ms/80ms chunk sizes | None | New option; not yet integrated |
-| Diarizer activity type | None | Advanced opt-in feature |
+| PR #521: Removed `CtcJaManager`, `CtcJaModels`, `TdtJaManager`, `TdtJaModels`, `.ctcJa` | **HIGH** | Migrate `FluidAudioASR.swift` to `AsrManager` + `version: .tdtJa` |
+| PR #531: ASR minimum guard 1s to 300ms | **LOW** | No code change required; short utterances now transcribed |
 
-### New Speakers/ASR/VAD/Diarizer Classes Needed?
+---
 
-No new classes are required for this upgrade. The existing classes cover all new functionality:
-- Nemotron 160ms/80ms → can be added to `FluidAudioASR` if Nemotron streaming is integrated
-- Diarizer activity type → opt-in via `DiarizerActivityType` on the existing `FluidAudioDiarizer`
+## No Changes Required For
+
+- `FluidAudioKokoroSpeaker` — TTS pipeline unaffected
+- `FluidAudioPocketTTSSpeaker` — TTS pipeline unaffected
+- `FluidAudioVAD` — VAD pipeline unaffected
+- `FluidAudioDiarizer` — Diarizer pipeline unaffected
+- `FluidAudioVoiceCloneProvider` — Voice clone pipeline unaffected
+- `FluidAudioParakeetSpeaker` — Delegates to AVFoundationSpeaker; no FluidAudio ASR calls
