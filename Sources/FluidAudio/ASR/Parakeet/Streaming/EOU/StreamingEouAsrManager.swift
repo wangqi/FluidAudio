@@ -520,6 +520,14 @@ public actor StreamingEouAsrManager {
             validOutLen: chunkSize.validOutputLen)
         accumulatedTokenIds.append(contentsOf: decodeResult.tokenIds)
 
+        // Reset sticky eouDetected when speech resumes after an EOU so a later silence can
+        // fire another EOU callback. Original implementation only cleared this in reset()/finish(),
+        // which meant EOU fired at most once per streaming session.
+        // wangqi modified 2026-04-20
+        if !decodeResult.tokenIds.isEmpty && eouDetected {
+            eouDetected = false
+        }
+
         // Invoke partial callback for ghost text (only when new tokens decoded)
         if let callback = partialCallback, let tokenizer = tokenizer, !decodeResult.tokenIds.isEmpty {
             let partial = tokenizer.decode(ids: accumulatedTokenIds)
@@ -555,6 +563,13 @@ public actor StreamingEouAsrManager {
                         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
                         callback(transcript)
                     }
+
+                    // Clear accumulated tokens after EOU fires so subsequent partial callbacks deliver
+                    // per-utterance text instead of re-emitting the full session transcript.
+                    // Without this, multi-utterance workflows (e.g. real-time translation in
+                    // MLXSpeechToTextView) see duplicated text and stranded translation buffers.
+                    // wangqi modified 2026-04-20
+                    accumulatedTokenIds.removeAll()
                 }
             }
         } else {
