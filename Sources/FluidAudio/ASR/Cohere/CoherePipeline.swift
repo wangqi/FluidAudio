@@ -332,6 +332,10 @@ public actor CoherePipeline {
         public let encoder: MLModel
         public let decoder: MLModel
         public let vocabulary: [Int: String]
+        /// Which cache-external decoder variant was loaded. Drives the
+        /// `attention_mask` build at decode time without re-probing the
+        /// model's input shape.
+        public let decoderVariant: DecoderVariant
     }
 
     private let melExtractor: CohereMelSpectrogram
@@ -340,24 +344,64 @@ public actor CoherePipeline {
         self.melExtractor = mel
     }
 
+    /// Cache-external decoder variant selector.
+    ///
+    /// Both decoders share the same input/output contract except for the
+    /// `attention_mask` shape and how position is sourced.
+    public enum DecoderVariant: Sendable {
+        /// `cohere_decoder_cache_external_v2.mlmodelc` — fixed
+        /// `attention_mask` shape `[1, 1, 1, 108]`, ANE-friendly. Default.
+        case v2
+        /// `cohere_decoder_cache_external.mlmodelc` — dynamic
+        /// `attention_mask` (`RangeDim(1, 108)`), CPU/GPU only.
+        case v1
+
+        public var compiledFileName: String {
+            switch self {
+            case .v2: return ModelNames.CohereTranscribe.decoderCacheExternalV2CompiledFile
+            case .v1: return ModelNames.CohereTranscribe.decoderCacheExternalCompiledFile
+            }
+        }
+
+        /// Whether the variant expects a full-length `[1, 1, 1, maxSeqLen]`
+        /// additive causal `attention_mask`. The dynamic v1 decoder instead
+        /// takes a `[1, 1, 1, step+1]` zero-filled mask.
+        public var usesStaticSelfMask: Bool {
+            switch self {
+            case .v2: return true
+            case .v1: return false
+            }
+        }
+    }
+
     /// Load encoder, decoder and vocabulary from (potentially different) directories.
     ///
     /// This supports mixed-precision — e.g. INT8 encoder + FP16 decoder. Pass
-    /// the same URL to both for a single-precision setup. Each directory must
-    /// contain `cohere_encoder.mlmodelc` and/or
-    /// `cohere_decoder_cache_external.mlmodelc`; the vocab is loaded from
-    /// `vocabDir`.
+    /// the same URL to both for a single-precision setup.
+    ///
+    /// `decoderVariant` selects which cache-external decoder file to load
+    /// from `decoderDir`. The default (`.v2`) is the ANE-friendly
+    /// static-shape build; pass `.v1` for the legacy FP16 dynamic-shape
+    /// decoder. The runtime automatically adapts the `attention_mask`
+    /// build to whichever variant is loaded.
     public static func loadModels(
         encoderDir: URL,
         decoderDir: URL,
         vocabDir: URL,
+        decoderVariant: DecoderVariant = .v2,
         computeUnits: MLComputeUnits = .all
     ) async throws -> LoadedModels {
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
 
-        let encoderURL = encoderDir.appendingPathComponent("cohere_encoder.mlmodelc")
-        let decoderURL = decoderDir.appendingPathComponent("cohere_decoder_cache_external.mlmodelc")
+        let encoderURL = encoderDir.appendingPathComponent(
+            ModelNames.CohereTranscribe.encoderCompiledFile)
+        let decoderURL = decoderDir.appendingPathComponent(decoderVariant.compiledFileName)
+
+        guard FileManager.default.fileExists(atPath: decoderURL.path) else {
+            throw CohereAsrError.modelNotFound(
+                "Decoder not found at \(decoderURL.path) (variant: \(decoderVariant)).")
+        }
 
         pipelineLogger.info("Loading encoder from \(encoderURL.path)")
         let encoder = try await MLModel.load(contentsOf: encoderURL, configuration: config)
@@ -372,7 +416,11 @@ public actor CoherePipeline {
         }
 
         let vocab = try loadVocabulary(vocabDir: vocabDir)
-        return LoadedModels(encoder: encoder, decoder: decoder, vocabulary: vocab)
+        return LoadedModels(
+            encoder: encoder,
+            decoder: decoder,
+            vocabulary: vocab,
+            decoderVariant: decoderVariant)
     }
 
     private static func loadVocabulary(vocabDir: URL) throws -> [Int: String] {
@@ -434,7 +482,8 @@ public actor CoherePipeline {
             maxNewTokens: maxNewTokens,
             repetitionPenalty: repetitionPenalty,
             noRepeatNgram: noRepeatNgram,
-            decoder: models.decoder)
+            decoder: models.decoder,
+            useStaticSelfMask: models.decoderVariant.usesStaticSelfMask)
         let decoderSecs = CFAbsoluteTimeGetCurrent() - dec0
 
         // 4) Detokenize
@@ -499,7 +548,8 @@ public actor CoherePipeline {
         maxNewTokens: Int,
         repetitionPenalty: Float,
         noRepeatNgram: Int,
-        decoder: MLModel
+        decoder: MLModel,
+        useStaticSelfMask: Bool
     ) async throws -> [Int] {
         let cacheShape: [NSNumber] = [
             1,
@@ -554,9 +604,8 @@ public actor CoherePipeline {
             let positionId = try MLMultiArray(shape: [1, 1], dataType: .int32)
             positionId[0] = NSNumber(value: step)
 
-            let selfMask = try MLMultiArray(
-                shape: [1, 1, 1, NSNumber(value: step + 1)], dataType: cacheDType)
-            Self.zeroFill(selfMask)
+            let selfMask = try Self.buildSelfAttentionMask(
+                step: step, useStatic: useStaticSelfMask, dtype: cacheDType)
 
             var inputs: [String: MLFeatureValue] = [
                 "input_id": MLFeatureValue(multiArray: inputId),
@@ -619,6 +668,49 @@ public actor CoherePipeline {
     }
 
     // MARK: Helpers
+
+    /// Build the self-attention additive mask for one decoding step.
+    ///
+    /// Dynamic path (RangeDim decoder): shape `[1, 1, 1, step+1]`, all zeros.
+    /// The model's attended K/V slice is exactly `step+1` long.
+    ///
+    /// Static path (fixed-shape decoder): shape `[1, 1, 1, maxSeqLen]`. The
+    /// decoder attends over the full cache; positions `[0..=step]` get `0`
+    /// (attend) and `[step+1..maxSeqLen-1]` get `-1e4` (masked — the cache
+    /// slots aren't written yet).
+    static func buildSelfAttentionMask(
+        step: Int, useStatic: Bool, dtype: MLMultiArrayDataType
+    ) throws -> MLMultiArray {
+        if !useStatic {
+            let mask = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: step + 1)], dataType: dtype)
+            zeroFill(mask)
+            return mask
+        }
+
+        let length = CohereAsrConfig.maxSeqLen
+        let mask = try MLMultiArray(
+            shape: [1, 1, 1, NSNumber(value: length)], dataType: dtype)
+        zeroFill(mask)
+        let firstBlocked = step + 1
+        guard firstBlocked < length else { return mask }
+
+        let invalidValue: Float = -1.0e4
+        switch dtype {
+        case .float32:
+            let ptr = mask.dataPointer.bindMemory(to: Float.self, capacity: length)
+            for i in firstBlocked..<length { ptr[i] = invalidValue }
+        case .float16:
+            let ptr = mask.dataPointer.bindMemory(to: UInt16.self, capacity: length)
+            let bits = float16Bits(invalidValue)
+            for i in firstBlocked..<length { ptr[i] = bits }
+        default:
+            for i in firstBlocked..<length {
+                mask[[0, 0, 0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: invalidValue)
+            }
+        }
+        return mask
+    }
 
     static func buildCrossAttentionMask(
         encoderSeqLen: Int, encoderValid: Int, dtype: MLMultiArrayDataType
