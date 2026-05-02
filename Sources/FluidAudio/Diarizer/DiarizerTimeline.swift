@@ -1209,7 +1209,7 @@ public class DiarizerTimeline {
                     let end = frame + padOffset
 
                     guard end - aux.unmergedStartFrame >= minSegmentLength else {
-                        aux.hasSegment = aux.endFrame >= minSegmentLength + aux.startFrame
+                        aux.hasSegment = aux.endFrame >= aux.startFrame + minSegmentLength
                         continue
                     }
 
@@ -1227,7 +1227,7 @@ public class DiarizerTimeline {
                     aux.unmergedActivitySum = activityFunc(activity)
                     aux.unmergedActiveFrameCount = 1
 
-                    guard !aux.hasSegment || start - aux.endFrame > minFramesOff else {
+                    guard !aux.hasSegment || start > aux.endFrame + minFramesOff else {
                         aux.hasSegment = false
                         continue
                     }
@@ -1242,8 +1242,6 @@ public class DiarizerTimeline {
 
                     // Activity will be merged from the unmerged accumulators
                     aux.startFrame = start
-                    aux.activitySum = 0
-                    aux.activeFrameCount = 0
                 }
             }
 
@@ -1263,11 +1261,15 @@ public class DiarizerTimeline {
 
             // Add trailing segment (tentative-path only)
             guard addTrailingTentative, aux.speaking else { continue }
-            aux.endFrame = endFrame + padOffset
-            guard aux.endFrame - aux.startFrame >= minSegmentLength else { continue }
+
+            let paddedEnd = endFrame + padOffset
+            guard paddedEnd >= aux.startFrame + minSegmentLength else { continue }
 
             aux.hasSegment = true
-            if aux.endFrame - aux.unmergedStartFrame >= minSegmentLength {
+
+            // If the trailing segment is too short, don't merge it
+            if paddedEnd >= aux.unmergedStartFrame + minSegmentLength {
+                aux.endFrame = paddedEnd
                 aux.activitySum += aux.unmergedActivitySum
                 aux.activeFrameCount += aux.unmergedActiveFrameCount
             }
@@ -1320,6 +1322,8 @@ public class DiarizerTimeline {
         }
 
         aux.hasSegment = false
+        aux.activitySum = 0
+        aux.activeFrameCount = 0
     }
 
     private func trimPredictions() {
