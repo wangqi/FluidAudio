@@ -58,6 +58,7 @@ let package = Package(
             name: "FluidAudioTests",
             dependencies: [
                 "FluidAudio",
+                "FluidAudioCLI",
             ]
         ),
     ],
