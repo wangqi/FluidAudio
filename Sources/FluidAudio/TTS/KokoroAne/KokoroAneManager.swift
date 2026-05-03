@@ -67,8 +67,23 @@ public actor KokoroAneManager {
         // we'd download to a path G2PModel can't see and still hit
         // vocabLoadFailed. The KokoroAne mlmodelc chain itself does respect
         // `directory` (via store), only the shared G2P assets are pinned.
-        try await KokoroAneResourceDownloader.ensureG2PAssets(directory: nil)
-        try await G2PModel.shared.ensureModelsAvailable()
+        //
+        // App override: if the caller already set TtsModels.overrideCacheDirectory
+        // (e.g. to a flat download folder containing G2P files), G2PModel.shared
+        // can load from there without a HuggingFace download. Skip ensureG2PAssets
+        // in that case to avoid an unnecessary network call from the app sandbox.
+        // wangqi modified 2026-05-02
+        var g2pLoadable = false
+        do {
+            try await G2PModel.shared.ensureModelsAvailable()
+            g2pLoadable = true
+        } catch {
+            // G2P not available from current paths; fall through to download.
+        }
+        if !g2pLoadable {
+            try await KokoroAneResourceDownloader.ensureG2PAssets(directory: nil)
+            try await G2PModel.shared.ensureModelsAvailable()
+        }
         if let voices = preloadVoices {
             for voice in voices {
                 _ = try await store.voicePack(voice)
