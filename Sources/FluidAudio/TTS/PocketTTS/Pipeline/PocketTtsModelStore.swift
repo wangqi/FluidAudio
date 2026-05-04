@@ -27,6 +27,7 @@ public actor PocketTtsModelStore {
     private let directory: URL?
     public let language: PocketTtsLanguage
     public let precision: PocketTtsPrecision
+    private let skipDownload: Bool  // wangqi modified 2026-05-04
 
     /// - Parameters:
     ///   - language: Which upstream language pack to load. Defaults to
@@ -38,24 +39,32 @@ public actor PocketTtsModelStore {
     ///     `flowlm_step.mlmodelc` for `flowlm_stepv2.mlmodelc` from the
     ///     same upstream `v2/<lang>/` directory; the other three submodels
     ///     stay at fp16.
+    ///   - skipDownload: When `true`, throws instead of fetching from HuggingFace
+    ///     if any required file is missing. Use when the caller pre-stages all
+    ///     files via DownloadManagerCoreML.
+    // wangqi modified 2026-05-04
     public init(
         language: PocketTtsLanguage = .english,
         directory: URL? = nil,
-        precision: PocketTtsPrecision = .fp16
+        precision: PocketTtsPrecision = .fp16,
+        skipDownload: Bool = false
     ) {
         self.language = language
         self.directory = directory
         self.precision = precision
+        self.skipDownload = skipDownload
     }
 
     /// Load all four CoreML models and the constants bundle.
     public func loadIfNeeded() async throws {
         guard condStepModel == nil else { return }
 
+        // wangqi modified 2026-05-04
         let languageRoot = try await PocketTtsResourceDownloader.ensureModels(
             language: language,
             directory: directory,
-            precision: precision
+            precision: precision,
+            skipDownload: skipDownload
         )
         self.languageRootDirectory = languageRoot
 
@@ -224,8 +233,10 @@ public actor PocketTtsModelStore {
     public func loadMimiEncoderIfNeeded() async throws {
         guard mimiEncoderModel == nil else { return }
 
-        // Ensure the mimi_encoder is downloaded (downloads if needed)
-        let modelURL = try await PocketTtsResourceDownloader.ensureMimiEncoder(directory: directory)
+        // Ensure the mimi_encoder is present; skipDownload gates the HF fallback.
+        // wangqi modified 2026-05-04
+        let modelURL = try await PocketTtsResourceDownloader.ensureMimiEncoder(
+            directory: directory, skipDownload: skipDownload)
 
         let config = MLModelConfiguration()
         config.computeUnits = .cpuAndGPU

@@ -28,10 +28,13 @@ public enum PocketTtsResourceDownloader {
     /// completes, the unused FlowLM `.mlmodelc` and `.mlpackage` directories
     /// are deleted so only the requested precision occupies disk
     /// (~217 MB savings for `.int8`, ~75 MB savings for `.fp16`).
+    // Offline contract: caller pre-stages files via DownloadManagerCoreML and forbids HF fallback.
+    // wangqi modified 2026-05-04
     public static func ensureModels(
         language: PocketTtsLanguage,
         directory: URL? = nil,
         precision: PocketTtsPrecision = .fp16,
+        skipDownload: Bool = false,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> URL {
         let targetDir = try directory ?? cacheDirectory()
@@ -70,6 +73,15 @@ public enum PocketTtsResourceDownloader {
         if flatPresent {
             logger.info("PocketTTS models found in flat layout at \(modelsDirectory.path)")
             return modelsDirectory
+        }
+
+        // Surfaces a precise error instead of a silent HF re-download when caller has pre-staged files.
+        // wangqi modified 2026-05-04
+        if skipDownload {
+            throw PocketTTSError.modelNotFound(
+                "PocketTTS \(language.rawValue) (\(precision)) models missing under "
+                    + "\(modelsDirectory.path); downloads disabled by caller."
+            )
         }
 
         logger.info(
@@ -134,16 +146,41 @@ public enum PocketTtsResourceDownloader {
     /// can clone a voice without pulling in another language pack.
     /// - Parameter directory: Optional override for the base cache directory.
     ///   When `nil`, uses the default platform cache location.
-    public static func ensureMimiEncoder(directory: URL? = nil) async throws -> URL {
+    // Honour caller's directory override (flat layout) and gate download behind skipDownload flag.
+    // wangqi modified 2026-05-04
+    public static func ensureMimiEncoder(
+        directory: URL? = nil,
+        skipDownload: Bool = false
+    ) async throws -> URL {
         let targetDir = try directory ?? cacheDirectory()
-        let modelsDirectory = targetDir.appendingPathComponent(
-            PocketTtsConstants.defaultModelsSubdirectory)
+
+        // When the caller provides a directory, check for the encoder flat under it first
+        // (DownloadManagerCoreML places files flat in cacheFolder).
+        // wangqi modified 2026-05-04
+        if directory != nil {
+            let flat = targetDir.appendingPathComponent(ModelNames.PocketTTS.mimiEncoderFile)
+            if FileManager.default.fileExists(atPath: flat.path) {
+                logger.info("Mimi encoder found in flat layout at \(flat.path)")
+                return flat
+            }
+        }
+
+        let modelsDirectory = directory != nil
+            ? targetDir
+            : targetDir.appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
         let repoDir = modelsDirectory.appendingPathComponent(Repo.pocketTts.folderName)
         let encoderPath = repoDir.appendingPathComponent(ModelNames.PocketTTS.mimiEncoderFile)
 
         if FileManager.default.fileExists(atPath: encoderPath.path) {
             logger.info("Mimi encoder found in cache")
             return encoderPath
+        }
+
+        // wangqi modified 2026-05-04
+        if skipDownload {
+            throw PocketTTSError.modelNotFound(
+                "Mimi encoder not present; downloads disabled by caller."
+            )
         }
 
         // Make sure the parent directory exists — the user may not have

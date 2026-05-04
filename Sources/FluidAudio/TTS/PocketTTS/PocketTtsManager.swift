@@ -36,16 +36,22 @@ public actor PocketTtsManager {
     ///     matching upstream's on-disk weight format). `.int8` swaps
     ///     `flowlm_step` for the upstream `flowlm_stepv2` int8-quantized
     ///     variant per kyutai-labs/pocket-tts#147.
+    ///   - skipDownload: When `true`, throws instead of fetching from HuggingFace
+    ///     if any required file is missing. Default `false` preserves the existing
+    ///     behaviour for CLI, benchmark, and test callers.
+    // wangqi modified 2026-05-04
     public init(
         defaultVoice: String = PocketTtsConstants.defaultVoice,
         language: PocketTtsLanguage = .english,
         directory: URL? = nil,
-        precision: PocketTtsPrecision = .fp16
+        precision: PocketTtsPrecision = .fp16,
+        skipDownload: Bool = false
     ) {
         self.modelStore = PocketTtsModelStore(
             language: language,
             directory: directory,
-            precision: precision
+            precision: precision,
+            skipDownload: skipDownload
         )
         self.defaultVoice = defaultVoice
         self.language = language
