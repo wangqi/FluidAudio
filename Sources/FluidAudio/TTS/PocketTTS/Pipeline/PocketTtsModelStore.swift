@@ -259,9 +259,15 @@ public actor PocketTtsModelStore {
     }
 
     /// Check if the Mimi encoder model is available.
+    // Flat layout: encoder lives directly in the caller-provided directory, not two levels up.
+    // wangqi modified 2026-05-04
     public func isMimiEncoderAvailable() -> Bool {
-        // The Mimi encoder lives at the repo root, two levels above any
-        // `v2/<lang>/` language root.
+        // Flat layout: caller provided a directory; encoder is placed flat alongside other model files.
+        if let dir = directory {
+            let flat = dir.appendingPathComponent(ModelNames.PocketTTS.mimiEncoderFile)
+            if FileManager.default.fileExists(atPath: flat.path) { return true }
+        }
+        // Standard layout: encoder lives two levels above the language root (<repoDir>/mimi_encoder.mlmodelc).
         guard let langRoot = languageRootDirectory else { return false }
         let repoRoot = langRoot.deletingLastPathComponent().deletingLastPathComponent()
         let modelURL = repoRoot.appendingPathComponent(ModelNames.PocketTTS.mimiEncoderFile)

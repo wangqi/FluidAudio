@@ -18,7 +18,28 @@ public enum KokoroAneResourceDownloader {
         directory: URL? = nil,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> URL {
-        let modelsDirectory = try directory ?? defaultModelsDirectory()
+        // When an explicit directory is provided, use it as the repo root directly —
+        // do NOT append folderName. The caller already resolved the ANE subfolder path.
+        // Appending folderName would create a double-nested path that doesn't exist and
+        // trigger an unnecessary HuggingFace download even when all files are present.
+        // wangqi modified 2026-05-04
+        if let explicitDir = directory {
+            let required = ModelNames.KokoroAne.requiredModels
+            let allPresent = required.allSatisfy { name in
+                FileManager.default.fileExists(atPath: explicitDir.appendingPathComponent(name).path)
+            }
+            if allPresent {
+                logger.info("laishere Kokoro models found at \(explicitDir.path)")
+            } else {
+                // Files missing but directory was explicitly provided — let the model
+                // store's per-file guard produce a descriptive error rather than
+                // downloading to an uncontrolled path.
+                logger.warning("laishere Kokoro models missing from explicit directory \(explicitDir.path)")
+            }
+            return explicitDir
+        }
+
+        let modelsDirectory = try defaultModelsDirectory()
         let repoDir = modelsDirectory.appendingPathComponent(Repo.kokoroAne.folderName)
 
         let required = ModelNames.KokoroAne.requiredModels
