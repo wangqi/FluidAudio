@@ -5,7 +5,7 @@
 > phrases / language, CC-BY-SA-4.0) — the same public corpus used
 > by [MiniMax-Speech][mms], seed-tts-eval, and Gradium, so numbers
 > here are directly paper-comparable.
-> **Status:** Kokoro, Kokoro ANE, PocketTTS, Magpie, StyleTTS2 all
+> **Status:** Kokoro, Kokoro ANE, PocketTTS, Magpie all
 > complete the English run; CosyVoice3 completes the full Mandarin
 > run.
 >
@@ -23,11 +23,11 @@ feel:
    tens of seconds on first invocation; subsequent loads finish in ~1 s.
 2. **TTFT (time-to-first-audio)** — for streaming agents the question
    is "how long until the user hears *something*", not "how long until
-   the whole utterance is rendered". For one-shot backends in this
-   slice `ttft_ms == synth_ms`. **PocketTTS** and **Magpie** are
-   wired through their respective streaming APIs (`synthesizeStreaming`
-   / `synthesizeStream`), so their `ttft_ms` is honest first-frame
-   latency.
+   the whole utterance is rendered". For one-shot / batch backends in
+   this slice `ttft_ms == synth_ms`. **PocketTTS** is wired through
+   its streaming API (`synthesizeStreaming`), so its `ttft_ms` is
+   honest first-frame latency. Magpie is batch-only — its `ttft_ms`
+   equals `synth_ms`.
 3. **Per-stage compute units** — Kokoro ANE / Magpie are pipelines of
    6–7 graphs. Sometimes ANE is *slower per call* but more efficient.
    The "right" compute-unit choice differs per stage.
@@ -55,7 +55,6 @@ Reference each language as `--corpus minimax-<lang>`:
 |-------------|--------------------|------------------------------------------------|
 | Kokoro / Kokoro ANE | `minimax-english` | `english` only (`af_heart` voice) |
 | PocketTTS   | `minimax-english`  | `english`, `german`, `italian`, `portuguese`, `spanish`, `french` |
-| StyleTTS2   | `minimax-english`  | `english` only (LibriTTS multi-speaker)        |
 | Magpie      | `minimax-english`  | `english`, `spanish`, `german`, `french`, `italian`, `vietnamese`, `chinese`, `hindi` |
 | CosyVoice3  | `minimax-chinese`  | `chinese`, `cantonese`                         |
 
@@ -65,20 +64,19 @@ passed with `--corpus-path <file.txt>`.
 ### Metrics
 
 Per phrase:
-- `ttft_ms` — time-to-first-audio. For one-shot backends this equals
-  `synth_ms`. **PocketTTS** is benchmarked through
+- `ttft_ms` — time-to-first-audio. For one-shot / batch backends this
+  equals `synth_ms`. **PocketTTS** is benchmarked through
   `synthesizeStreaming`, so its `ttft_ms` is the timestamp of the first
-  80 ms audio frame (1920 samples @ 24 kHz). **Magpie** is benchmarked
-  through `synthesizeStream`, so its `ttft_ms` is the first
-  `MagpieAudioChunk` emit time (typically ~9.6 s on M2 vs ~15 s for
-  full synth).
+  80 ms audio frame (1920 samples @ 24 kHz). **Magpie** is batch-only
+  (`synthesize(...)` returns a single `MagpieSynthesisResult` after
+  the full AR + codec pipeline completes), so `ttft_ms == synth_ms`.
 - `synth_ms` — total synth wall time.
 - `audio_ms` — generated audio duration.
 - `rtfx` — `audio_ms / synth_ms`.
 - `wer`, `cer` — via Parakeet ASR roundtrip on the rendered WAV.
 - `stage_ms` — per-stage breakdown (backend-specific keys; populated
   for Kokoro ANE + Magpie; empty for Kokoro / PocketTTS /
-  StyleTTS2 / CosyVoice3).
+  CosyVoice3).
 - Backend-specific extras: `encoder_tokens`, `acoustic_frames`,
   `chunk_count`, `frame_count`, `code_count`, `finished_on_eos`,
   `generated_token_count`, etc.
@@ -131,12 +129,12 @@ WER / CER.
 | Kokoro ANE  | Apache-2.0  | en (af_heart only)     | ~330 MB   | 37.9 s     | 1586 / 2515 ms      | 1586 / 2515 ms      | 5.19×    | 738 MB   | 0.108   | 0.040   | one-shot; per-stage CU sweep, 7-graph pipeline |
 | Kokoro      | Apache-2.0  | en (af_heart only)     | ~330 MB   | 92.2 s     | 3113 / 4696 ms      | 3113 / 4696 ms      | 2.02×    | 736 MB   | 0.013   | 0.005   | one-shot; cleanest English ASR roundtrip |
 | PocketTTS   | research    | en + de + it + pt + es + fr (6L / 24L) | ~140 / ~520 MB | 6.0 s | **1244 / 4749 ms**  | 8757 / 19174 ms     | 0.61×    | 1503 MB  | 0.014   | 0.006   | **streaming**; TTFT is first 80 ms audio frame |
-| StyleTTS2   | MIT         | en (LibriTTS multi-spk) | ~280 MB  | 955 s§     | 6671 / 15990 ms§    | 6671 / 15990 ms§    | 2.72×§   | 963 MB§  | 0.440§  | 0.241§  | full 100/100 `minimax-english` via [misaki→espeak post-pass remap](#styletts2-misaki--espeak-post-pass-remap); ref_s = LibriTTS `696_92939_000016_000006.wav` (StyleTTS2 demo voice) |
-| Magpie      | research    | en/es/de/fr/it/vi/zh/hi | ~1.3 GB   | 38.5 s∥    | **9580 / 23796 ms**∥ | 15080 / 29895 ms∥   | 0.64×∥   | 762 MB∥  | 0.056   | 0.033   | **streaming TTFT**: first audio chunk at 9.6 s p50 on M2 (full synth 15.1 s); split-K/V decoder; outputBackings fast path with latched fallback |
+| Magpie      | research    | en/es/de/fr/it/vi/zh/hi | ~1.3 GB   | 38.5 s∥    | 15080 / 29895 ms∥   | 15080 / 29895 ms∥   | 0.64×∥   | 762 MB∥  | 0.056   | 0.033   | **batch-only**; `ttft_ms == synth_ms`; split-K/V decoder; outputBackings fast path with latched fallback |
 | CosyVoice3  | Apache-2.0  | zh (mandarin)          | ~1.5 GB   | 29.2 s†    | 14091 / 23679 ms†   | 14091 / 23679 ms†   | 0.357×†  | 3302 MB† | n/a‡    | 0.017‡  | beta; full `minimax-chinese` (100/100 phrases) for latency / RSS and whisper-large-v3 CER‡; cantonese supported via [auto-chunker](#cosyvoice3-auto-chunker) but not benchmarked (no yue ASR) |
 
-\* TTFT for **PocketTTS / Magpie** is first-frame emit through the
-streaming API; the others are one-shot, so `ttft_ms == synth_ms`.
+\* TTFT for **PocketTTS** is first-frame emit through the streaming
+API; **Magpie** is batch-only (`ttft_ms == synth_ms`); the others
+are one-shot, so `ttft_ms == synth_ms`.
 
 † CosyVoice3 chinese: 100/100, 0 errors, ASR skipped. Cold-start
 dropped from 302.7 s to 29.2 s on the warm re-run.
@@ -155,19 +153,12 @@ omitted because Mandarin has no word boundaries and `WERCalculator`
 splits on whitespace, so word-level WER reads near 100% and is
 meaningless.
 
-∥ Magpie: streamed via `synthesizeStream`. TTFT (9.6 s p50) is
-first-chunk emit; synth (15.1 s p50) is full-utterance wall time —
-the 5.5 s gap is the streaming win.
-
-§ StyleTTS2 (**beta** — `StyleTTS2Manager.initialize` emits a
-runtime warning): warm-cache run; first cold compile of the
-bucketed text_predictor / diffusion_step / decoder graphs is
-multi-second. ref_s dumped via
-[`06_dump_ref_s.py`](https://github.com/voicelink-ai/mobius-styletts2/blob/main/models/tts/styletts2/scripts/06_dump_ref_s.py).
-Read WER **relatively** per the
-[WER caveat](#about-the-wer--cer-numbers); StyleTTS2's own demo
-notebook reports artifacts on long sentences at default
-`alpha/beta/diffusion_steps`.
+∥ Magpie: batch-only. `synthesize(...)` returns one
+`MagpieSynthesisResult` after the full AR + codec pipeline completes,
+so `ttft_ms == synth_ms`. Long inputs are sentence-split internally
+(NanoCodec 256-frame static cap) and AR(N+1) ‖ codec(N) chunk-level
+pipelining overlaps the next chunk's AR loop with the current chunk's
+codec pass — wallclock optimization, not incremental yield.
 
 ### Kokoro ANE — per-stage breakdown (default preset, MiniMax-English)
 
@@ -195,11 +186,11 @@ Means across 100 `minimax-english` phrases on M2 (`John` voice, en,
 default compute units), captured during the original one-shot
 profiling run. `ar_loop` is the umbrella for the per-step
 `decoder_step` + `sampler` (so it is not added on top in the total).
-`nanocodec` runs concurrently with the AR loop in chunked-streaming
-mode, which is why the per-stage means do not sum to total warm-synth
-mean. The AR loop dominates the wall clock, and its cost grows
-super-linearly with phrase length — long news / story phrases drive
-the long-tail p95.
+`nanocodec` runs concurrently with the next chunk's AR loop via
+chunk-level pipelining inside `synthesize(...)`, which is why the
+per-stage means do not sum to total warm-synth mean. The AR loop
+dominates the wall clock, and its cost grows super-linearly with
+phrase length — long news / story phrases drive the long-tail p95.
 
 | Stage              | Mean ms |
 |--------------------|---------|
@@ -221,32 +212,6 @@ discussion](https://huggingface.co/datasets/MiniMaxAI/TTS-Multilingual-Test-Set/
 absolute WER is best read **relatively** (backend A vs. backend B on
 the same corpus + same ASR + same normalizer) rather than against
 raw paper numbers.
-
-## StyleTTS2 misaki → espeak post-pass remap
-
-StyleTTS2's LibriTTS checkpoint was trained on **espeak-ng-phonemized**
-text, but the in-tree BART G2P (shared with Kokoro) emits **misaki**
-output. The 178-token vocab accepts both forms, but the acoustic
-embeddings for the misaki ligature glyphs are essentially untrained
-noise — every training utterance saw the espeak form.
-
-Four systematic divergences vs. `espeak-ng -v en-us --ipa -q`:
-
-| misaki | espeak-ng | example                  |
-|--------|-----------|--------------------------|
-| `ʧ`    | `tʃ`      | choice → `tʃˈɔɪs`        |
-| `ʤ`    | `dʒ`      | jump   → `dʒˈʌmps`       |
-| `ɜɹ`   | `ɝ`       | girl   → `ɡˈɝl`          |
-| `əɹ`   | `ɚ`       | over   → `ˈoʊvɚ`         |
-
-Fix: 4-rule post-pass remap in `StyleTTS2Phonemizer.phonemize`, gated
-on `.americanEnglish`. Result on `minimax-english`: WER 0.581 →
-0.440, CER 0.476 → 0.241, agg-RTFx 2.36× → 2.72× (warm-cache
-re-run, so latency / RSS deltas are noise — WER / CER are the real
-signal). WER is still 30× worse than Kokoro; remaining errors cluster
-on word-level BART mispronunciations and long-tail diffusion artifacts.
-Further gains likely need a richer remap layer or swapping BART for
-libespeak-ng directly.
 
 ## CosyVoice3 Decode budget cap
 

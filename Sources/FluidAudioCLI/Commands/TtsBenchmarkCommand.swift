@@ -15,7 +15,6 @@ import Foundation
 ///   pocket-tts    — streaming flow-matching (no per-stage timings)
 ///   magpie        — encoder-decoder + NanoCodec (6-stage timings, slow)
 ///   cosyvoice3    — Mandarin LLM-based (Mandarin corpus only, no WER)
-///   styletts2     — diffusion + HiFi-GAN (one-shot, requires --voice ref_s.bin)
 ///
 /// Usage:
 ///   fluidaudio tts-benchmark --backend kokoro-ane \
@@ -274,12 +273,6 @@ public enum TtsBenchmarkCommand {
                 try await runCosyVoice3(
                     phrases: phrases, corpusLabel: corpusLabel,
                     voice: voice,
-                    preset: preset, outputJson: outputJson, audioDir: audioDir,
-                    asrChoice: asrChoice)
-            case .styleTts2:
-                try await runStyleTts2(
-                    phrases: phrases, corpusLabel: corpusLabel,
-                    voicePath: voice,
                     preset: preset, outputJson: outputJson, audioDir: audioDir,
                     asrChoice: asrChoice)
             }
@@ -545,56 +538,23 @@ public enum TtsBenchmarkCommand {
                 "speaker": speaker.displayName, "language": language.rawValue,
             ]
         ) { text in
-            // Drive Magpie through `synthesizeStream` so TTFT measures
-            // time-to-first-chunk-yield rather than full-utterance wall.
-            // The chunker carves a small first chunk
-            // (`MagpieChunker.streamingFirstChunkCap` = 50 codec frames ≈
-            // 2.3 s of audio) when the first sentence is long enough; for
-            // short phrases the stream degrades to one chunk == whole
-            // utterance and TTFT == synthMs (no streaming benefit, no
-            // measurement penalty).
-            //
-            // Trade-off vs. the prior `synthesize()` path: per-stage
-            // timings (`text_encoder`/`prefill`/`ar_loop`/…) are only
-            // surfaced on `MagpieSynthesisResult`, not per
-            // `MagpieAudioChunk`, so `stageMs` is empty here. That matches
-            // PocketTTS streaming which also publishes empty `stageMs`.
+            // Magpie is a batch / offline model — `synthesize()` runs the
+            // full chunked AR + codec pipeline and returns a single
+            // `MagpieSynthesisResult`. TTFT therefore equals synthMs (no
+            // incremental yield to measure against).
             let t0 = Date()
-            let stream = try await manager.synthesizeStream(
+            let result = try await manager.synthesize(
                 text: text, speaker: speaker, language: language)
-            var aggregated: [Float] = []
-            var ttftMs: Double = 0
-            var chunkCount = 0
-            var codeCount = 0
-            var finishedOnEos = false
-            var sampleRate = MagpieConstants.audioSampleRate
-            for try await chunk in stream {
-                if chunkCount == 0 {
-                    ttftMs = Date().timeIntervalSince(t0) * 1000
-                }
-                aggregated.append(contentsOf: chunk.samples)
-                chunkCount += 1
-                codeCount += chunk.codeCount
-                sampleRate = chunk.sampleRate
-                if chunk.isFinal {
-                    finishedOnEos = chunk.finishedOnEos
-                }
-            }
             let synthMs = Date().timeIntervalSince(t0) * 1000
-            // Empty-stream guard (synthesizeStream returns immediately on
-            // zero-length input). Fall back to synthMs so downstream
-            // percentile math doesn't see ttftMs == 0.
-            if chunkCount == 0 { ttftMs = synthMs }
             return BackendPhraseSample(
                 synthMs: synthMs,
-                ttftMs: ttftMs,
-                samples: aggregated,
-                sampleRate: sampleRate,
+                ttftMs: synthMs,
+                samples: result.samples,
+                sampleRate: result.sampleRate,
                 stageMs: [:],
                 extraFields: [
-                    "code_count": codeCount,
-                    "finished_on_eos": finishedOnEos,
-                    "chunk_count": chunkCount,
+                    "code_count": result.codeCount,
+                    "finished_on_eos": result.finishedOnEos,
                 ]
             )
         }
@@ -657,69 +617,6 @@ public enum TtsBenchmarkCommand {
                     // long phrases hit silent truncation.
                     "finished_on_eos": result.finishedOnEos,
                 ]
-            )
-        }
-    }
-
-    // MARK: - StyleTTS2 driver
-
-    private static func runStyleTts2(
-        phrases: [(category: String, text: String)],
-        corpusLabel: String,
-        voicePath: String?,
-        preset: TtsComputeUnitPreset,
-        outputJson: String?,
-        audioDir: String?,
-        asrChoice: AsrChoice
-    ) async throws {
-        guard let voicePath, !voicePath.isEmpty else {
-            logger.error(
-                "StyleTTS2 requires --voice <path/to/ref_s.bin> "
-                    + "(256 fp32 LE blob from mobius-styletts2/scripts/06_dump_ref_s.py)")
-            exit(1)
-        }
-        let voiceURL = resolveURL(voicePath, isDirectory: false)
-        let voiceLabel = voiceURL.deletingPathExtension().lastPathComponent
-
-        // StyleTTS2 doesn't expose a compute-units knob today; --compute-units
-        // is accepted for parity with other backends but only labels the run.
-        let manager = StyleTTS2Manager()
-
-        let coldStart = Date()
-        try await manager.initialize()
-        let coldStartS = Date().timeIntervalSince(coldStart)
-        logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
-
-        let firstStart = Date()
-        _ = try await manager.synthesizeSamples(
-            text: "Initialization warm-up.", voiceStyleURL: voiceURL, randomSeed: 42)
-        let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
-        logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
-
-        try await runPhraseLoop(
-            backendId: "styletts2",
-            voiceLabel: voiceLabel,
-            corpusLabel: corpusLabel,
-            phrases: phrases,
-            preset: preset,
-            coldStartS: coldStartS,
-            firstSynthMs: firstSynthMs,
-            outputJson: outputJson,
-            audioDir: audioDir,
-            asrChoice: asrChoice,
-            extraSummary: ["voice": voiceLabel]
-        ) { text in
-            let t0 = Date()
-            let result = try await manager.synthesizeSamples(
-                text: text, voiceStyleURL: voiceURL, randomSeed: 42)
-            let synthMs = Date().timeIntervalSince(t0) * 1000
-            return BackendPhraseSample(
-                synthMs: synthMs,
-                ttftMs: synthMs,
-                samples: result.samples,
-                sampleRate: result.sampleRate,
-                stageMs: [:],
-                extraFields: [:]
             )
         }
     }
@@ -989,7 +886,6 @@ public enum TtsBenchmarkCommand {
         case pocketTts
         case magpie
         case cosyVoice3
-        case styleTts2
 
         var defaultCorpus: String {
             switch self {
@@ -1011,8 +907,6 @@ public enum TtsBenchmarkCommand {
             return .magpie
         case "cosyvoice3", "cosyvoice", "cosy":
             return .cosyVoice3
-        case "styletts2", "style-tts2", "styletts", "style":
-            return .styleTts2
         default:
             logger.warning("Unknown backend '\(name)' — defaulting to kokoro-ane")
             return .kokoroAne
