@@ -1,138 +1,97 @@
-# FluidAudio: tag-20260425 → tag-20260502 Upgrade Notes
+# FluidAudio Upgrade Notes: tag-20260502 → tag-20260509
 
-## Commits Included
+## Summary
 
-| # | Commit | Title |
-|---|--------|-------|
-| 1 | 7c115f6 | feat(tts/kokoro-ane): add laishere 7-stage CoreML chain (ANE-optimized) |
-| 2 | 982f117 | fix: avoid misleading confidence warning in SlidingWindowAsrManager.finish() |
-| 3 | eff1752 | feat(tts/pocket): multi-language support (EN + 9 new packs) |
-| 4 | b82d4f2 | feat(tts): CosyVoice3 Mandarin zero-shot TTS port |
-| 5 | 3d9d422 | feat(tts/magpie): add NVIDIA Magpie TTS Multilingual 357M Swift port |
-| 6 | d89cf01 | docs(models): list CosyVoice3 under Not Production Ready |
-| 7 | e435319 | docs(models): drop Parakeet CTC Japanese + ASR/TTS row cleanups |
-| 8 | 5c16ee1 | docs(models): add Cohere Transcribe + Qwen3-ASR rows |
-| 9 | e332c18 | docs(models): fix Cohere Transcribe Model Sources link target |
-| 10 | 248b76b | feat(tts/styletts2): scaffold StyleTTS2 4-stage pipeline integration |
-| 11 | 00ea906 | fix: remove module_map from MachTaskSelfWrapper subspec |
-| 12 | c4d56a5 | Feat/pocket tts int8 precision swap |
-| 13 | 3e3ee69 | docs: add top-level architecture overview |
-| 14 | 4db4af1 | Add Dictato to showcase |
-| 15 | 4065a99 | Optimized LS-EEND API (major refactor) |
-| 16 | 35f6ba6 | Added Back the Old LS-EEND Constructors |
-| 17 | b5d8017 | feat(asr/parakeet-v3): default to int4-per-channel encoder |
-| 18 | 7603ac6 | feat(tts/benchmark): tts-benchmark CLI covering all TTS backends |
-| 19 | cad8a2b | feat(asr/cohere): long-form transcribeLong + cold/warm docs |
-| 20 | 5bb84bc | Fix DiarizerTimeline Short Segment Filter |
-| 21 | 0a9aace | Fixed short segment filter for trailing tentative segments in DiarizerTimeline |
+21 commits between the two tags. Changes span TTS (Kokoro crash fix, Mandarin G2P pipeline, Magpie nanocodec precision), diarization (concurrency model, timeline bug fix), and code health (StyleTTS2 add/remove, Float16 guard).
 
 ---
 
-## Feature Summary
+## New Features
 
-### TTS Improvements
+### Kokoro ANE — Mandarin (v1.1-zh) (#570)
 
-#### Kokoro ANE — 7-Stage CoreML Pipeline (#547)
-A new ANE-optimized Kokoro variant uses a 7-graph CoreML chain. Benchmark on M2:
-- TTFT p50: 1586 ms (vs 3113 ms for CPU+GPU Kokoro)
-- RTFx: 5.19x real-time
-- WER: 10.8% on MiniMax English corpus
+A new Mandarin variant of the Kokoro-82M ANE model is available. The same 7-stage CoreML chain is used (language-agnostic by construction); only the embedding vocabulary (177 → 171 tokens), HuggingFace subdirectory (`ANE/` → `ANE-zh/`), voice file layout (`voices/<voice>.bin`), and default voice (`af_heart` → `zf_001`) differ.
 
-Not integrated in this release. Our `FluidAudioKokoroSpeaker` uses the standard Kokoro variant which is simpler to initialize and production-ready. A separate model download (`laishere/kokoro-82m-coreml-ane-optimized`) would be needed.
+**Paired Mandarin G2P pipeline** (items 1, 2, 3, 4, 5, 6 from issue #572):
+- **Erhua merging** (#574): folds trailing `儿` into the preceding syllable so `小孩儿` emits a single r-coloured token.
+- **Number/date/currency verbalization** (#573): Chinese numeric expressions are converted to their spoken form before phonemization.
+- **Jieba HMM tail** (#575): re-segments OOV single-character runs via 4-state B/M/E/S Viterbi, recovering proper-noun boundaries (`特朗普`, `比特币`).
+- **g2pW polyphone disambiguation** (#576): int8 BERT-base CoreML classifier (152 MB) resolves ambiguous Hanzi readings (`行`/`长`/`重`/`朝`) using full sentence context. Falls back to dictionary when model is absent.
+- **POS-aware tone sandhi** (#577): grammatical part-of-speech context drives the tone-3 sandhi rule instead of a simple linear scan.
+- **User-supplied custom lexicon** (#578): callers can inject application-domain pronunciations that override the default dictionary.
 
-#### PocketTTS Multi-Language Support (#549)
-PocketTTS now supports 10 language packs: `english`, `french`, `german`, `spanish`, `italian`, `portuguese`, `chinese`, `japanese`, `korean`, `arabic`.
+### Magpie Nanocodec — New Precision Variants (#580, #581)
 
-API change: `PocketTtsManager(directory:)` gains a `language: PocketTtsLanguage` parameter that defaults to `.english`. Backward compatible — our code is unchanged. Language switching requires creating a new manager instance (language is immutable for the lifetime of one manager).
-
-#### PocketTTS Int8 Precision Swap (#558)
-New `PocketTtsPrecision { .fp16, .int8 }` enum for `PocketTtsManager`. The int8 `flowlm_stepv2.mlmodelc` variant reduces memory. Default stays `.fp16` — no behavior change.
-
-#### BETA: NVIDIA Magpie TTS Multilingual 357M (#541)
-New `MagpieTtsManager` for multilingual TTS at 22.05 kHz. Status: BETA — RTFx 0.64x (below real-time), TTFT p50 ~9.6 s. Emits a runtime warning on `initialize()`. Not suitable for production use.
-
-#### BETA: CosyVoice3 Mandarin Zero-Shot TTS (#536)
-New `CosyVoice3TtsManager` for Mandarin/Cantonese zero-shot voice cloning. Status: BETA — RTFx 0.25-0.36x, requires chunking for long phrases. Emits a runtime warning. Not suitable for production use.
-
-#### BETA: StyleTTS2 Integration (#554)
-New 4-stage StyleTTS2 pipeline scaffold. Status: BETA — WER ~44%, RTFx 2.72x but only on ~22 s/phrase output. Emits a runtime warning. Not suitable for production use.
+- **nanocodec v2/v3**: two new fp32 decoder builds; `decoder_step` is now pinned to ANE for ~2× wall speedup on M2.
+- **nanocodec v4 (fp32 + int8 palettize)**: 8-bit kmeans-palettized weights, ~4× smaller on disk, ~11% lower peak RSS, acoustically transparent vs v3. Runs `.cpuOnly` (ANE refuses fp32 input; GPU is 50%+ slower).
+- **Dual-precision API**: `MagpieNanocodecPrecision` enum exposes `.fp32`, `.fp32Pal` (v4), and existing int8 variants.
 
 ---
 
-### ASR Improvements
+## Bug Fixes
 
-#### Cohere Transcribe: Long-Form Audio Support (#564)
-New `CoherePipeline.transcribeLong(audio:models:language:)` handles audio longer than 35 seconds. The prior `transcribe()` silently truncated audio at the 35 s encoder window. `transcribeLong` slices into 35 s chunks with 5 s overlap and stitches chunks via token-level longest-common-substring merge.
+### Kokoro TTS — Metal Crash on Zero-Length Input (#586)
 
-`transcribeLong` is a full superset: audio <= 35 s short-circuits to `transcribe()` with byte-identical output. Our `FluidAudioASR.swift` has been updated to always call `transcribeLong` for the Cohere backend.
+`KokoroSynthesizer.synthesizeChunk()` now throws `TTSError.processingFailed` when `targetTokens == 0` before any MLMultiArray allocation reaches CoreML. Previously a zero-length `put_ids` tensor caused an uncatchable Metal assertion:
 
-#### Parakeet v3: Int4 Encoder Default (#560)
-Parakeet TDT v3 encoder now defaults to `int4-per-channel` quantization (was int8). Reduces model size and may improve throughput on Apple Neural Engine. No API change needed — the encoder precision is baked into `AsrModels.load(from:version:)`.
-
----
-
-### Diarization Improvements
-
-#### LS-EEND API Refactor (#526) — Breaking Change, Fixed
-Major restructuring of the LS-EEND diarizer. `LSEENDModelDescriptor` and `initialize(descriptor:)` have been removed. Metadata is now embedded inside the `.mlmodelc` model description, so no separate JSON file is needed.
-
-Old API (broken after this upgrade):
-```swift
-let descriptor = LSEENDModelDescriptor(variant: .dihard3, modelURL:..., metadataURL:...)
-let diarizer = LSEENDDiarizer()
-try diarizer.initialize(descriptor: descriptor)
+```
+-[MTLDebugComputeCommandEncoder dispatchThreadgroups:threadsPerThreadgroup:]
+    failed assertion `(threadgroupsPerGrid.width(0) * ...) must not be 0.'
 ```
 
-New API:
-```swift
-let model = try LSEENDModel(modelURL: modelURL.appendingPathComponent(modelFile))
-let diarizer = LSEENDDiarizer()
-try diarizer.initialize(model: model)
-```
+`KokoroModelCache` also clamps all cached token lengths with `max(1, inferTokenLength(...))` at all three caching sites as defense-in-depth.
 
-Our `FluidAudioDiarizer.swift` has been updated. The `LSEENDDiarizer()` no-arg constructor (no throws) is available again via the restored constructors in #563.
+**Risk to our code**: We use `KokoroAneManager`, which drives `KokoroSynthesizer` internally. This crash could be triggered by edge-case inputs (empty strings, whitespace-only chunks, very short utterances that phonemize to zero tokens). The fix is now in place upstream; no change needed on our side.
 
-#### DiarizerTimeline Short Segment Filter Fix (#565, #566)
-Two-part fix:
-1. Gaps were closed as soon as any speech appeared instead of waiting for a second segment of sufficient length — `config.minFramesOn` threshold is now correctly applied.
-2. Trailing tentative segments at the end of a buffer emitted incorrect merged spans and wrong activity scores.
+### Diarizer Timeline — Trailing Tentative Segments (#568)
 
-These fix streaming diarization segment boundary accuracy. No API change.
+A bug caused the trailing diarizer segment to disappear when `minFramesOff` was nonzero once speech ended. The `DiarizerTimeline` now correctly finalizes segments rather than discarding tentative trailing entries.
+
+**Risk to our code**: We use `OfflineDiarizerManager`, which goes through `DiarizerManager` and `DiarizerTimeline`. This fix improves offline diarization accuracy at the tail of an audio file; no API change required.
+
+### Float16 Guard on non-ARM64 (#582)
+
+Direct `Float16` memory reads in CosyVoice3 and StyleTTS2 synthesizers are now gated with `#if arch(arm64)`. Prevents compile-time errors on x86_64 Simulator builds.
 
 ---
 
-## Breaking API Changes Requiring Code Updates
+## Refactors and Removals
 
-| Area | Breaking Change | Our Fix |
-|------|----------------|---------|
-| LS-EEND init | `LSEENDModelDescriptor` removed; `initialize(descriptor:)` removed | Use `LSEENDModel(modelURL:)` + `initialize(model:)` in `FluidAudioDiarizer.swift` |
-| Cohere ASR | `transcribe()` silently truncated audio > 35 s | Switch to `transcribeLong()` in `FluidAudioASR.swift` |
+### DiarizerManager De-async + SpeakerManager Struct (#591)
 
----
+`DiarizerManager.performCompleteDiarization` is now synchronous (no `async`). This was possible because `SpeakerManager` — previously a class actor — is now a value-type struct with copy-on-write semantics. The compiler statically enforces exclusive ownership, eliminating the need for async dispatch.
 
-## Risk Assessment
+**Risk to our code**: We do **not** call `DiarizerManager.performCompleteDiarization` directly; we use `OfflineDiarizerManager.process(audio:)`, which remains `async throws`. No change required.
 
-| Change | Risk | Notes |
-|--------|------|-------|
-| LS-EEND API refactor | Medium | Breaking API fixed; runtime behavior unchanged since we load same local files |
-| Cohere transcribeLong | Low | Superset of old transcribe(); short audio byte-identical, long audio now works correctly |
-| PocketTTS multi-lang | Low | Default .english unchanged; no behavior change |
-| PocketTTS int8 | Low | Default stays .fp16; opt-in only |
-| Parakeet v3 int4 default | Low | Smaller model, faster inference; quality equivalent or better per upstream testing |
-| DiarizerTimeline fixes | Low | Bug fixes only; segment boundaries more accurate |
-| BETA TTS (Magpie/CosyVoice3/StyleTTS2) | None | Not integrated; upstream marks as BETA with runtime warning |
-| Kokoro ANE variant | None | Not integrated; requires separate model download |
+### Magpie Refactor — Drop Non-Native synthesizeStream (#589)
+
+`MagpieSynthesizer.synthesizeStream` (the non-native path that buffered full audio then streamed it) is removed. The async `StyleTTS2Synthesizer.predict` path is now the canonical streaming route.
+
+**Risk to our code**: We do not use `MagpieTtsManager` or `MagpieSynthesizer`. No impact.
+
+### StyleTTS2 Add/Remove Cycle
+
+StyleTTS2 was added as a new CoreML backend (commit `ce59fb1`) and then fully removed (commit `024bd8e`) within the same week. No residual code or model references remain in the library. We never used StyleTTS2; no impact.
 
 ---
 
-## New Models Available (not yet integrated)
+## Upgrade Risk Assessment
 
-| Model | Type | Status | Notes |
-|-------|------|--------|-------|
-| NVIDIA Magpie TTS 357M | TTS (multilingual) | BETA | Below real-time |
-| CosyVoice3 | TTS (Mandarin/Cantonese zero-shot) | BETA | Below real-time |
-| StyleTTS2 | TTS (multi-speaker) | BETA | WER ~44% |
-| Kokoro ANE | TTS | Production | ANE-optimized; requires separate `laishere/kokoro-82m-coreml-ane-optimized` download |
-| PocketTTS fr/de/es/it/pt/zh/ja/ko/ar | TTS | Production | 9 new language packs; requires `PocketTtsLanguage` on init |
+| Area | Risk | Notes |
+|------|------|-------|
+| Kokoro ANE TTS | **Low** | Crash fix for `targetTokens == 0` is strictly additive. Existing API unchanged. |
+| Kokoro Mandarin | **None (unused)** | New model variant; requires separate model download (`ANE-zh/`). |
+| Magpie nanocodec | **None (unused)** | We do not use Magpie or CosyVoice. |
+| DiarizerManager sync API | **None** | We use `OfflineDiarizerManager` which stays async. |
+| Diarizer timeline fix | **Low (beneficial)** | Trailing segment accuracy improved at no API cost. |
+| SpeakerManager struct | **None** | Internal to FluidAudio diarization stack. |
+| StyleTTS2 removal | **None** | Never used by us. |
+| Float16 arm64 guard | **None** | Compile fix; no behavior change on arm64. |
 
-Recommendation: Kokoro ANE and PocketTTS language packs are the most viable additions for the next release. BETA backends should wait for upstream quality improvements.
+**Overall upgrade risk: Low.** The only behavioral change relevant to our integration is the Kokoro crash fix, which is purely beneficial.
+
+---
+
+## New Speaker Opportunity
+
+**Mandarin Kokoro ANE TTS** is now supported via the `ANE-zh/` model assets and the new Mandarin G2P pipeline. To support it in Privacy AI, a new `FluidAudioKokoroAneZhSpeaker` class would be needed, pointing to the `ANE-zh/` subfolder and setting `defaultVoice = "zf_001"`. The model requires a separate HuggingFace download. This is not yet implemented — inform the user before proceeding.
