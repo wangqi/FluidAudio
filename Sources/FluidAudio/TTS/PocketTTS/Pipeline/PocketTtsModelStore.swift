@@ -214,10 +214,14 @@ public actor PocketTtsModelStore {
         guard let languageRoot = languageRootDirectory else {
             throw PocketTTSError.modelNotFound("PocketTTS repository not loaded")
         }
+        // Forward the store's offline gate so a pre-staged pack never reaches the network for a
+        // voice prompt either; previously only ensureModels/ensureMimiEncoder honoured it.
+        // wangqi modified 2026-08-12
         let data = try await PocketTtsResourceDownloader.ensureVoice(
             voice,
             language: language,
-            languageRoot: languageRoot
+            languageRoot: languageRoot,
+            skipDownload: skipDownload
         )
         voiceCache[voice] = data
         return data

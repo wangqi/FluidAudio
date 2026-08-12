@@ -210,10 +210,14 @@ public enum PocketTtsResourceDownloader {
     ///   - language: Language pack the voice belongs to. Voice files are
     ///     per-language (same names, different acoustic embeddings).
     ///   - languageRoot: The directory returned by `ensureModels(language:)`.
+    ///   - skipDownload: When `true`, throws instead of fetching a missing voice prompt from
+    ///     HuggingFace. Callers that pre-stage every file (the app's download manager) pass `true`
+    ///     so an offline pack surfaces a precise error rather than a network failure.
     public static func ensureVoice(
         _ voice: String,
         language: PocketTtsLanguage,
-        languageRoot: URL
+        languageRoot: URL,
+        skipDownload: Bool = false
     ) async throws -> PocketTtsVoiceData {
         let sanitized = voice.filter { $0.isLetter || $0.isNumber || $0 == "_" }
         guard !sanitized.isEmpty else {
@@ -224,6 +228,19 @@ public enum PocketTtsResourceDownloader {
         let safetensorsURL = constantsDir.appendingPathComponent(safetensorsFile)
 
         if !FileManager.default.fileExists(atPath: safetensorsURL.path) {
+            // Voice prompts are pre-staged alongside the models by the caller; surface a precise
+            // error instead of a silent HF fetch that fails with a bare 404.
+            // wangqi modified 2026-08-12
+            if skipDownload {
+                logger.info(
+                    "voice '\(sanitized)' missing for \(language.rawValue) and skipDownload is set — not fetching"
+                )
+                throw PocketTTSError.modelNotFound(
+                    "Voice '\(sanitized)' not present for \(language.rawValue) under "
+                        + "\(constantsDir.path); downloads disabled by caller."
+                )
+            }
+
             let remotePath = "\(language.repoSubdirectory)/constants_bin/\(safetensorsFile)"
             let remoteURL = try ModelRegistry.resolveModel(Repo.pocketTts.remotePath, remotePath)
             logger.info(
