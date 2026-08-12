@@ -109,6 +109,52 @@ final class MultilingualG2PTests: XCTestCase {
             ["MultilingualG2PEncoder.mlmodelc", "MultilingualG2PDecoder.mlmodelc"])
     }
 
+    // MARK: - Models Directory Resolution
+
+    private func makeTempDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("g2p-dir-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    func testModelsDirectoryFallsBackToFlatLayout() throws {
+        // Host apps point TtsModels.overrideCacheDirectory at their download folder, where the
+        // G2P models sit at the root rather than under Models/kokoro/.
+        let base = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(
+            at: base.appendingPathComponent(ModelNames.MultilingualG2P.encoderFile),
+            withIntermediateDirectories: true)
+
+        XCTAssertEqual(
+            MultilingualG2PModel.modelsDirectory(base: base).standardizedFileURL,
+            base.standardizedFileURL)
+    }
+
+    func testModelsDirectoryPrefersNestedLayoutWhenPresent() throws {
+        let base = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let nested = base.appendingPathComponent("Models").appendingPathComponent(Repo.kokoro.folderName)
+        try FileManager.default.createDirectory(
+            at: nested.appendingPathComponent(ModelNames.MultilingualG2P.encoderFile),
+            withIntermediateDirectories: true)
+
+        XCTAssertEqual(
+            MultilingualG2PModel.modelsDirectory(base: base).standardizedFileURL,
+            nested.standardizedFileURL)
+    }
+
+    func testModelsDirectoryWithoutAnyEncoderReturnsBase() throws {
+        // Nothing installed: report the flat path so the caller's error names the folder the app uses.
+        let base = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        XCTAssertEqual(
+            MultilingualG2PModel.modelsDirectory(base: base).standardizedFileURL,
+            base.standardizedFileURL)
+    }
+
     func testRepoMultilingualG2P() {
         // Multilingual G2P models are bundled inside the kokoro repo
         XCTAssertEqual(Repo.kokoro.folderName, "kokoro")
