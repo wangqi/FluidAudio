@@ -40,11 +40,89 @@ final class SlidingWindowAsrManagerTests: XCTestCase {
 
     // MARK: - Configuration Tests
 
+    func testConfigDefaultsToNilLanguage() {
+        XCTAssertNil(SlidingWindowAsrConfig.default.language)
+        XCTAssertNil(SlidingWindowAsrConfig.streaming.language)
+        XCTAssertNil(SlidingWindowAsrConfig().language)
+    }
+
+    func testConfigCarriesLanguageHint() {
+        let config = SlidingWindowAsrConfig(language: .german)
+        XCTAssertEqual(config.language, .german)
+    }
+
+    func testApplyingLanguageKeepsOtherFields() {
+        let base = SlidingWindowAsrConfig.streaming
+        let localized = base.applying(language: .polish)
+
+        XCTAssertEqual(localized.language, .polish)
+        XCTAssertEqual(localized.chunkSeconds, base.chunkSeconds)
+        XCTAssertEqual(localized.leftContextSeconds, base.leftContextSeconds)
+        XCTAssertEqual(localized.rightContextSeconds, base.rightContextSeconds)
+        XCTAssertEqual(localized.confirmationThreshold, base.confirmationThreshold)
+    }
+
+    func testApplyingTdtConfigKeepsLanguage() {
+        let base = SlidingWindowAsrConfig(language: .german)
+        let adapted = base.applying(tdtConfig: TdtConfig())
+        XCTAssertEqual(adapted.language, .german)
+    }
+
     func testConfigPresets() {
         // Test default config
         let defaultConfig = SlidingWindowAsrConfig.default
         XCTAssertEqual(defaultConfig.confirmationThreshold, 0.85)
-        XCTAssertEqual(defaultConfig.chunkDuration, 15.0)
+        XCTAssertEqual(defaultConfig.chunkDuration, 11.0)
+    }
+
+    func testPresetWindowsFitModelInput() throws {
+        // The assembled window (left + chunk + right) feeds a fixed-shape
+        // [1, 240000] preprocessor input — presets must never exceed it (issue #686)
+        for config in [SlidingWindowAsrConfig.default, SlidingWindowAsrConfig.streaming] {
+            XCTAssertLessThanOrEqual(config.windowSamples, ASRConstants.maxModelSamples)
+            XCTAssertNoThrow(try config.validate())
+        }
+    }
+
+    func testValidateThrowsForOversizedWindow() {
+        // The old default: 10 + 15 + 2 = 27s = 432,000 samples > 240,000
+        let oversized = SlidingWindowAsrConfig(
+            chunkSeconds: 15.0,
+            leftContextSeconds: 10.0,
+            rightContextSeconds: 2.0
+        )
+        XCTAssertThrowsError(try oversized.validate()) { error in
+            guard case SlidingWindowAsrError.invalidConfiguration = error else {
+                return XCTFail("Expected invalidConfiguration, got \(error)")
+            }
+        }
+    }
+
+    func testStartStreamingThrowsForOversizedWindow() async {
+        let oversized = SlidingWindowAsrConfig(
+            chunkSeconds: 15.0,
+            leftContextSeconds: 10.0,
+            rightContextSeconds: 2.0
+        )
+        let manager = SlidingWindowAsrManager(config: oversized)
+        do {
+            try await manager.startStreaming()
+            XCTFail("startStreaming should reject a window larger than the model input")
+        } catch {
+            guard case SlidingWindowAsrError.invalidConfiguration = error else {
+                return XCTFail("Expected invalidConfiguration, got \(error)")
+            }
+        }
+    }
+
+    func testConvenienceInitializersFitModelInput() throws {
+        // chunkDuration-based initializers must produce valid windows for
+        // any chunk up to the model limit minus their fixed contexts
+        let config = SlidingWindowAsrConfig(chunkDuration: 11.0)
+        XCTAssertNoThrow(try config.validate())
+
+        let custom = SlidingWindowAsrConfig.custom(chunkDuration: 11.0, confirmationThreshold: 0.8)
+        XCTAssertNoThrow(try custom.validate())
     }
 
     func testConfigCalculatedProperties() {
@@ -228,5 +306,76 @@ final class SlidingWindowAsrManagerTests: XCTestCase {
                 _ = config.bufferCapacity
             }
         }
+    }
+
+    // MARK: - Volatile text accumulation (#851)
+
+    func testAppendingVolatileExtendsRatherThanReplaces() {
+        XCTAssertEqual(
+            SlidingWindowAsrManager.appendingVolatile("first window", "second window"), "first window second window")
+    }
+
+    func testAppendingVolatileIgnoresEmptyFlushWindow() {
+        XCTAssertEqual(SlidingWindowAsrManager.appendingVolatile("first window", ""), "first window")
+        XCTAssertEqual(SlidingWindowAsrManager.appendingVolatile("", "only"), "only")
+    }
+
+    /// Seam retirement removes the previous window's last word from the text
+    /// state; with vocabulary boosting that text may carry a replacement, so
+    /// the rendered form is tracked (#897 review).
+    func testRenderedLastWordUsesVocabularyReplacement() {
+        typealias R = VocabularyRescorer.RescoringResult
+        let hit = R(
+            originalWord: "codecs", originalScore: 0.2, replacementWord: "Codex", replacementScore: 0.9,
+            shouldReplace: true, reason: "test")
+        let miss = R(
+            originalWord: "favor", originalScore: 0.5, replacementWord: "flavor", replacementScore: 0.4,
+            shouldReplace: false, reason: "test")
+        XCTAssertEqual(
+            SlidingWindowAsrManager.renderedLastWord(
+                rawText: "validate with codecs?", renderedText: "validate with Codex?", replacements: [hit, miss]),
+            "Codex")
+        XCTAssertEqual(
+            SlidingWindowAsrManager.renderedLastWord(
+                rawText: "help them out.", renderedText: "help them out.", replacements: [hit]),
+            "out.")
+        XCTAssertNil(SlidingWindowAsrManager.renderedLastWord(rawText: "", renderedText: "", replacements: []))
+        // The retirement path tries the raw text first, then the rendered form.
+        XCTAssertNil(SlidingWindowAsrManager.removingTrailingWord("codecs?", from: "validate with Codex?"))
+        XCTAssertEqual(
+            SlidingWindowAsrManager.removingTrailingWord("Codex?", from: "validate with Codex?"), "validate with")
+    }
+
+    /// The final flush window is end-aligned to a full chunk plus the left
+    /// context (#897): a 2–3 s window decoded from a fresh state emits nothing.
+    func testFinalWindowStartIsEndAligned() {
+        let s = 16_000
+        // 0.9 s of new audio behind center 16 s, chunk 8 s, left 2 s: regular
+        // start would be 14 s; end-aligned start is 16.9 - 10 = 6.9 s.
+        XCTAssertEqual(
+            SlidingWindowAsrManager.finalWindowStart(
+                nextCenterStart: 16 * s, effectiveChunk: Int(0.9 * Double(s)), chunk: 8 * s, left: 2 * s),
+            Int(6.9 * Double(s)))
+        // A full final chunk keeps the regular `center - left` start.
+        XCTAssertEqual(
+            SlidingWindowAsrManager.finalWindowStart(
+                nextCenterStart: 16 * s, effectiveChunk: 8 * s, chunk: 8 * s, left: 2 * s),
+            14 * s)
+        // Never before the start of the stream.
+        XCTAssertEqual(
+            SlidingWindowAsrManager.finalWindowStart(
+                nextCenterStart: 0, effectiveChunk: 3 * s, chunk: 8 * s, left: 2 * s),
+            0)
+        XCTAssertEqual(SlidingWindowAsrManager.appendingVolatile("", ""), "")
+    }
+
+    // MARK: - Trailing-word retirement (#897)
+
+    func testRemovingTrailingWordOnlyMatchesWholeWords() {
+        XCTAssertEqual(
+            SlidingWindowAsrManager.removingTrailingWord("an", from: "the net new code and an"), "the net new code and")
+        XCTAssertEqual(SlidingWindowAsrManager.removingTrailingWord("an", from: "an"), "")
+        XCTAssertNil(SlidingWindowAsrManager.removingTrailingWord("an", from: "we have a plan"), "suffix inside a word")
+        XCTAssertNil(SlidingWindowAsrManager.removingTrailingWord("an", from: "and so"))
     }
 }

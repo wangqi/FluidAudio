@@ -90,7 +90,7 @@ final class AsrTranscriptionTests: XCTestCase {
             tokenIds: tokenIds,
             confidences: [0.63, 0.63, 0.63, 0.63, 0.63],  // Mean 0.63 (pure model confidence)
             encoderSequenceLength: 100,
-            audioSamples: audioSamples,
+            audioSampleCount: audioSamples.count,
             processingTime: processingTime
         )
 
@@ -113,7 +113,7 @@ final class AsrTranscriptionTests: XCTestCase {
             timestamps: timestamps,
             confidences: confidences,
             encoderSequenceLength: 150,
-            audioSamples: audioSamples,
+            audioSampleCount: audioSamples.count,
             processingTime: 1.2
         )
 
@@ -134,7 +134,7 @@ final class AsrTranscriptionTests: XCTestCase {
             timestamps: timestamps,
             confidences: [0.51, 0.51, 0.51],  // Mean 0.51 (pure model confidence)
             encoderSequenceLength: 100,
-            audioSamples: audioSamples,
+            audioSampleCount: audioSamples.count,
             processingTime: processingTime
         )
 
@@ -148,10 +148,14 @@ final class AsrTranscriptionTests: XCTestCase {
         XCTAssertEqual(result.tokenTimings?.count, 3)
 
         if let tokenTimings = result.tokenTimings {
-            // Verify timing calculations (80ms per frame)
-            XCTAssertEqual(tokenTimings[0].startTime, 0.8, accuracy: 0.01)  // Frame 10 * 0.08
-            XCTAssertEqual(tokenTimings[1].startTime, 1.6, accuracy: 0.01)  // Frame 20 * 0.08
-            XCTAssertEqual(tokenTimings[2].startTime, 2.4, accuracy: 0.01)  // Frame 30 * 0.08
+            // Verify timing calculations (80ms per frame). The TDT emission-
+            // delay correction in createTokenTimings shifts each frame index
+            // down by 1 (default `TDT_EMISSION_DELAY_FRAMES = 1`) to compensate
+            // for the median +1 frame lag between TDT-emitted timestamps and
+            // CTC log-prob peaks measured on earnings22.
+            XCTAssertEqual(tokenTimings[0].startTime, 0.72, accuracy: 0.01)  // (10 - 1) * 0.08
+            XCTAssertEqual(tokenTimings[1].startTime, 1.52, accuracy: 0.01)  // (20 - 1) * 0.08
+            XCTAssertEqual(tokenTimings[2].startTime, 2.32, accuracy: 0.01)  // (30 - 1) * 0.08
 
             XCTAssertEqual(tokenTimings[0].tokenId, 100)
             XCTAssertEqual(tokenTimings[1].tokenId, 200)

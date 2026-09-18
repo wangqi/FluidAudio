@@ -17,6 +17,37 @@ How the Swift code generates speech from text.
 | `PocketTtsConstantsLoader.swift` | Loads binary constants (embeddings, tokenizer, quantizer weights) |
 | `PocketTtsConstants.swift` | All numeric constants (dimensions, thresholds, etc.) |
 
+## v2.1 — Optimized Re-Conversion (current default)
+
+v2.1 is the **same weights** as v2, re-converted for speed (not a finetune).
+The loader points at `v2.1/<lang>/`. Measured on M-series / macOS 26:
+**~905 ms → ~452–520 ms per utterance (~1.8× RTFx)**; validated end-to-end
+(Whisper: english exact, german_24l intelligible).
+
+| stage | v2 | v2.1 |
+|---|---|---|
+| conditioning | `cond_step`, per-token (~141 calls) | **`cond_prefill`** — whole block in 1 call (122→4.8 ms) |
+| flow decoder | `flow_decoder`, 8-step Euler loop (8 calls/frame) | **`flow_decoder_fused`** — 8 steps fused, 1 call/frame (249→46 ms) |
+| flowlm | fp16 | fp16 (unchanged; int8 `flowlm_stepv2` is the fastest variant) |
+| mimi | unchanged | unchanged (compute-bound floor) |
+
+**ANE residency (measured — corrects earlier claims):** **only
+`flow_decoder_fused` runs on the ANE** (0%→100%; scatter-free fp16 graph).
+`flowlm` and `cond` run on **GPU** — their rank-5 KV-cache `scatter` is rejected
+by the ANE compiler at *any* precision, so the previous "flowlm 1.97× on ANE"
+claim did **not** reproduce on-device. `mimi` is **CPU** (fp16 streaming
+feedback beeps on ANE, and it is compute-bound regardless).
+
+**Per-model compute units (measured fastest):** `flowlm` `.all`,
+`flow_decoder_fused` `.all` (→ANE), `cond_prefill` `.all` (→GPU),
+`mimi_decoder` `.cpuOnly`.
+
+The v2 table below documents the original per-step contracts; v2.1 swaps in the
+fused/prefill artifacts at `v2.1/<lang>/` and otherwise reuses v2's `mimi`,
+`flowlm_stepv2`, and `constants`.
+
+---
+
 ## Model Files & Precision
 
 The four CoreML submodels (plus the optional Mimi encoder) and their
@@ -135,7 +166,17 @@ Splitting priority:
 
 ## CoreML Details
 
-- All 4 models loaded with `.cpuAndGPU` compute units (ANE float16 causes artifacts in Mimi state feedback)
+- Per-model compute units (measured fastest, v2.1): `flowlm`/`flow_decoder_fused` `.all`, `cond_prefill` `.all` (GPU), `mimi_decoder` `.cpuOnly`. Only the fused flow decoder reaches the ANE; mimi stays off the ANE (fp16 streaming-state feedback causes audible artifacts there)
+- **Overriding compute units (#881).** The defaults above are measured on M-series / macOS 26 and are not tunable through `placement`, which only swaps model variants. Some hardware/OS pairs reject a default placement — an M1 Max on macOS 26.6.2 aborts `flow_decoder_fused` on the ANE (`ANEProgramProcessRequestDirect status=0x16`) at both precisions and both placements. Pass `PocketTtsComputeUnits` to `PocketTtsManager` / `PocketTtsModelStore`; every field is optional and `nil` keeps that stage's default:
+
+  ```swift
+  // Keep every stage off the Neural Engine (GPU for the transformer stages, CPU for mimi)
+  let tts = PocketTtsManager(computeUnits: .avoidNeuralEngine)
+  // Or move just the failing stage
+  let tts = PocketTtsManager(computeUnits: PocketTtsComputeUnits(flowDecoder: .cpuAndGPU))
+  ```
+
+  CLI: `fluidaudiocli tts "…" --backend pocket --compute-units no-ane` (also `default`, `all`, `cpu-gpu`, `cpu-ane`, `cpu-only`). Under `.aneState` placement the `flowLM` field governs the fused `pocket_state` functions; that placement is ANE-resident by design, so pair `.avoidNeuralEngine` with `.gpu`.
 - Models compiled from `.mlpackage` → `.mlmodelc` on first load, cached on disk
 - `PocketTtsModelStore` is an actor — thread-safe access to loaded models
 - Voice data cached per voice name to avoid reloading
@@ -225,7 +266,7 @@ text → SentencePiece tokenizer → subword tokens → PocketTTS model → audi
                                           (no external control)
 ```
 
-Unlike Kokoro which uses a CoreML G2P model to convert text to IPA phonemes **before** the model, PocketTTS feeds raw text tokens directly into the neural network. The model learned text→pronunciation mappings during training — there is no phoneme stage to intercept.
+Unlike KokoroAne / StyleTTS2 which run a CoreML G2P model to convert text to IPA phonemes **before** the model, PocketTTS feeds raw text tokens directly into the neural network. The model learned text→pronunciation mappings during training — there is no phoneme stage to intercept.
 
 ### Feature Support
 
@@ -251,7 +292,7 @@ Text-level preprocessing that runs **before** the SentencePiece tokenizer:
 - **Custom lexicon** — no phoneme stage to apply word → IPA mappings
 - **Fine-grained pronunciation control** — the model decides pronunciation from text tokens alone
 
-See [Kokoro.md](Kokoro.md) if you need pronunciation control.
+See [KokoroAne.md](KokoroAne.md) or [StyleTTS2.md](StyleTTS2.md) if you need pronunciation control.
 
 ## Session API
 
@@ -306,8 +347,15 @@ that matches your input text — there is no automatic language detection.
 Notes:
 - French only ships a 24-layer pack upstream (no 6-layer variant).
 - 24-layer packs are higher quality but slower and larger.
-- The 21 voice names (alba, anna, eve, michael, …) are shared across
-  languages, but the underlying acoustic embeddings are per-language.
+- 26 voice names are shared across every language pack, but the underlying
+  acoustic embeddings are per-language. The set is 21 English-trained
+  "literary" voices (alba, anna, azelma, bill_boerst, caro_davy, charles,
+  cosette, eponine, eve, fantine, george, jane, javert, jean, marius, mary,
+  michael, paul, peter_yearsley, stuart_bell, vera) plus 5 voices recorded
+  natively in their target language: `estelle` (French), `lola` (Spanish),
+  `juergen` (German), `rafael` (Portuguese), `giovanni` (Italian). The
+  native-language voices generally produce the most idiomatic prosody for
+  their matching language pack.
 - Mimi encoder weights (used for voice cloning) are language-agnostic and
   always live at the repo root.
 

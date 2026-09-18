@@ -11,10 +11,9 @@ import Foundation
 ///
 /// Backends:
 ///   kokoro-ane    — 7-stage ANE pipeline (per-stage timings, per-stage CU)
-///   kokoro        — single-graph CPU+GPU (chunk-level only)
 ///   pocket-tts    — streaming flow-matching (no per-stage timings)
-///   magpie        — encoder-decoder + NanoCodec (6-stage timings, slow)
-///   cosyvoice3    — Mandarin LLM-based (Mandarin corpus only, no WER)
+///   styletts2     — LibriTTS iteration_3, zero-shot w/ reference audio
+///   supertonic3   — 4-stage multilingual flow-matching diffusion (31 langs)
 ///
 /// Usage:
 ///   fluidaudio tts-benchmark --backend kokoro-ane \
@@ -50,8 +49,9 @@ public enum TtsBenchmarkCommand {
     // The harness supports two ASR backends for the TTS→ASR roundtrip:
     //   .parakeet — Parakeet TDT (English-only, auto-downloaded).
     //   .cohere   — Cohere Transcribe cache-external (14 languages incl. zh).
-    // CosyVoice3's Mandarin output requires `.cohere` for a meaningful CER
-    // — Parakeet's English-only output collapses to ~100% on zh.
+    // Non-English TTS output (e.g. KokoroAne `mandarin` variant) needs
+    // `.cohere` for a meaningful CER — Parakeet's English-only output
+    // collapses to ~100% WER on zh.
     fileprivate enum AsrChoice {
         case skip
         case parakeet
@@ -95,7 +95,6 @@ public enum TtsBenchmarkCommand {
         var corpusName: String?
         var corpusPath: String?
         var voice: String?
-        var speakerName: String?
         var languageName: String?
         var computeUnitsName = "default"
         var outputJson: String?
@@ -105,6 +104,12 @@ public enum TtsBenchmarkCommand {
         var cohereModelDirArg: String?
         var asrLanguageArg: String?
         var cohereComputeUnitsArg: String?
+        var referencePath: String?
+        var variantArg: String?
+        var phonemesMode = false
+        var voiceStylePath: String?
+        var totalStepsArg: Int?
+        var speedArg: Float?
 
         var i = 0
         while i < arguments.count {
@@ -130,11 +135,6 @@ public enum TtsBenchmarkCommand {
                     voice = arguments[i + 1]
                     i += 1
                 }
-            case "--speaker":
-                if i + 1 < arguments.count {
-                    speakerName = arguments[i + 1]
-                    i += 1
-                }
             case "--language":
                 if i + 1 < arguments.count {
                     languageName = arguments[i + 1]
@@ -157,6 +157,8 @@ public enum TtsBenchmarkCommand {
                 }
             case "--skip-asr":
                 skipAsr = true
+            case "--phonemes":
+                phonemesMode = true
             case "--asr-backend":
                 if i + 1 < arguments.count {
                     asrBackendName = arguments[i + 1]
@@ -177,6 +179,31 @@ public enum TtsBenchmarkCommand {
                     cohereComputeUnitsArg = arguments[i + 1]
                     i += 1
                 }
+            case "--reference":
+                if i + 1 < arguments.count {
+                    referencePath = arguments[i + 1]
+                    i += 1
+                }
+            case "--variant":
+                if i + 1 < arguments.count {
+                    variantArg = arguments[i + 1]
+                    i += 1
+                }
+            case "--voice-style":
+                if i + 1 < arguments.count {
+                    voiceStylePath = arguments[i + 1]
+                    i += 1
+                }
+            case "--total-steps":
+                if i + 1 < arguments.count {
+                    totalStepsArg = Int(arguments[i + 1])
+                    i += 1
+                }
+            case "--speed":
+                if i + 1 < arguments.count {
+                    speedArg = Float(arguments[i + 1])
+                    i += 1
+                }
             case "--help", "-h":
                 printUsage()
                 return
@@ -189,7 +216,7 @@ public enum TtsBenchmarkCommand {
         let backend = parseBackend(backendName)
 
         // Resolve corpus.
-        let phrases: [(category: String, text: String)]
+        var phrases: [(category: String, text: String)]
         let corpusLabel: String
         do {
             if let corpusPath {
@@ -210,11 +237,40 @@ public enum TtsBenchmarkCommand {
             logger.error("Corpus is empty after parsing")
             exit(1)
         }
+
+        // --phonemes: each corpus line is `ipa_phonemes|reference_text`.
+        // Synthesis feeds the phonemes (G2P bypass); WER/CER scores against
+        // the reference text. Kokoro ANE only; useful for comparing a
+        // pre-computed frontend against the built-in frontends.
+        var phonemesByReference: [String: String] = [:]
+        if phonemesMode {
+            guard backend == .kokoroAne else {
+                logger.error("--phonemes is only supported for --backend kokoro-ane")
+                exit(1)
+            }
+            var split: [(category: String, text: String)] = []
+            for item in phrases {
+                guard let pipe = item.text.firstIndex(of: "|") else {
+                    logger.error("--phonemes corpus line has no `phonemes|reference` pipe: \(item.text)")
+                    exit(1)
+                }
+                let phonemes = String(item.text[..<pipe]).trimmingCharacters(in: .whitespaces)
+                let reference = String(item.text[item.text.index(after: pipe)...])
+                    .trimmingCharacters(in: .whitespaces)
+                guard !phonemes.isEmpty, !reference.isEmpty else {
+                    logger.error("--phonemes corpus line has empty phonemes or reference: \(item.text)")
+                    exit(1)
+                }
+                phonemesByReference[reference] = phonemes
+                split.append((category: item.category, text: reference))
+            }
+            phrases = split
+        }
         logger.info("Loaded \(phrases.count) phrase(s) from corpus '\(corpusLabel)'")
 
         guard let preset = TtsComputeUnitPreset(cliValue: computeUnitsName) else {
             logger.error(
-                "Unknown --compute-units value: \(computeUnitsName). Expected default | all-ane | cpu-and-gpu | cpu-only."
+                "Unknown --compute-units value: \(computeUnitsName). Expected default | all-ane | cpu-and-gpu | cpu-only | ane-tail-gpu."
             )
             exit(1)
         }
@@ -223,12 +279,10 @@ public enum TtsBenchmarkCommand {
         //   --skip-asr or --asr-backend none → .skip
         //   --asr-backend cohere             → .cohere(modelDir, language)
         //   --asr-backend parakeet           → .parakeet
-        //   no flag, backend == cosyvoice3   → .skip (Parakeet is English-only;
-        //                                       Mandarin output collapses to ~100% WER)
         //   no flag, otherwise               → .parakeet
         let asrChoice: AsrChoice
         do {
-            asrChoice = try resolveAsrChoice(
+            asrChoice = try await resolveAsrChoice(
                 skipAsrFlag: skipAsr,
                 backendName: asrBackendName,
                 cohereModelDir: cohereModelDirArg,
@@ -245,15 +299,12 @@ public enum TtsBenchmarkCommand {
         do {
             switch backend {
             case .kokoroAne:
+                let kaVariant = parseKokoroAneVariant(variantArg)
                 try await runKokoroAne(
                     phrases: phrases, corpusLabel: corpusLabel,
-                    voice: voice ?? KokoroAneConstants.defaultVoice,
-                    preset: preset, outputJson: outputJson, audioDir: audioDir,
-                    asrChoice: asrChoice)
-            case .kokoro:
-                try await runKokoro(
-                    phrases: phrases, corpusLabel: corpusLabel,
-                    voice: voice ?? TtsConstants.recommendedVoice,
+                    variant: kaVariant,
+                    voice: voice ?? kaVariant.defaultVoice,
+                    phonemesByReference: phonemesMode ? phonemesByReference : nil,
                     preset: preset, outputJson: outputJson, audioDir: audioDir,
                     asrChoice: asrChoice)
             case .pocketTts:
@@ -263,16 +314,31 @@ public enum TtsBenchmarkCommand {
                     languageName: languageName,
                     preset: preset, outputJson: outputJson, audioDir: audioDir,
                     asrChoice: asrChoice)
-            case .magpie:
-                try await runMagpie(
+            case .styleTts2:
+                try await runStyleTTS2(
                     phrases: phrases, corpusLabel: corpusLabel,
-                    speakerName: speakerName, languageName: languageName,
+                    referencePath: referencePath,
                     preset: preset, outputJson: outputJson, audioDir: audioDir,
                     asrChoice: asrChoice)
-            case .cosyVoice3:
-                try await runCosyVoice3(
+            case .supertonic3:
+                try await runSupertonic3(
                     phrases: phrases, corpusLabel: corpusLabel,
-                    voice: voice,
+                    voiceStylePath: voiceStylePath,
+                    languageName: languageName,
+                    totalSteps: totalStepsArg
+                        ?? Supertonic3Constants.defaultTotalSteps,
+                    speed: speedArg ?? Supertonic3Constants.defaultSpeed,
+                    preset: preset, outputJson: outputJson, audioDir: audioDir,
+                    asrChoice: asrChoice)
+            case .chatterbox:
+                try await runChatterbox(
+                    phrases: phrases, corpusLabel: corpusLabel,
+                    languageName: languageName,
+                    preset: preset, outputJson: outputJson, audioDir: audioDir,
+                    asrChoice: asrChoice)
+            case .chatterboxNano:
+                try await runChatterboxNano(
+                    phrases: phrases, corpusLabel: corpusLabel,
                     preset: preset, outputJson: outputJson, audioDir: audioDir,
                     asrChoice: asrChoice)
             }
@@ -287,14 +353,16 @@ public enum TtsBenchmarkCommand {
     private static func runKokoroAne(
         phrases: [(category: String, text: String)],
         corpusLabel: String,
+        variant: KokoroAneVariant,
         voice: String,
+        phonemesByReference: [String: String]?,
         preset: TtsComputeUnitPreset,
         outputJson: String?,
         audioDir: String?,
         asrChoice: AsrChoice
     ) async throws {
         let units = KokoroAneComputeUnits(preset: preset)
-        let manager = KokoroAneManager(defaultVoice: voice, computeUnits: units)
+        let manager = KokoroAneManager(variant: variant, defaultVoice: voice, computeUnits: units)
 
         let coldStart = Date()
         try await manager.initialize()
@@ -302,8 +370,15 @@ public enum TtsBenchmarkCommand {
         logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
 
         let firstStart = Date()
-        _ = try await manager.synthesizeDetailed(
-            text: "Initialization warm-up.", voice: voice, speed: 1.0)
+        if let phonemesByReference {
+            // Warm up through the same bypass the loop uses.
+            let warmUp = phrases.first.flatMap { phonemesByReference[$0.text] } ?? "aɾʲiɡatoː"
+            _ = try await manager.synthesizeFromPhonemesDetailed(warmUp, voice: voice, speed: 1.0)
+        } else {
+            let warmUpText = variant == .japanese ? "初期化します。" : "Initialization warm-up."
+            _ = try await manager.synthesizeDetailed(
+                text: warmUpText, voice: voice, speed: 1.0)
+        }
         let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
         logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
 
@@ -318,11 +393,23 @@ public enum TtsBenchmarkCommand {
             outputJson: outputJson,
             audioDir: audioDir,
             asrChoice: asrChoice,
+            // Native level — KokoroAne ships un-normalized output (#852).
+            normalizeWavs: false,
             extraSummary: ["voice": voice]
         ) { text in
             let t0 = Date()
-            let result = try await manager.synthesizeDetailed(
-                text: text, voice: voice, speed: 1.0)
+            let result: KokoroAneSynthesisResult
+            if let phonemesByReference {
+                guard let phonemes = phonemesByReference[text] else {
+                    throw KokoroAneError.inputProcessingFailed(
+                        "No phonemes mapped for reference: \(text)")
+                }
+                result = try await manager.synthesizeFromPhonemesDetailed(
+                    phonemes, voice: voice, speed: 1.0)
+            } else {
+                result = try await manager.synthesizeDetailed(
+                    text: text, voice: voice, speed: 1.0)
+            }
             let synthMs = Date().timeIntervalSince(t0) * 1000
             return BackendPhraseSample(
                 synthMs: synthMs,
@@ -342,61 +429,6 @@ public enum TtsBenchmarkCommand {
                 extraFields: [
                     "encoder_tokens": result.encoderTokens,
                     "acoustic_frames": result.acousticFrames,
-                ]
-            )
-        }
-    }
-
-    // MARK: - Kokoro driver (single-graph)
-
-    private static func runKokoro(
-        phrases: [(category: String, text: String)],
-        corpusLabel: String,
-        voice: String,
-        preset: TtsComputeUnitPreset,
-        outputJson: String?,
-        audioDir: String?,
-        asrChoice: AsrChoice
-    ) async throws {
-        let units = preset.uniformUnits ?? .all
-        let manager = KokoroTtsManager(defaultVoice: voice, computeUnits: units)
-
-        let coldStart = Date()
-        try await manager.initialize(preloadVoices: [voice])
-        let coldStartS = Date().timeIntervalSince(coldStart)
-        logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
-
-        let firstStart = Date()
-        _ = try await manager.synthesizeDetailed(text: "Initialization warm-up.", voice: voice)
-        let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
-        logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
-
-        try await runPhraseLoop(
-            backendId: "kokoro",
-            voiceLabel: voice,
-            corpusLabel: corpusLabel,
-            phrases: phrases,
-            preset: preset,
-            coldStartS: coldStartS,
-            firstSynthMs: firstSynthMs,
-            outputJson: outputJson,
-            audioDir: audioDir,
-            asrChoice: asrChoice,
-            extraSummary: ["voice": voice]
-        ) { text in
-            let t0 = Date()
-            let result = try await manager.synthesizeDetailed(text: text, voice: voice)
-            let synthMs = Date().timeIntervalSince(t0) * 1000
-            let samples = result.chunks.flatMap { $0.samples }
-            return BackendPhraseSample(
-                synthMs: synthMs,
-                ttftMs: synthMs,
-                samples: samples,
-                sampleRate: 24000,
-                stageMs: [:],
-                extraFields: [
-                    "chunk_count": result.chunks.count,
-                    "wav_bytes": result.audio.count,
                 ]
             )
         }
@@ -458,6 +490,7 @@ public enum TtsBenchmarkCommand {
             outputJson: outputJson,
             audioDir: audioDir,
             asrChoice: asrChoice,
+            normalizeWavs: true,
             extraSummary: ["voice": voice, "language": language.rawValue]
         ) { text in
             // PocketTTS is streaming-first: we measure TTFT (time to first
@@ -492,25 +525,32 @@ public enum TtsBenchmarkCommand {
         }
     }
 
-    // MARK: - Magpie driver
+    // MARK: - StyleTTS2 driver
 
-    private static func runMagpie(
+    private static func runStyleTTS2(
         phrases: [(category: String, text: String)],
         corpusLabel: String,
-        speakerName: String?,
-        languageName: String?,
+        referencePath: String?,
         preset: TtsComputeUnitPreset,
         outputJson: String?,
         audioDir: String?,
         asrChoice: AsrChoice
     ) async throws {
-        let units = preset.uniformUnits ?? .cpuAndNeuralEngine
-        let language = parseMagpieLanguage(languageName)
-        let speaker = parseMagpieSpeaker(speakerName)
-        logger.info("Magpie speaker=\(speaker.displayName) language=\(language.rawValue)")
+        guard let referencePath, !referencePath.isEmpty else {
+            logger.error(
+                "styletts2 backend requires --reference <speaker-audio-file> "
+                    + "(any sample rate / channel layout — resampled to 24 kHz mono).")
+            exit(1)
+        }
+        let referenceURL = resolveURL(referencePath, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: referenceURL.path) else {
+            logger.error("Reference audio not found: \(referenceURL.path)")
+            exit(1)
+        }
+        logger.info("StyleTTS2 reference audio: \(referenceURL.path)")
 
-        let manager = MagpieTtsManager(
-            computeUnits: units, preferredLanguages: [language])
+        let units = preset.uniformUnits ?? .cpuAndNeuralEngine
+        let manager = StyleTTS2Manager(computeUnits: units)
 
         let coldStart = Date()
         try await manager.initialize()
@@ -519,13 +559,14 @@ public enum TtsBenchmarkCommand {
 
         let firstStart = Date()
         _ = try await manager.synthesize(
-            text: "Initialization warm-up.", speaker: speaker, language: language)
+            text: "Initialization warm-up.",
+            referenceAudioURL: referenceURL)
         let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
         logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
 
         try await runPhraseLoop(
-            backendId: "magpie",
-            voiceLabel: speaker.displayName,
+            backendId: "styletts2",
+            voiceLabel: referenceURL.lastPathComponent,
             corpusLabel: corpusLabel,
             phrases: phrases,
             preset: preset,
@@ -534,62 +575,91 @@ public enum TtsBenchmarkCommand {
             outputJson: outputJson,
             audioDir: audioDir,
             asrChoice: asrChoice,
+            normalizeWavs: true,
             extraSummary: [
-                "speaker": speaker.displayName, "language": language.rawValue,
+                "reference": referenceURL.path,
+                "alpha": Double(StyleTTS2Constants.defaultAlpha),
+                "beta": Double(StyleTTS2Constants.defaultBeta),
             ]
         ) { text in
-            // Magpie is a batch / offline model — `synthesize()` runs the
-            // full chunked AR + codec pipeline and returns a single
-            // `MagpieSynthesisResult`. TTFT therefore equals synthMs (no
-            // incremental yield to measure against).
+            // StyleTTS2 is a one-shot diffusion-based synthesizer — no
+            // streaming yield, so TTFT == synthMs. The per-phrase mel
+            // recompute is tiny vs. the 5-step ADPM2 + decoder cost.
             let t0 = Date()
-            let result = try await manager.synthesize(
-                text: text, speaker: speaker, language: language)
+            let samples = try await manager.synthesize(
+                text: text, referenceAudioURL: referenceURL)
             let synthMs = Date().timeIntervalSince(t0) * 1000
             return BackendPhraseSample(
                 synthMs: synthMs,
                 ttftMs: synthMs,
-                samples: result.samples,
-                sampleRate: result.sampleRate,
+                samples: samples,
+                sampleRate: StyleTTS2Constants.sampleRate,
                 stageMs: [:],
-                extraFields: [
-                    "code_count": result.codeCount,
-                    "finished_on_eos": result.finishedOnEos,
-                ]
+                extraFields: [:]
             )
         }
     }
 
-    // MARK: - CosyVoice3 driver
+    // MARK: - Supertonic-3 driver
 
-    private static func runCosyVoice3(
+    private static func runSupertonic3(
         phrases: [(category: String, text: String)],
         corpusLabel: String,
-        voice: String?,
+        voiceStylePath: String?,
+        languageName: String?,
+        totalSteps: Int,
+        speed: Float,
         preset: TtsComputeUnitPreset,
         outputJson: String?,
         audioDir: String?,
         asrChoice: AsrChoice
     ) async throws {
+        guard let voiceStylePath, !voiceStylePath.isEmpty else {
+            logger.error(
+                "supertonic3 backend requires --voice-style <path-to-voice.json> "
+                    + "(e.g. M1.json from FluidInference/supertonic-3-coreml).")
+            exit(1)
+        }
+        let voiceURL = resolveURL(voiceStylePath, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: voiceURL.path) else {
+            logger.error("Voice style JSON not found: \(voiceURL.path)")
+            exit(1)
+        }
+        let style: Supertonic3VoiceStyle
+        do {
+            style = try Supertonic3VoiceStyle.load(from: voiceURL)
+        } catch {
+            logger.error("Failed to load voice style: \(error.localizedDescription)")
+            exit(1)
+        }
+
+        let language = resolveSupertonic3Language(
+            explicit: languageName, corpus: corpusLabel)
+        logger.info(
+            "Supertonic-3 voice=\(style.name) lang=\(language) "
+                + "steps=\(totalSteps) speed=\(speed)")
+
         let units = preset.uniformUnits ?? .cpuAndNeuralEngine
-        let voiceId = voice ?? "cosyvoice3-default-zh"
+        let manager = Supertonic3Manager(computeUnits: units)
 
         let coldStart = Date()
-        let manager = try await CosyVoice3TtsManager.downloadAndCreate(
-            cacheDirectory: nil, includeDefaultVoice: true, computeUnits: units)
         try await manager.initialize()
-        let promptAssets = try await manager.loadVoice(voiceId)
         let coldStartS = Date().timeIntervalSince(coldStart)
-        logger.info(String(format: "Cold start (download+init+voice): %.2fs", coldStartS))
+        logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
 
         let firstStart = Date()
-        _ = try await manager.synthesize(text: "你好", promptAssets: promptAssets)
+        _ = try await manager.synthesize(
+            text: "Initialization warm-up.",
+            language: language,
+            style: style,
+            totalSteps: totalSteps,
+            speed: speed)
         let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
         logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
 
         try await runPhraseLoop(
-            backendId: "cosyvoice3",
-            voiceLabel: voiceId,
+            backendId: "supertonic3",
+            voiceLabel: style.name,
             corpusLabel: corpusLabel,
             phrases: phrases,
             preset: preset,
@@ -598,27 +668,189 @@ public enum TtsBenchmarkCommand {
             outputJson: outputJson,
             audioDir: audioDir,
             asrChoice: asrChoice,
-            extraSummary: ["voice": voiceId]
+            normalizeWavs: true,
+            extraSummary: [
+                "voice_style": style.name,
+                "language": language,
+                "total_steps": totalSteps,
+                "speed": Double(speed),
+            ]
         ) { text in
+            // Supertonic-3 is a one-shot diffusion synthesizer — `synthesize`
+            // returns the full waveform after the 8-step vector_estimator
+            // loop completes, so TTFT == synthMs (no incremental yield).
             let t0 = Date()
-            let result = try await manager.synthesize(text: text, promptAssets: promptAssets)
+            let result = try await manager.synthesize(
+                text: text, language: language, style: style,
+                totalSteps: totalSteps, speed: speed)
             let synthMs = Date().timeIntervalSince(t0) * 1000
             return BackendPhraseSample(
                 synthMs: synthMs,
                 ttftMs: synthMs,
                 samples: result.samples,
-                sampleRate: result.sampleRate,
+                sampleRate: Supertonic3Constants.sampleRate,
                 stageMs: [:],
                 extraFields: [
-                    "generated_token_count": result.generatedTokenCount,
-                    "decoded_token_count": result.decodedTokens.count,
-                    // Surface the structural 250-token Flow-input cap as a
-                    // per-phrase boolean so corpus reports can tally how many
-                    // long phrases hit silent truncation.
-                    "finished_on_eos": result.finishedOnEos,
+                    "total_steps": totalSteps,
+                    "speed": Double(speed),
                 ]
             )
         }
+    }
+
+    // MARK: - Chatterbox driver
+
+    private static func runChatterbox(
+        phrases: [(category: String, text: String)],
+        corpusLabel: String,
+        languageName: String?,
+        preset: TtsComputeUnitPreset,
+        outputJson: String?,
+        audioDir: String?,
+        asrChoice: AsrChoice
+    ) async throws {
+        guard #available(macOS 15.0, *) else {
+            logger.error("chatterbox backend requires macOS 15+ (MLState KV cache)")
+            exit(1)
+        }
+        // The Chatterbox loaders pin every model to .cpuAndGPU (the T3
+        // packages crash on .cpuOnly and the ANE compiler rejects them), so
+        // other presets cannot be honored — warn and report what actually ran.
+        if preset != .default && preset != .cpuAndGpu {
+            logger.warning(
+                "Chatterbox always runs .cpuAndGPU; --compute-units \(preset.cliValue) not supported."
+            )
+        }
+        let appliedPreset = TtsComputeUnitPreset.cpuAndGpu
+        let language = resolveChatterboxLanguage(explicit: languageName, corpus: corpusLabel)
+        logger.info("Chatterbox language=\(language) voice=default")
+
+        let manager = ChatterboxManager()
+        let coldStart = Date()
+        try await manager.initialize()
+        let coldStartS = Date().timeIntervalSince(coldStart)
+        logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
+
+        let firstStart = Date()
+        _ = try await manager.synthesize(
+            text: "Initialization warm-up.", language: language, seed: 42)
+        let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
+        logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
+
+        try await runPhraseLoop(
+            backendId: "chatterbox",
+            voiceLabel: "default",
+            corpusLabel: corpusLabel,
+            phrases: phrases,
+            preset: appliedPreset,
+            coldStartS: coldStartS,
+            firstSynthMs: firstSynthMs,
+            outputJson: outputJson,
+            audioDir: audioDir,
+            asrChoice: asrChoice,
+            normalizeWavs: true,
+            extraSummary: [
+                "language": language,
+                "seed": 42,
+            ]
+        ) { text in
+            // One-shot backend: the AR decode + flow + vocoder complete
+            // before any audio is available, so TTFT == synthMs.
+            let t0 = Date()
+            let result = try await manager.synthesize(
+                text: text, language: language, seed: 42)
+            let synthMs = Date().timeIntervalSince(t0) * 1000
+            return BackendPhraseSample(
+                synthMs: synthMs,
+                ttftMs: synthMs,
+                samples: result.samples,
+                sampleRate: ChatterboxConstants.sampleRate,
+                stageMs: [:],
+                extraFields: [:]
+            )
+        }
+    }
+
+    // MARK: - Chatterbox Nano driver
+
+    private static func runChatterboxNano(
+        phrases: [(category: String, text: String)],
+        corpusLabel: String,
+        preset: TtsComputeUnitPreset,
+        outputJson: String?,
+        audioDir: String?,
+        asrChoice: AsrChoice
+    ) async throws {
+        guard #available(macOS 15.0, *) else {
+            logger.error("chatterbox-nano backend requires macOS 15+ (MLState KV cache)")
+            exit(1)
+        }
+        if preset != .default && preset != .cpuAndGpu {
+            logger.warning(
+                "Chatterbox Nano always runs .cpuAndGPU; --compute-units \(preset.cliValue) not supported."
+            )
+        }
+        let appliedPreset = TtsComputeUnitPreset.cpuAndGpu
+        logger.info("Chatterbox Nano voice=default")
+
+        let manager = ChatterboxNanoManager()
+        let coldStart = Date()
+        try await manager.initialize()
+        let coldStartS = Date().timeIntervalSince(coldStart)
+        logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
+
+        let firstStart = Date()
+        _ = try await manager.synthesize(text: "Initialization warm-up.", seed: 42)
+        let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
+        logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
+
+        try await runPhraseLoop(
+            backendId: "chatterbox-nano",
+            voiceLabel: "default",
+            corpusLabel: corpusLabel,
+            phrases: phrases,
+            preset: appliedPreset,
+            coldStartS: coldStartS,
+            firstSynthMs: firstSynthMs,
+            outputJson: outputJson,
+            audioDir: audioDir,
+            asrChoice: asrChoice,
+            normalizeWavs: true,
+            extraSummary: [
+                "language": "en",
+                "seed": 42,
+            ]
+        ) { text in
+            // One-shot backend: the AR decode + flow + vocoder complete
+            // before any audio is available, so TTFT == synthMs.
+            let t0 = Date()
+            let result = try await manager.synthesize(text: text, seed: 42)
+            let synthMs = Date().timeIntervalSince(t0) * 1000
+            return BackendPhraseSample(
+                synthMs: synthMs,
+                ttftMs: synthMs,
+                samples: result.samples,
+                sampleRate: ChatterboxNanoConstants.sampleRate,
+                stageMs: [:],
+                extraFields: [:]
+            )
+        }
+    }
+
+    /// Map `--language` or a `minimax-<lang>` corpus name onto a Chatterbox
+    /// language code. Falls back to English.
+    private static func resolveChatterboxLanguage(explicit: String?, corpus: String) -> String {
+        if let explicit {
+            let lang = explicit.lowercased()
+            return ChatterboxConstants.supportedLanguages.contains(lang) ? lang : "en"
+        }
+        let corpusLangs: [String: String] = [
+            "minimax-english": "en", "minimax-german": "de", "minimax-french": "fr",
+            "minimax-spanish": "es", "minimax-italian": "it", "minimax-portuguese": "pt",
+            "minimax-dutch": "nl", "minimax-polish": "pl", "minimax-turkish": "tr",
+            "minimax-arabic": "ar", "minimax-hindi": "hi",
+        ]
+        return corpusLangs[corpus.lowercased()] ?? "en"
     }
 
     // MARK: - Shared per-phrase loop + summary
@@ -634,6 +866,7 @@ public enum TtsBenchmarkCommand {
         outputJson: String?,
         audioDir: String?,
         asrChoice: AsrChoice,
+        normalizeWavs: Bool,
         extraSummary: [String: Any],
         synthOne: (String) async throws -> BackendPhraseSample
     ) async throws {
@@ -671,7 +904,8 @@ public enum TtsBenchmarkCommand {
                     .appendingPathComponent("tts-benchmark-\(UUID().uuidString).wav")
             }
             let wavData = try AudioWAV.data(
-                from: sample.samples, sampleRate: Double(sample.sampleRate))
+                from: sample.samples, sampleRate: Double(sample.sampleRate),
+                normalize: normalizeWavs)
             try wavData.write(to: wavURL)
 
             var werValue = Double.nan
@@ -882,31 +1116,31 @@ public enum TtsBenchmarkCommand {
 
     private enum Backend: String {
         case kokoroAne
-        case kokoro
         case pocketTts
-        case magpie
-        case cosyVoice3
+        case styleTts2
+        case supertonic3
+        case chatterbox
+        case chatterboxNano
 
         var defaultCorpus: String {
-            switch self {
-            case .cosyVoice3: return "minimax-chinese"
-            default: return "minimax-english"
-            }
+            return "minimax-english"
         }
     }
 
     private static func parseBackend(_ name: String) -> Backend {
         switch name.lowercased() {
-        case "kokoro-ane", "kokoroane", "kokoro_ane", "lai":
+        case "kokoro-ane", "kokoroane", "kokoro_ane", "kokoro", "lai":
             return .kokoroAne
-        case "kokoro":
-            return .kokoro
         case "pocket-tts", "pockettts", "pocket":
             return .pocketTts
-        case "magpie":
-            return .magpie
-        case "cosyvoice3", "cosyvoice", "cosy":
-            return .cosyVoice3
+        case "styletts2", "style-tts2", "styletts", "style-tts":
+            return .styleTts2
+        case "supertonic3", "supertonic-3", "sup3", "supertonic":
+            return .supertonic3
+        case "chatterbox", "chatterbox-mtl", "chatterbox-multilingual":
+            return .chatterbox
+        case "chatterbox-nano", "chatterboxnano":
+            return .chatterboxNano
         default:
             logger.warning("Unknown backend '\(name)' — defaulting to kokoro-ane")
             return .kokoroAne
@@ -920,21 +1154,67 @@ public enum TtsBenchmarkCommand {
         return l
     }
 
-    private static func parseMagpieLanguage(_ name: String?) -> MagpieLanguage {
-        guard let name, let l = MagpieLanguage(rawValue: name.lowercased()) else {
-            return .english
+    /// Map an explicit `--language` flag or a `minimax-<lang>` corpus name
+    /// onto one of the 31 ISO codes accepted by Supertonic-3
+    /// (`Supertonic3Constants.availableLanguages`). Falls back to English.
+    private static func resolveSupertonic3Language(
+        explicit: String?, corpus: String
+    ) -> String {
+        if let explicit, !explicit.isEmpty {
+            let lower = explicit.lowercased()
+            if Supertonic3Constants.availableLanguages.contains(lower) {
+                return lower
+            }
+            if let mapped = supertonic3LanguageAliases[lower] {
+                return mapped
+            }
         }
-        return l
+        let lower = corpus.lowercased()
+        for (needle, code) in supertonic3CorpusToLanguage where lower.contains(needle) {
+            return code
+        }
+        return "en"
     }
 
-    private static func parseMagpieSpeaker(_ name: String?) -> MagpieSpeaker {
+    /// Long-name → ISO code aliases for the `--language` flag.
+    private static let supertonic3LanguageAliases: [String: String] = [
+        "english": "en", "korean": "ko", "japanese": "ja", "arabic": "ar",
+        "bulgarian": "bg", "czech": "cs", "danish": "da", "german": "de",
+        "greek": "el", "spanish": "es", "estonian": "et", "finnish": "fi",
+        "french": "fr", "hindi": "hi", "croatian": "hr", "hungarian": "hu",
+        "indonesian": "id", "italian": "it", "lithuanian": "lt",
+        "latvian": "lv", "dutch": "nl", "polish": "pl", "portuguese": "pt",
+        "romanian": "ro", "russian": "ru", "slovak": "sk", "slovenian": "sl",
+        "swedish": "sv", "turkish": "tr", "ukrainian": "uk",
+        "vietnamese": "vi",
+    ]
+
+    /// Ordered scan list for `minimax-<lang>` corpus labels — longest /
+    /// least-ambiguous matches first.
+    private static let supertonic3CorpusToLanguage: [(String, String)] = [
+        ("korean", "ko"), ("japanese", "ja"), ("arabic", "ar"),
+        ("bulgarian", "bg"), ("czech", "cs"), ("danish", "da"),
+        ("german", "de"), ("greek", "el"), ("spanish", "es"),
+        ("estonian", "et"), ("finnish", "fi"), ("french", "fr"),
+        ("hindi", "hi"), ("croatian", "hr"), ("hungarian", "hu"),
+        ("indonesian", "id"), ("italian", "it"), ("lithuanian", "lt"),
+        ("latvian", "lv"), ("dutch", "nl"), ("polish", "pl"),
+        ("portuguese", "pt"), ("romanian", "ro"), ("russian", "ru"),
+        ("slovak", "sk"), ("slovenian", "sl"), ("swedish", "sv"),
+        ("turkish", "tr"), ("ukrainian", "uk"), ("vietnamese", "vi"),
+        ("english", "en"),
+    ]
+
+    private static func parseKokoroAneVariant(_ name: String?) -> KokoroAneVariant {
         switch name?.lowercased() {
-        case "sofia": return .sofia
-        case "aria": return .aria
-        case "jason": return .jason
-        case "leo": return .leo
-        case "john", nil, "": return .john
-        default: return .john
+        case "mandarin", "zh", "chinese", "zh-cn":
+            return .mandarin
+        case "japanese", "ja", "jp":
+            return .japanese
+        case "english", "en", "en-us", nil, "":
+            return .english
+        default:
+            return .english
         }
     }
 
@@ -961,9 +1241,9 @@ public enum TtsBenchmarkCommand {
     /// Map CLI flags + TTS backend defaults to a concrete `AsrChoice`.
     ///
     /// Precedence: `--skip-asr` and `--asr-backend none` always win. With
-    /// no flag, English-friendly TTS backends default to Parakeet TDT and
-    /// CosyVoice3 defaults to `.skip` (Parakeet is English-only — its WER
-    /// on Mandarin output reads ~100% and is meaningless).
+    /// no flag, defaults to Parakeet TDT (English-only). Non-English TTS
+    /// output (e.g. KokoroAne `mandarin` variant) should use Cohere via
+    /// `--asr-backend cohere`.
     private static func resolveAsrChoice(
         skipAsrFlag: Bool,
         backendName: String?,
@@ -972,14 +1252,14 @@ public enum TtsBenchmarkCommand {
         cohereComputeUnits: String?,
         corpusLabel: String,
         ttsBackend: Backend
-    ) throws -> AsrChoice {
+    ) async throws -> AsrChoice {
         let normalized = backendName?.lowercased()
         if skipAsrFlag || normalized == "none" {
             return .skip
         }
         switch normalized {
         case "cohere":
-            let dir = try resolveCohereModelDir(cohereModelDir)
+            let dir = try await resolveCohereModelDir(cohereModelDir)
             let language = inferCohereLanguage(
                 explicit: asrLanguage, corpus: corpusLabel)
             let units = try resolveCohereComputeUnits(cohereComputeUnits)
@@ -987,14 +1267,6 @@ public enum TtsBenchmarkCommand {
         case "parakeet":
             return .parakeet
         case nil:
-            // Implicit defaults: skip for CosyVoice3 (no English ASR pairing),
-            // Parakeet otherwise.
-            if ttsBackend == .cosyVoice3 {
-                logger.info(
-                    "CosyVoice3: no --asr-backend selected; skipping ASR. "
-                        + "Pass `--asr-backend cohere --cohere-model-dir <dir>` for CER.")
-                return .skip
-            }
             return .parakeet
         default:
             logger.warning(
@@ -1011,34 +1283,39 @@ public enum TtsBenchmarkCommand {
     ///   1. Explicit `--cohere-model-dir <path>`.
     ///   2. The default cache location at
     ///      `~/Library/Application Support/FluidAudio/Models/cohere-transcribe/q8`,
-    ///      matching `Repo.cohereTranscribeCoreml.folderName`.
+    ///      matching `Repo.cohereTranscribeCoreml.folderName`. Auto-downloaded
+    ///      from HuggingFace if missing.
     ///
-    /// Auto-download is intentionally not wired here: the upstream
-    /// `Repo.cohereTranscribeCoreml` registration ships `vocab.json` in
-    /// `requiredModels`, but the file lives at the repo root rather than
-    /// under the `q8/` subPath, so `DownloadUtils.downloadRepo` would fail
-    /// the post-download verify. Fix this when the registry learns about
-    /// repo-root files; until then, callers must pre-populate the cache
-    /// (e.g. via `fluidaudio cohere-transcribe ... --model-dir <dir>`).
-    private static func resolveCohereModelDir(_ override: String?) throws -> URL {
+    /// `Repo.cohereTranscribeCoreml` ships `vocab.json` in `requiredModels`, and
+    /// that file lives at the repo root rather than under the `q8/` subPath.
+    /// `ModelHub.download` now sweeps the repo root for required
+    /// auxiliary files (issue #649), so auto-download resolves it correctly.
+    private static func resolveCohereModelDir(_ override: String?) async throws -> URL {
         if let override {
             return resolveURL(override, isDirectory: true)
         }
         let appSupport = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask, appropriateFor: nil, create: true)
-        let target =
-            appSupport
-            .appendingPathComponent("FluidAudio/Models/cohere-transcribe/q8")
+        // `ModelHub.download` appends `repo.folderName` (cohere-transcribe/q8), so
+        // pass the Models base dir and let it land the bundle at `target`.
+        let modelsBase = appSupport.appendingPathComponent("FluidAudio/Models")
+        let target = modelsBase.appendingPathComponent("cohere-transcribe/q8")
         let needed = [
             ModelNames.CohereTranscribe.encoderCompiledFile,
             ModelNames.CohereTranscribe.decoderCacheExternalV2CompiledFile,
             "vocab.json",
         ]
-        let missing = needed.filter { name in
-            !FileManager.default.fileExists(
-                atPath: target.appendingPathComponent(name).path)
+        func missingFiles() -> [String] {
+            needed.filter { name in
+                !FileManager.default.fileExists(
+                    atPath: target.appendingPathComponent(name).path)
+            }
         }
+        if !missingFiles().isEmpty {
+            try await ModelHub.download(.cohereTranscribeCoreml, to: modelsBase)
+        }
+        let missing = missingFiles()
         guard missing.isEmpty else {
             throw NSError(
                 domain: "TtsBenchmark", code: 1,
@@ -1190,10 +1467,10 @@ public enum TtsBenchmarkCommand {
 
             Backends:
               kokoro-ane    7-stage ANE pipeline (per-stage timings, per-stage CU)
-              kokoro        Single-graph CPU+GPU
               pocket-tts    Streaming flow-matching (multilingual)
-              magpie        Encoder-decoder + NanoCodec (per-stage, slow)
-              cosyvoice3    Mandarin LLM-based (auto-picks Cohere ASR for zh)
+              styletts2     LibriTTS iteration_3, zero-shot, requires --reference
+              supertonic3   4-stage multilingual flow-matching (31 langs);
+                            requires --voice-style <preset.json>
 
             Options:
               --backend <name>          See list above (default: kokoro-ane)
@@ -1202,10 +1479,10 @@ public enum TtsBenchmarkCommand {
                                         minimax-vietnamese — 24 languages total;
                                         see Documentation/TTS/MinimaxCorpus.md)
               --corpus-path <path>      Custom corpus file (overrides --corpus)
-              --voice <name>            Voice id (Kokoro/PocketTTS/CosyVoice3)
-              --speaker <name>          Magpie speaker: john|sofia|aria|jason|leo
-              --language <code>         PocketTTS lang pack or Magpie language code
-              --compute-units <preset>  default | all-ane | cpu-and-gpu | cpu-only
+              --voice <name>            Voice id (KokoroAne/PocketTTS)
+              --language <code>         PocketTTS lang pack code
+              --compute-units <preset>  default | all-ane | cpu-and-gpu | cpu-only | ane-tail-gpu
+                                        (kokoro-ane on M5/macOS 26.5 needs ane-tail-gpu; see #667)
               --output-json <path>      Write JSON report
               --audio-dir <path>        Keep generated WAVs under this dir
               --skip-asr                Skip ASR roundtrip (no WER/CER)
@@ -1232,15 +1509,36 @@ public enum TtsBenchmarkCommand {
                                         fails (`MILCompilerForANE error: …`)
                                         — avoids the multi-minute fallback
                                         compile on first call.
+              --reference <path>        StyleTTS2 speaker-reference audio
+                                        (required for --backend styletts2;
+                                        any sample rate / channel layout —
+                                        resampled to 24 kHz mono internally)
+              --variant <name>          Kokoro ANE variant: english (default),
+                                        mandarin (aliases: zh, chinese), or
+                                        japanese (aliases: ja, jp; requires
+                                        --phonemes)
+              --phonemes                Kokoro ANE G2P bypass: corpus lines are
+                                        `ipa_phonemes|reference_text`; synthesis
+                                        feeds the phonemes, WER/CER scores
+                                        against the reference text
+              --voice-style <path>      Supertonic-3 voice style JSON
+                                        (required for --backend supertonic3;
+                                        e.g. M1.json shipped under
+                                        FluidInference/supertonic-3-coreml).
+              --total-steps <n>         Supertonic-3 denoising steps
+                                        (default 8 — matches reference CLI).
+              --speed <f>               Supertonic-3 speech-rate multiplier
+                                        (default 1.05; divides duration).
               --help, -h                Show this help
 
             Examples:
               fluidaudio tts-benchmark --backend kokoro-ane --output-json bench.json
-              fluidaudio tts-benchmark --backend kokoro --corpus minimax-english
+              fluidaudio tts-benchmark --backend kokoro-ane --variant mandarin \\
+                  --voice zf_001 --corpus minimax-chinese --skip-asr
               fluidaudio tts-benchmark --backend pocket-tts --corpus minimax-german --language german
-              fluidaudio tts-benchmark --backend magpie --speaker sofia --language en
-              fluidaudio tts-benchmark --backend cosyvoice3 --corpus minimax-chinese \\
-                  --asr-backend cohere --cohere-model-dir ~/.fluidaudio/cohere/q8
+              fluidaudio tts-benchmark --backend styletts2 --reference speaker.wav
+              fluidaudio tts-benchmark --backend supertonic3 \\
+                  --voice-style M1.json --corpus minimax-english
 
             Notes:
               For Chinese (zh) and Japanese (ja), WER is meaningless because

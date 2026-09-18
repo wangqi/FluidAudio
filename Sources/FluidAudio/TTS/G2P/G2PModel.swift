@@ -163,7 +163,7 @@ actor G2PModel {
     // MARK: - Private
 
     // Returns the URL for an asset, preferring kokoroDir but falling back to the
-    // overrideCacheDirectory root when the app manages its own flat download layout
+    // TtsCacheDirectory.overrideDirectory root when the app manages its own flat download layout
     // (DownloadManagerCoreML places files at the override root, not in Models/kokoro/).
     // wangqi modified 2026-03-29
     private func resolveAssetURL(fileName: String, in kokoroDir: URL) -> URL {
@@ -171,7 +171,7 @@ actor G2PModel {
         if FileManager.default.fileExists(atPath: primary.path) {
             return primary
         }
-        if let override = TtsModels.overrideCacheDirectory {
+        if let override = TtsCacheDirectory.overrideDirectory {
             let fallback = override.appendingPathComponent(fileName)
             if FileManager.default.fileExists(atPath: fallback.path) {
                 return fallback
@@ -183,7 +183,9 @@ actor G2PModel {
     private func loadIfNeeded() throws {
         if graphemeToId != nil && encoder != nil && decoder != nil { return }
 
-        let kokoroDir = try TtsModels.cacheDirectoryURL().appendingPathComponent("Models/kokoro")
+        let kokoroDir = try TtsCacheDirectory.ensure()
+            .appendingPathComponent("Models")
+            .appendingPathComponent(Repo.kokoro.folderName)
 
         // Load g2p_vocab.json — prefer Models/kokoro/, fall back to override root
         // wangqi modified 2026-03-29

@@ -188,6 +188,15 @@ public actor StreamingEouAsrManager {
 
     // Accumulated token IDs from incremental decoding (NeMo-style)
     private var accumulatedTokenIds: [Int] = []
+    // Accumulated token timestamps in ms, aligned with accumulatedTokenIds
+    private var accumulatedTokenTimestampsMs: [Int] = []
+    // Accumulated raw token strings, aligned with accumulatedTokenIds
+    private var accumulatedRawTokenStrings: [String] = []
+    // Accumulated EoU timestamps in ms
+    private var accumulatedEouTimestampsMs: [Int] = []
+
+    // Timestamp granularity for RNNT frames is derived per-chunk from encoder
+    // shift (samples) and the number of valid encoder output frames.
 
     // EOU Detection
     /// Whether End-of-Utterance was detected in the last chunk processed
@@ -198,7 +207,9 @@ public actor StreamingEouAsrManager {
     private var partialCallback: PartialCallback?
 
     // EOU Debouncing - requires sustained silence before triggering
-    /// Minimum duration of silence (in ms) before EOU is confirmed
+    /// Wall-clock silence (in ms) after the EOU head first fires before EOU is confirmed.
+    /// Measured from the first EOU signal; only newly decoded words reset it, so a silent
+    /// chunk that does not re-emit the EOU token does not restart the timer.
     public var eouDebounceMs: Int = 1280
     /// Timestamp when EOU was first detected (for debouncing)
     private var eouFirstDetectedAt: Int?  // in processed samples
@@ -246,6 +257,74 @@ public actor StreamingEouAsrManager {
         self.partialCallback = callback
     }
 
+    /// Returns timestamps (ms) aligned with the accumulated token IDs.
+    /// Each value is the elapsed time from the start of the conversation.
+    public func getTokenTimestampsMs() -> [Int] {
+        accumulatedTokenTimestampsMs
+    }
+
+    /// Returns raw token strings aligned with accumulated token IDs/timestamps.
+    public func getRawTokenStrings() -> [String] {
+        accumulatedRawTokenStrings
+    }
+
+    /// Returns EoU timestamps when utterances end.
+    public func getEouTimestampsMs() -> [Int] {
+        accumulatedEouTimestampsMs
+    }
+
+    static func computeTokenTimestampsMs(
+        baseFrame: Int,
+        tokenFrames: [Int],
+        frameDurationMs: Int
+    ) -> [Int] {
+        tokenFrames.map { (baseFrame + $0) * frameDurationMs }
+    }
+
+    /// Outcome of the per-chunk EOU debounce evaluation.
+    struct EouDebounceDecision: Equatable {
+        /// Updated debounce anchor (in processed samples), or nil if the timer is not running.
+        let anchorSamples: Int?
+        /// Whether EOU should be confirmed on this chunk.
+        let confirmed: Bool
+    }
+
+    /// Pure debounce rule for confirming End-of-Utterance.
+    ///
+    /// `debounceMs` measures wall-clock silence — the elapsed time since the EOU head first
+    /// fired during which no new words are decoded. The anchor starts on the first chunk that
+    /// signals EOU with no new tokens, and only a chunk that decodes new words (ongoing speech)
+    /// resets it. A silent chunk that fails to re-emit the EOU token neither starts nor resets
+    /// the timer, so the value behaves as the duration its name implies rather than requiring
+    /// consecutive EOU emissions. See issue #827.
+    static func evaluateEouDebounce(
+        hasNewTokens: Bool,
+        eouSignal: Bool,
+        totalSamplesProcessed: Int,
+        anchorSamples: Int?,
+        alreadyConfirmed: Bool,
+        debounceMs: Int,
+        sampleRate: Int = 16000
+    ) -> EouDebounceDecision {
+        // Newly decoded words mean speech is ongoing - reset the timer.
+        if hasNewTokens {
+            return EouDebounceDecision(anchorSamples: nil, confirmed: false)
+        }
+
+        // Start the timer on the first EOU signal; otherwise carry the existing anchor forward.
+        var anchor = anchorSamples
+        if anchor == nil, eouSignal {
+            anchor = totalSamplesProcessed
+        }
+
+        guard let firstDetected = anchor, !alreadyConfirmed else {
+            return EouDebounceDecision(anchorSamples: anchor, confirmed: false)
+        }
+
+        let elapsedMs = ((totalSamplesProcessed - firstDetected) * 1000) / sampleRate
+        return EouDebounceDecision(anchorSamples: anchor, confirmed: elapsedMs >= debounceMs)
+    }
+
     /// Load models from a specific directory
     /// - Parameter directory: Directory containing the model files
     public func loadModels(from directory: URL) async throws {
@@ -265,7 +344,23 @@ public actor StreamingEouAsrManager {
         let vocabUrl = directory.appendingPathComponent("vocab.json")
         self.tokenizer = try Tokenizer(vocabPath: vocabUrl)
 
-        self.rnntDecoder = RnntDecoder(decoderModel: self.decoder!, jointModel: self.joint!)
+        // Opt-in fused decoder+joint_decision path (single MLModel.prediction per RNNT step).
+        // Enabled only when FLUID_EOU_FUSED=1 AND the fused mlmodelc is present alongside the
+        // other models. Default OFF: the fused fp16 graph is not bit-exact with the two-model
+        // reference (low-margin argmax ties can flip), so it ships opt-in.
+        var fusedModel: MLModel?
+        let fusedRequested = ProcessInfo.processInfo.environment["FLUID_EOU_FUSED"] == "1"
+        let fusedUrl = directory.appendingPathComponent("decoder_joint_decision_fused.mlmodelc")
+        if fusedRequested, FileManager.default.fileExists(atPath: fusedUrl.path) {
+            fusedModel = try await MLModel.load(contentsOf: fusedUrl, configuration: self.configuration)
+            logger.info("FLUID_EOU_FUSED=1: using fused decoder+joint_decision (1 dispatch per RNNT step)")
+        } else if fusedRequested {
+            logger.warning(
+                "FLUID_EOU_FUSED=1 set but \(fusedUrl.lastPathComponent) not found in \(directory.path); using reference decoder+joint path"
+            )
+        }
+
+        self.rnntDecoder = RnntDecoder(decoderModel: self.decoder!, jointModel: self.joint!, fusedModel: fusedModel)
 
         // Initialize States
         try self.resetStates()
@@ -284,7 +379,7 @@ public actor StreamingEouAsrManager {
     public func loadModels(
         to directory: URL? = nil,
         configuration: MLModelConfiguration? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws {
         if let configuration {
             self.configuration = configuration
@@ -302,19 +397,16 @@ public actor StreamingEouAsrManager {
         }
         let modelDir = modelsRoot.appendingPathComponent(repo.folderName, isDirectory: true)
 
-        let requiredModels = ModelNames.ParakeetEOU.requiredModels
-        let modelsExist = requiredModels.allSatisfy { modelName in
-            FileManager.default.fileExists(atPath: modelDir.appendingPathComponent(modelName).path)
+        // Completeness-checked download + purge-and-retry on load failure: a
+        // bare file-existence gate mistook an interrupted encoder fetch for a
+        // warm cache and bricked loading permanently (issue #819).
+        try await ModelHub.loadWithRecovery(
+            repo, directory: modelsRoot,
+            requiredFiles: ModelNames.ParakeetEOU.requiredModels,
+            progressHandler: progressHandler
+        ) {
+            try await self.loadModels(from: modelDir)
         }
-
-        if !modelsExist {
-            logger.info("Downloading Parakeet EOU models to \(modelsRoot.path)...")
-            try await DownloadUtils.downloadRepo(repo, to: modelsRoot, progressHandler: progressHandler)
-        } else {
-            logger.info("Using cached Parakeet EOU models at \(modelDir.path)")
-        }
-
-        try await loadModels(from: modelDir)
     }
 
     private static func defaultCacheDirectory() -> URL {
@@ -407,6 +499,9 @@ public actor StreamingEouAsrManager {
 
         // Clear accumulated tokens
         accumulatedTokenIds.removeAll()
+        accumulatedTokenTimestampsMs.removeAll()
+        accumulatedRawTokenStrings.removeAll()
+        accumulatedEouTimestampsMs.removeAll()
 
         return transcript
     }
@@ -417,6 +512,9 @@ public actor StreamingEouAsrManager {
             accumulatedTokenIds: &accumulatedTokenIds,
             processedChunks: &processedChunks
         )
+        accumulatedTokenTimestampsMs.removeAll()
+        accumulatedRawTokenStrings.removeAll()
+        accumulatedEouTimestampsMs.removeAll()
         debugFeatureBuffer.removeAll()
         eouDetected = false
         eouFirstDetectedAt = nil
@@ -521,11 +619,39 @@ public actor StreamingEouAsrManager {
         accumulatedTokenIds.append(contentsOf: decodeResult.tokenIds)
 
         // Reset sticky eouDetected when speech resumes after an EOU so a later silence can
-        // fire another EOU callback. Original implementation only cleared this in reset()/finish(),
-        // which meant EOU fired at most once per streaming session.
+        // fire another EOU callback. `evaluateEouDebounce` only clears the *anchor* on new
+        // tokens; `eouDetected` is otherwise cleared solely in reset()/finish(), which means
+        // EOU fires at most once per streaming session.
         // wangqi modified 2026-04-20
         if !decodeResult.tokenIds.isEmpty && eouDetected {
             eouDetected = false
+        }
+
+        if let tokenizer, !decodeResult.tokenIds.isEmpty {
+            let rawTokens = decodeResult.tokenIds.map { tokenId in
+                tokenizer.rawToken(for: tokenId) ?? "<id:\(tokenId)>"
+            }
+            accumulatedRawTokenStrings.append(contentsOf: rawTokens)
+        }
+
+        // Convert per-chunk frame indices into global timestamps (ms) aligned with tokens.
+        if !decodeResult.tokenFrames.isEmpty {
+            let baseFrame = processedChunks * chunkSize.validOutputLen
+
+            // Derive per-frame duration (ms) from shiftSamples and validOutputLen.
+            // frameDurationMs = (shiftSamples [samples] * 1000) / (sampleRate * validOutputLen)
+            // Using 16kHz sample rate for Parakeet models.
+            let shift = Float(self.shiftSamples)
+            let validOut = Float(chunkSize.validOutputLen)
+            let frameDurationMsFloat = (shift * 1000.0) / (16000.0 * validOut)
+            let frameDurationMs = Int(round(frameDurationMsFloat))
+
+            let timestampsMs = Self.computeTokenTimestampsMs(
+                baseFrame: baseFrame,
+                tokenFrames: decodeResult.tokenFrames,
+                frameDurationMs: frameDurationMs
+            )
+            accumulatedTokenTimestampsMs.append(contentsOf: timestampsMs)
         }
 
         // Invoke partial callback for ghost text (only when new tokens decoded)
@@ -537,44 +663,40 @@ public actor StreamingEouAsrManager {
         // Track total samples for timing
         totalSamplesProcessed += shiftSamples
 
-        // Handle EOU detection with debouncing
-        // EOU requires sustained silence for eouDebounceMs before triggering
-        if decodeResult.eouDetected {
-            // If new tokens were produced, speech is ongoing - reset debounce timer
-            if !decodeResult.tokenIds.isEmpty {
-                eouFirstDetectedAt = nil
-            } else if eouFirstDetectedAt == nil {
-                // First EOU detection - start debounce timer
-                eouFirstDetectedAt = totalSamplesProcessed
-                logger.debug("EOU candidate at chunk \(processedChunks), starting debounce timer")
+        // Handle EOU detection with debouncing (see evaluateEouDebounce for the rule).
+        let decision = Self.evaluateEouDebounce(
+            hasNewTokens: !decodeResult.tokenIds.isEmpty,
+            eouSignal: decodeResult.eouDetected,
+            totalSamplesProcessed: totalSamplesProcessed,
+            anchorSamples: eouFirstDetectedAt,
+            alreadyConfirmed: eouDetected,
+            debounceMs: eouDebounceMs
+        )
+        eouFirstDetectedAt = decision.anchorSamples
+
+        if decision.confirmed {
+            eouDetected = true
+            let eouTimestampMs = (totalSamplesProcessed * 1000) / 16000
+            logger.info("EOU confirmed at chunk \(processedChunks) (\(eouTimestampMs)ms)")
+            accumulatedEouTimestampsMs.append(eouTimestampMs)
+
+            // Invoke callback with current transcript
+            if let callback = eouCallback, let tokenizer = tokenizer {
+                let transcript = tokenizer.decode(ids: accumulatedTokenIds)
+                callback(transcript)
             }
 
-            // Check if debounce period has elapsed
-            if let firstDetected = eouFirstDetectedAt {
-                let elapsedSamples = totalSamplesProcessed - firstDetected
-                let elapsedMs = (elapsedSamples * 1000) / 16000  // Convert samples to ms at 16kHz
-
-                if elapsedMs >= eouDebounceMs && !eouDetected {
-                    eouDetected = true
-                    logger.info("EOU confirmed at chunk \(processedChunks) after \(elapsedMs)ms silence")
-
-                    // Invoke callback with current transcript
-                    if let callback = eouCallback, let tokenizer = tokenizer {
-                        let transcript = tokenizer.decode(ids: accumulatedTokenIds)
-                        callback(transcript)
-                    }
-
-                    // Clear accumulated tokens after EOU fires so subsequent partial callbacks deliver
-                    // per-utterance text instead of re-emitting the full session transcript.
-                    // Without this, multi-utterance workflows (e.g. real-time translation in
-                    // MLXSpeechToTextView) see duplicated text and stranded translation buffers.
-                    // wangqi modified 2026-04-20
-                    accumulatedTokenIds.removeAll()
-                }
-            }
-        } else {
-            // Model did not predict EOU - speech is ongoing, reset debounce timer
-            eouFirstDetectedAt = nil
+            // Clear accumulated tokens after EOU fires so subsequent partial callbacks deliver
+            // per-utterance text instead of re-emitting the full session transcript.
+            // Without this, multi-utterance workflows (e.g. real-time translation in
+            // MLXSpeechToTextView) see duplicated text and stranded translation buffers.
+            // The two token-aligned side arrays are cleared with it to preserve their
+            // documented "aligned with accumulatedTokenIds" invariant; the EOU timestamp
+            // list is a session-level log and deliberately keeps accumulating.
+            // wangqi modified 2026-04-20
+            accumulatedTokenIds.removeAll()
+            accumulatedTokenTimestampsMs.removeAll()
+            accumulatedRawTokenStrings.removeAll()
         }
 
         processedChunks += 1
@@ -624,3 +746,7 @@ extension StreamingEouAsrManager: StreamingAsrManager {
         return tokenizer.decode(ids: accumulatedTokenIds)
     }
 }
+
+extension StreamingEouAsrManager: StreamingAsrTokenTimestampProvider, StreamingAsrRawTokenProvider,
+    StreamingAsrEouProvider
+{}

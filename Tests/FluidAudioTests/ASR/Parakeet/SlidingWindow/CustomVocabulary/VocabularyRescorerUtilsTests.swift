@@ -118,11 +118,115 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
         XCTAssertEqual(config.adaptiveCbw(baseCbw: 3.0, tokenCount: 10), 3.0, accuracy: 0.01)
     }
 
+    // MARK: - Short-Term cbw Taper (#702, opt-in)
+
+    func testShortTermTaperDisabledByDefault() {
+        // Default config must NOT taper short terms (zero behavior change).
+        let config = VocabularyRescorer.Config.default
+        XCTAssertEqual(config.shortTermCbwTaperPivot <= 1, true, "taper disabled by default")
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 1), 4.5, accuracy: 0.01)
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 2), 4.5, accuracy: 0.01)
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 3), 4.5, accuracy: 0.01)
+    }
+
+    func testShortTermTaperWhenEnabled() {
+        // pivot=5, exponent=2: terms below 5 tokens get a quadratic-tapered
+        // boost. referenceTokenCount=5 too, so tokenCount=5 is the clean
+        // boundary (full boost, no long-term scale-up).
+        let config = VocabularyRescorer.Config(
+            referenceTokenCount: 5,
+            shortTermCbwTaperPivot: 5,
+            shortTermCbwTaperExponent: 2.0
+        )
+        // tokenCount=1: (1/5)^2 = 0.04 → 4.5 * 0.04 = 0.18
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 1), 0.18, accuracy: 0.01)
+        // tokenCount=3: (3/5)^2 = 0.36 → 4.5 * 0.36 = 1.62
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 3), 1.62, accuracy: 0.01)
+        // tokenCount=4: (4/5)^2 = 0.64 → 4.5 * 0.64 = 2.88
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 4), 2.88, accuracy: 0.01)
+        // At the pivot (== reference) the full boost applies.
+        XCTAssertEqual(config.adaptiveCbw(baseCbw: 4.5, tokenCount: 5), 4.5, accuracy: 0.01)
+    }
+
+    func testSpotterRescueFloorsDisabledByDefault() {
+        let config = VocabularyRescorer.Config.default
+        XCTAssertEqual(config.spotterRescueMinSimilarity, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(config.spotterRescueMultiWordMinSimilarity, 0.0, accuracy: 0.0001)
+    }
+
+    func testSpotterRescueEnabledByDefault() {
+        // The acoustic rescue pass must run by default (zero behavior change);
+        // disabling it is opt-in for short-vocab KWS (#724). Clear the env
+        // override first so the assertion reflects the code default regardless
+        // of the ambient environment (a freshly constructed Config reads the
+        // env at init, unlike the cached `Config.default` static).
+        let saved = ProcessInfo.processInfo.environment["FLUID_SPOTTER_RESCUE"]
+        unsetenv("FLUID_SPOTTER_RESCUE")
+        defer {
+            if let saved { setenv("FLUID_SPOTTER_RESCUE", saved, 1) }
+        }
+        XCTAssertTrue(VocabularyRescorer.Config().spotterRescueEnabled)
+        XCTAssertFalse(VocabularyRescorer.Config(spotterRescueEnabled: false).spotterRescueEnabled)
+    }
+
     // MARK: - Config Defaults
 
     func testConfigDefaultValues() {
         let config = VocabularyRescorer.Config.default
         XCTAssertEqual(config.useAdaptiveThresholds, ContextBiasingConstants.defaultUseAdaptiveThresholds)
         XCTAssertEqual(config.referenceTokenCount, ContextBiasingConstants.defaultReferenceTokenCount)
+    }
+
+    // MARK: - Stopword Sets
+
+    func testMultiWordStopwordsExcludeContentWords() {
+        // The multi-word path raises the threshold for spans containing
+        // function words (the/and/of/etc.). It must NOT raise the
+        // threshold on content words like "new"/"old"/"good"/"great" so
+        // that rescues like `new red` → `Newrez` (sim 0.83) clear the
+        // 0.55 floor.
+        let contentWords = [
+            "new", "old", "good", "great", "first", "last",
+            "well", "back", "way", "own", "just", "also",
+            "only", "even", "still", "now", "here",
+            "there", "very",
+        ]
+        for word in contentWords {
+            XCTAssertFalse(
+                VocabularyRescorer.multiWordStopwords.contains(word),
+                "'\(word)' should not be in multiWordStopwords (poisons multi-word rescue)"
+            )
+        }
+    }
+
+    func testMultiWordStopwordsIncludeFunctionWords() {
+        // Function words still raise the threshold on multi-word spans.
+        let functionWords = [
+            "a", "the", "and", "or", "is", "to", "for",
+            "in", "of", "with", "by", "i", "you", "he",
+            "she", "it", "we", "they", "this", "that",
+        ]
+        for word in functionWords {
+            XCTAssertTrue(
+                VocabularyRescorer.multiWordStopwords.contains(word),
+                "'\(word)' should be in multiWordStopwords"
+            )
+        }
+    }
+
+    func testSingleWordStopwordsRetainContentWords() {
+        // Single-word path uses the wider list to avoid lone-word
+        // substitutions like `just` → `Wyost`. Make sure the broader
+        // set still includes those guards.
+        let mustGuard = [
+            "just", "new", "old", "good", "great", "back",
+            "way", "own", "now", "here", "there", "still",
+        ]
+        for word in mustGuard {
+            XCTAssertTrue(
+                VocabularyRescorer.stopwords.contains(word),
+                "'\(word)' should be in stopwords (single-word guard)"
+            )
+        }
     }
 }

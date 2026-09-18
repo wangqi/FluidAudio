@@ -26,7 +26,7 @@ public enum StyleTTS2ResourceDownloader {
     @discardableResult
     public static func ensureDefaultModels(
         directory: URL? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws -> URL {
         let modelsRoot = try directory ?? defaultCacheRoot()
         let repoDir = modelsRoot.appendingPathComponent(Repo.styletts2.folderName)
@@ -38,7 +38,7 @@ public enum StyleTTS2ResourceDownloader {
         if !allDefaultsPresent {
             logger.info("Downloading StyleTTS2 LibriTTS models (iteration_3) from HuggingFace…")
             do {
-                try await DownloadUtils.downloadRepo(
+                try await ModelHub.download(
                     .styletts2, to: modelsRoot, progressHandler: progressHandler)
             } catch {
                 throw StyleTTS2Error.downloadFailed("\(error)")
@@ -52,17 +52,33 @@ public enum StyleTTS2ResourceDownloader {
 
     /// Ensure Kokoro's preprocessed Misaki lexicon cache
     /// (`us_lexicon_cache.json`) is present locally, then return the kokoro
-    /// cache directory that holds it. The same payload is consumed by
-    /// `KokoroSynthesizer.LexiconCache`, so the StyleTTS2 backend is using
-    /// the exact same word→phoneme map Kokoro ships.
+    /// cache directory that holds it. The lexicon file lives under the
+    /// kokoro HF repo root and is consumed by the shared
+    /// `LexiconAssetCache`.
     @discardableResult
     public static func ensureLexiconCache() async throws -> URL {
+        let modelsRoot = try defaultCacheRoot()
+        let kokoroDir = modelsRoot.appendingPathComponent(Repo.kokoro.folderName)
+        try FileManager.default.createDirectory(
+            at: kokoroDir, withIntermediateDirectories: true)
+
+        let filename = "us_lexicon_cache.json"
+        let localURL = kokoroDir.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            return kokoroDir
+        }
+
         do {
-            let cacheURL = try await TtsResourceDownloader.ensureLexiconFile(
-                named: "us_lexicon_cache.json")
-            return cacheURL.deletingLastPathComponent()
+            let remoteURL = try ModelRegistry.resolveModel(Repo.kokoro.remotePath, filename)
+            let descriptor = AssetDownloader.Descriptor(
+                description: filename,
+                remoteURL: remoteURL,
+                destinationURL: localURL
+            )
+            _ = try await AssetDownloader.ensure(descriptor, logger: logger)
+            return kokoroDir
         } catch {
-            throw StyleTTS2Error.downloadFailed("us_lexicon_cache.json: \(error)")
+            throw StyleTTS2Error.downloadFailed("\(filename): \(error)")
         }
     }
 
@@ -74,7 +90,7 @@ public enum StyleTTS2ResourceDownloader {
     /// `G2PModelError.vocabLoadFailed` the first time the OOV path is hit.
     public static func ensureG2PAssets(
         directory: URL? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws {
         let modelsRoot = try directory ?? defaultCacheRoot()
         let kokoroDir = modelsRoot.appendingPathComponent(Repo.kokoro.folderName)
@@ -86,7 +102,7 @@ public enum StyleTTS2ResourceDownloader {
         }
         logger.info("Downloading kokoro G2P CoreML assets (g2p-only variant) from HuggingFace…")
         do {
-            try await DownloadUtils.downloadRepo(
+            try await ModelHub.download(
                 .kokoro,
                 to: modelsRoot,
                 variant: "g2p-only",
@@ -114,34 +130,28 @@ public enum StyleTTS2ResourceDownloader {
         }
 
         logger.info("Fetching StyleTTS2 bucket T=\(t) (\(missing.count) bundles)")
-        for fileName in missing {
-            do {
-                try await DownloadUtils.downloadSubdirectory(
-                    .styletts2,
-                    subdirectory: fileName,
-                    to: repoDir
-                )
-            } catch {
-                throw StyleTTS2Error.downloadFailed(
-                    "bucket T=\(t) bundle \(fileName) — \(error)")
-            }
+        // The "t<T>" sentinel variant scopes the repo download to the two
+        // bucket bundles; the repo download handles subPath stripping, so the
+        // bundles land directly under `repoDir` where the model store loads
+        // them. (The previous `download(subdirectory:)` call listed the
+        // bundle name at the repo *root* — the buckets live under the
+        // `iteration_3/compiled` subPath, so it fetched nothing; it went
+        // unnoticed because the bulk download used to sweep the buckets in.)
+        var modelsRoot = repoDir
+        for _ in Repo.styletts2.folderName.split(separator: "/") {
+            modelsRoot.deleteLastPathComponent()
+        }
+        do {
+            try await ModelHub.download(.styletts2, to: modelsRoot, variant: "t\(t)")
+        } catch {
+            throw StyleTTS2Error.downloadFailed("bucket T=\(t) — \(error)")
         }
     }
 
     private static func defaultCacheRoot() throws -> URL {
-        let base: URL
-        #if os(macOS)
-        base = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cache")
-        #else
-        guard
-            let first = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-        else {
-            throw StyleTTS2Error.downloadFailed("failed to locate caches directory")
-        }
-        base = first
-        #endif
-        let root = base.appendingPathComponent("fluidaudio").appendingPathComponent("Models")
+        // Delegate to the shared TTS cache root (Application Support on iOS,
+        // ~/.cache/fluidaudio on macOS) so all backends share one location.
+        let root = try TtsCacheDirectory.ensure().appendingPathComponent("Models")
         if !FileManager.default.fileExists(atPath: root.path) {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         }

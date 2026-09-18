@@ -147,8 +147,7 @@ public actor MultilingualG2PModel {
     /// Resolves the directory holding the multilingual G2P models.
     ///
     /// The standard layout nests them under `Models/<kokoro folder>/`, but a host app that points
-    /// `TtsModels.overrideCacheDirectory` at its own download folder has them flat at the root.
-    /// Mirrors the flat fallback in `TtsResourceDownloader.ensureVoiceEmbedding`.
+    /// `TtsCacheDirectory.overrideDirectory` at its own download folder has them flat at the root.
     /// wangqi modified 2026-08-12
     static func modelsDirectory(base: URL) -> URL {
         let nested =
@@ -168,7 +167,7 @@ public actor MultilingualG2PModel {
         // Flat fallback: with an overridden cache directory the models sit at the root, not under
         // Models/<kokoro folder>/, which made every non-English voice throw modelLoadFailed.
         // wangqi modified 2026-08-12
-        let modelsDir = Self.modelsDirectory(base: try TtsModels.cacheDirectoryURL())
+        let modelsDir = Self.modelsDirectory(base: try TtsCacheDirectory.ensure())
         logger.info("Multilingual G2P models directory resolved to \(modelsDir.path)")
 
         let encoderURL = modelsDir.appendingPathComponent(ModelNames.MultilingualG2P.encoderFile)

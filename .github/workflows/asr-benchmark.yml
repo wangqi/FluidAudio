@@ -31,7 +31,7 @@ jobs:
             ~/Library/Caches/Homebrew
             /usr/local/Cellar/ffmpeg
             /opt/homebrew/Cellar/ffmpeg
-          key: ${{ runner.os }}-asr-${{ hashFiles('Package.resolved', 'Sources/FluidAudio/Frameworks/**', 'Sources/FluidAudio/ModelRegistry.swift', 'Sources/FluidAudio/ModelNames.swift') }}
+          key: ${{ runner.os }}-asr-${{ hashFiles('Package.resolved', 'Sources/FluidAudio/Frameworks/**', 'Sources/FluidAudio/ModelRegistry.swift', 'Sources/FluidAudio/ModelNames.swift', 'Sources/FluidAudio/Shared/Download/**') }}
 
       - name: Install ffmpeg
         run: |
@@ -249,6 +249,16 @@ jobs:
             echo "BENCHMARK_STATUS=SUCCESS" >> $GITHUB_OUTPUT
             echo "✅ All benchmarks completed successfully"
           fi
+
+      # Issue #855: real-recording finish() regression for the streaming final
+      # window. Runs here because the benchmark above has already cached the v3
+      # models; the test skips when they are absent.
+      - name: Streaming final-window regression (real recordings)
+        if: always()
+        env:
+          FLUIDAUDIO_RUN_ASR_E2E: "1"
+        run: swift test --filter 'SlidingWindowFinalWindowRegressionTests|SlidingWindowVocabularyBoostingStreamingTests'
+        timeout-minutes: 15
 
       - name: Comment PR
         if: always() && github.event_name == 'pull_request'

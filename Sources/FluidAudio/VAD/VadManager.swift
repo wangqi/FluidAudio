@@ -78,7 +78,7 @@ public actor VadManager {
     /// Initialize with configuration
     public init(
         config: VadConfig = .default,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws {
         self.config = config
 
@@ -110,7 +110,7 @@ public actor VadManager {
     public init(
         config: VadConfig = .default,
         modelDirectory: URL,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws {
         self.config = config
 
@@ -123,14 +123,14 @@ public actor VadManager {
 
     private func loadUnifiedModel(
         from directory: URL? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws {
         let baseDirectory = directory ?? getDefaultBaseDirectory()
 
         // When directory is provided externally, models are already in baseDirectory — skip Models/.
         // When using default app-support path, append Models/ for standard FluidAudio layout.
         // wangqi modified 2026-03-28
-        let models = try await DownloadUtils.loadModels(
+        let models = try await ModelHub.loadModels(
             .vad,
             modelNames: Array(ModelNames.VAD.requiredModels),
             directory: (directory != nil) ? baseDirectory : baseDirectory.appendingPathComponent("Models"),

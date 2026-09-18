@@ -14,8 +14,10 @@ extension VocabularyRescorer {
 
     // MARK: - Stopwords
 
-    /// Common stopwords that should not be replaced by vocabulary terms.
-    /// Defined once as a static constant to avoid recreation in hot loops.
+    /// Common stopwords used by the **single-word** rescue path to skip
+    /// substituting vocabulary terms over short common words (prevents
+    /// false positives like `just` → `Wyost`). Wider than the multi-word
+    /// set because lone-word substitutions are the most error-prone.
     static let stopwords: Set<String> = [
         // Articles and determiners
         "a", "an", "the", "some", "any", "no", "every", "each", "all",
@@ -39,16 +41,42 @@ extension VocabularyRescorer {
         "well", "back", "way", "own", "new", "old", "good", "great", "first", "last",
     ]
 
+    /// Subset of `stopwords` used by the **multi-word** rescue path to
+    /// raise the similarity floor on phrases like `at this` → `Matthew`.
+    /// Restricted to true function words so content words like
+    /// `new red` → `Newrez` (sim 0.83) are not silently upgraded to a
+    /// 0.85 threshold and rejected.
+    static let multiWordStopwords: Set<String> = [
+        // Articles and determiners
+        "a", "an", "the", "some", "any", "no", "every", "each", "all",
+        // Conjunctions
+        "and", "or", "but", "so", "if", "then", "than", "as",
+        // Prepositions
+        "in", "on", "at", "to", "for", "of", "with", "by", "from", "up", "down",
+        "out", "about", "into", "over", "after", "before", "between", "under",
+        // Be verbs
+        "is", "are", "was", "were", "be", "been", "being", "am",
+        // Auxiliaries
+        "have", "has", "had", "do", "does", "did", "will", "would", "can", "could",
+        // Pronouns
+        "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+        "my", "your", "his", "its", "our", "their", "this", "that", "these", "those",
+        "who", "what", "which", "where", "when", "how", "why",
+    ]
+
     // MARK: - CTC Match Types
 
     /// Parameters for evaluating a CTC match candidate.
     struct CTCMatchCandidate {
+        let origin: CandidateOrigin
         let originalPhrase: String
         let vocabTerm: String
+        let matchedAlias: String?
         let vocabTokens: [Int]
         let similarity: Float
         let spanLength: Int
         let spanIndices: [Int]
+        let tokenRange: Range<Int>?
         let spanStartTime: Double
         let spanEndTime: Double
     }
@@ -56,8 +84,12 @@ extension VocabularyRescorer {
     /// Result of CTC match evaluation.
     struct CTCMatchResult {
         let shouldReplace: Bool
+        let comparisonWasPerformed: Bool
         let originalScore: Float
         let boostedVocabScore: Float
+        let rawVocabularyCTCScore: Float?
+        let rawOriginalCTCScore: Float?
+        let effectiveBoost: Float?
         let replacement: String
         let reason: String
     }
@@ -65,9 +97,93 @@ extension VocabularyRescorer {
     /// Pending replacement candidate for two-pass selection.
     /// Stores all info needed to apply the replacement later.
     struct PendingReplacement {
+        let candidateID: Int?
         let candidate: CTCMatchCandidate
         let result: CTCMatchResult
         let similarity: Float  // String similarity for sorting
+    }
+
+    /// Evidence-only state. Legacy rescoring keeps this optional `nil` and allocates none of its arrays.
+    struct CandidateEvidenceCollector {
+        var baseText: String = ""
+        var baseWords: [String] = []
+        var alignedWordRanges: [Range<Int>?] = []
+        var candidates: [CandidateEvidence] = []
+    }
+
+    /// Result of the legacy greedy overlap pass before text mutation is applied.
+    struct PendingReplacementArbitration {
+        let applied: [PendingReplacement]
+        let supersededCandidateIDs: Set<Int>
+    }
+
+    /// Return a half-open token range when the word span has contiguous token provenance.
+    static func tokenRange(
+        for spanIndices: [Int],
+        in wordTimings: [WordTiming]
+    ) -> Range<Int>? {
+        guard let firstIndex = spanIndices.first,
+            spanIndices.allSatisfy({ wordTimings.indices.contains($0) })
+        else {
+            return nil
+        }
+
+        guard let firstRange = wordTimings[firstIndex].tokenRange else { return nil }
+        var tokenEnd = firstRange.upperBound
+        for (leftIndex, rightIndex) in zip(spanIndices, spanIndices.dropFirst()) {
+            guard rightIndex == leftIndex + 1 else { return nil }
+            guard let rightRange = wordTimings[rightIndex].tokenRange,
+                rightRange.lowerBound == tokenEnd
+            else {
+                return nil
+            }
+            tokenEnd = rightRange.upperBound
+        }
+
+        return firstRange.lowerBound..<tokenEnd
+    }
+
+    /// Append one evidence row only when the caller requested evidence collection.
+    @discardableResult
+    static func recordCandidateEvidence(
+        candidate: CTCMatchCandidate,
+        result: CTCMatchResult,
+        candidateEvidence: inout CandidateEvidenceCollector?
+    ) -> Int? {
+        guard let candidateID = candidateEvidence?.candidates.count else { return nil }
+
+        let wordRange: Range<Int>
+        if let firstIndex = candidate.spanIndices.first,
+            let lastIndex = candidate.spanIndices.last,
+            candidate.spanIndices == Array(firstIndex...lastIndex)
+        {
+            wordRange = firstIndex..<(lastIndex + 1)
+        } else {
+            wordRange = 0..<0
+        }
+
+        let textRange: Range<Int>?
+        if let collector = candidateEvidence {
+            textRange = candidateBaseTextUTF8Range(
+                wordRange: wordRange,
+                alignedWordRanges: collector.alignedWordRanges,
+                baseText: collector.baseText,
+                basePhrase: candidate.originalPhrase
+            )
+        } else {
+            textRange = nil
+        }
+
+        candidateEvidence?.candidates.append(
+            makeCandidateEvidence(
+                candidateID: candidateID,
+                candidate: candidate,
+                result: result,
+                wordRange: wordRange,
+                baseTextUTF8Range: textRange
+            )
+        )
+        return candidateID
     }
 
     // MARK: - Shared Finalization
@@ -79,25 +195,43 @@ extension VocabularyRescorer {
         pendingReplacements: [PendingReplacement],
         modifiedWords: inout [(word: String, startTime: Double, endTime: Double)],
         replacedIndices: inout Set<Int>,
-        replacements: inout [RescoringResult]
+        replacements: inout [RescoringResult],
+        candidateEvidence: inout CandidateEvidenceCollector?
     ) -> RescoreOutput {
-        // PASS 2: Sort by span length (ascending) then by similarity (descending)
-        // This ensures shorter spans are preferred when multiple matches overlap
-        let sortedReplacements = pendingReplacements.sorted { a, b in
-            if a.candidate.spanLength != b.candidate.spanLength {
-                return a.candidate.spanLength < b.candidate.spanLength  // Prefer shorter spans
-            }
-            // For same span length, prefer higher similarity
-            return a.similarity > b.similarity
-        }
+        // PASS 2: Sort by similarity (descending), with span length used
+        // only as a tiebreak.
+        //
+        // Rationale: when a longer multi-word span has substantially higher
+        // similarity than a shorter overlapping span, the longer match
+        // should win. This handles the FDA-extended failure pattern where
+        // TDT splits an unfamiliar drug like `Romvimza` into `Rom vimza`,
+        // and the rescorer finds:
+        //   - 2-word: `rom vimza` → `Romvimza` (sim 0.89, real drug)
+        //   - 1-word: `vimza` → `Cimzia` (sim 0.67, distractor)
+        // The previous "shortest span wins" rule picked the 1-word
+        // distractor purely because it was shorter, ignoring that the
+        // 2-word match has 22pp better similarity.
+        //
+        // Span length still tiebreaks at near-equal similarity to keep the
+        // existing preference for compact replacements when both candidates
+        // are equally plausible.
+        // Quantize similarity into 0.05-wide buckets so candidates whose raw
+        // similarities differ by less than the bucket width are treated as
+        // equivalent for ranking. Span length breaks ties within a bucket;
+        // raw similarity breaks ties at equal span. Quantization yields a
+        // strict weak ordering (transitive by construction) — the previous
+        // implementation compared `abs(simDiff) > 0.05` directly, which is
+        // non-transitive: e.g. for similarities 0.70/0.66/0.62 across span
+        // lengths 3/2/1, A vs B and B vs C dispatch to the span tiebreaker
+        // while A vs C dispatches to similarity, producing a cycle.
+        let arbitration = Self.arbitratePendingReplacements(
+            pendingReplacements,
+            occupiedIndices: replacedIndices
+        )
 
         // PASS 3: Greedily apply non-overlapping replacements
-        for pending in sortedReplacements {
-            // Check if any index in this span is already replaced
-            guard pending.candidate.spanIndices.allSatisfy({ !replacedIndices.contains($0) }) else {
-                continue  // Skip - overlaps with already-accepted replacement
-            }
-
+        var appliedCandidateIDs = Set<Int>()
+        for pending in arbitration.applied {
             applyReplacement(
                 result: pending.result,
                 candidate: pending.candidate,
@@ -105,6 +239,17 @@ extension VocabularyRescorer {
                 replacedIndices: &replacedIndices,
                 replacements: &replacements
             )
+            if let candidateID = pending.candidateID {
+                appliedCandidateIDs.insert(candidateID)
+            }
+        }
+
+        if var collector = candidateEvidence {
+            Self.reconcileLegacyOutcomes(
+                candidates: &collector.candidates,
+                appliedCandidateIDs: appliedCandidateIDs
+            )
+            candidateEvidence = collector
         }
 
         // Reconstruct transcript from modified words (filter empty strings from multi-word replacements)
@@ -121,6 +266,58 @@ extension VocabularyRescorer {
             replacements: replacements,
             wasModified: wasModified
         )
+    }
+
+    /// Run the legacy similarity ordering and greedy overlap selection without mutating text.
+    static func arbitratePendingReplacements(
+        _ pendingReplacements: [PendingReplacement],
+        occupiedIndices: Set<Int> = []
+    ) -> PendingReplacementArbitration {
+        let quantized: (Float) -> Int = { Int(($0 / 0.05).rounded()) }
+        let sortedReplacements = pendingReplacements.sorted { a, b in
+            let aBucket = quantized(a.similarity)
+            let bBucket = quantized(b.similarity)
+            if aBucket != bBucket {
+                return aBucket > bBucket
+            }
+            if a.candidate.spanLength != b.candidate.spanLength {
+                return a.candidate.spanLength < b.candidate.spanLength
+            }
+            return a.similarity > b.similarity
+        }
+
+        var occupiedIndices = occupiedIndices
+        var applied: [PendingReplacement] = []
+        var supersededCandidateIDs = Set<Int>()
+        for pending in sortedReplacements {
+            guard pending.candidate.spanIndices.allSatisfy({ !occupiedIndices.contains($0) }) else {
+                if let candidateID = pending.candidateID {
+                    supersededCandidateIDs.insert(candidateID)
+                }
+                continue
+            }
+            applied.append(pending)
+            occupiedIndices.formUnion(pending.candidate.spanIndices)
+        }
+
+        return PendingReplacementArbitration(
+            applied: applied,
+            supersededCandidateIDs: supersededCandidateIDs
+        )
+    }
+
+    /// Resolve final outcomes after the legacy greedy overlap pass has selected its winners.
+    static func reconcileLegacyOutcomes(
+        candidates: inout [CandidateEvidence],
+        appliedCandidateIDs: Set<Int>
+    ) {
+        for index in candidates.indices where candidates[index].comparisonPassed {
+            let outcome: LegacyApplicationOutcome =
+                appliedCandidateIDs.contains(candidates[index].candidateID)
+                ? .applied
+                : .supersededByOverlap
+            candidates[index] = candidates[index].replacingLegacyOutcome(outcome)
+        }
     }
 
     // MARK: - Public API
@@ -148,25 +345,111 @@ extension VocabularyRescorer {
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
         minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
     ) -> RescoreOutput {
+        var candidateEvidence: CandidateEvidenceCollector?
+        return evaluateTokenCandidates(
+            transcript: transcript,
+            tokenTimings: tokenTimings,
+            logProbs: logProbs,
+            frameDuration: frameDuration,
+            cbw: cbw,
+            marginSeconds: marginSeconds,
+            minSimilarity: minSimilarity,
+            candidateEvidence: &candidateEvidence
+        )
+    }
+
+    /// Evaluate vocabulary candidates without returning the rewritten transcript.
+    ///
+    /// This runs the same candidate discovery and CTC comparison as ``ctcTokenRescore`` while
+    /// preserving the supplied transcript as ``CandidateEvidenceOutput/baseText``. The output
+    /// includes comparison failures, unavailable comparisons, applied candidates, and candidates
+    /// superseded by the legacy overlap pass.
+    ///
+    /// - Parameters:
+    ///   - transcript: Untouched transcript from the TDT decoder.
+    ///   - tokenTimings: Token-level timings from the TDT decoder.
+    ///   - logProbs: CTC log-probabilities from the spotter.
+    ///   - frameDuration: Duration of each CTC frame in seconds.
+    ///   - cbw: Context-biasing weight.
+    ///   - marginSeconds: Temporal margin around TDT words for CTC search.
+    ///   - minSimilarity: Minimum string similarity to consider a match.
+    /// - Returns: Untouched base text, its exact internal word sequence, and finalized evidence for
+    ///   every CTC-evaluated candidate.
+    public func ctcTokenEvaluateCandidates(
+        transcript: String,
+        tokenTimings: [TokenTiming],
+        logProbs: [[Float]],
+        frameDuration: Double,
+        cbw: Float = ContextBiasingConstants.defaultCbw,
+        marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+    ) -> CandidateEvidenceOutput {
+        var candidateEvidence: CandidateEvidenceCollector? = CandidateEvidenceCollector()
+        _ = evaluateTokenCandidates(
+            transcript: transcript,
+            tokenTimings: tokenTimings,
+            logProbs: logProbs,
+            frameDuration: frameDuration,
+            cbw: cbw,
+            marginSeconds: marginSeconds,
+            minSimilarity: minSimilarity,
+            candidateEvidence: &candidateEvidence
+        )
+        return CandidateEvidenceOutput(
+            baseText: transcript,
+            baseWords: candidateEvidence?.baseWords ?? [],
+            candidates: candidateEvidence?.candidates ?? []
+        )
+    }
+
+    private func evaluateTokenCandidates(
+        transcript: String,
+        tokenTimings: [TokenTiming],
+        logProbs: [[Float]],
+        frameDuration: Double,
+        cbw: Float,
+        marginSeconds: Double,
+        minSimilarity: Float,
+        candidateEvidence: inout CandidateEvidenceCollector?
+    ) -> RescoreOutput {
+        // Build word-level timings once at the entrypoint and pass into both
+        // dispatch paths. Computing this once instead of twice avoids
+        // duplicate work for the BK-tree branch and keeps the private
+        // functions parameterized by `[WordTiming]` rather than the raw
+        // `[TokenTiming]` (cleaner contract; useful if a caller ever wants
+        // to supply pre-computed timings from another source).
+        let wordTimings = Self.buildWordTimings(from: tokenTimings)
+        if candidateEvidence != nil {
+            let baseWords = wordTimings.map(\.word)
+            candidateEvidence?.baseText = transcript
+            candidateEvidence?.baseWords = baseWords
+            candidateEvidence?.alignedWordRanges = Self.alignBaseWordsToUTF8Ranges(
+                baseText: transcript,
+                baseWords: baseWords
+            )
+        }
+
         if useBKTree {
             return rescoreWithConstrainedCTCWordCentric(
                 transcript: transcript,
-                tokenTimings: tokenTimings,
+                wordTimings: wordTimings,
                 logProbs: logProbs,
                 frameDuration: frameDuration,
                 cbw: cbw,
                 marginSeconds: marginSeconds,
-                minSimilarity: minSimilarity
+                minSimilarity: minSimilarity,
+                candidateEvidence: &candidateEvidence
             )
         } else {
             return rescoreWithConstrainedCTCTermCentric(
                 transcript: transcript,
-                tokenTimings: tokenTimings,
+                wordTimings: wordTimings,
                 logProbs: logProbs,
                 frameDuration: frameDuration,
                 cbw: cbw,
                 marginSeconds: marginSeconds,
-                minSimilarity: minSimilarity
+                minSimilarity: minSimilarity,
+                candidateEvidence: &candidateEvidence
             )
         }
     }
@@ -183,16 +466,14 @@ extension VocabularyRescorer {
     /// Best used with BK-tree enabled for O(W x log V) performance.
     private func rescoreWithConstrainedCTCWordCentric(
         transcript: String,
-        tokenTimings: [TokenTiming],
+        wordTimings: [WordTiming],
         logProbs: [[Float]],
         frameDuration: Double,
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
-        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        candidateEvidence: inout CandidateEvidenceCollector?
     ) -> RescoreOutput {
-        // Build word-level timings from token timings
-        let wordTimings = buildWordTimings(from: tokenTimings)
-
         guard !wordTimings.isEmpty, !logProbs.isEmpty else {
             return RescoreOutput(text: transcript, replacements: [], wasModified: false)
         }
@@ -212,6 +493,12 @@ extension VocabularyRescorer {
 
         // Build normalized vocabulary set for guard checks
         let vocabularyNormalizedSet = buildVocabularyNormalizedSet()
+
+        // Lowest per-term similarity across the vocabulary. The BK-tree search
+        // bound is derived from this floor so that terms with a lower per-term
+        // `minSimilarity` are not pruned before per-candidate filtering applies
+        // each term's own threshold.
+        let searchFloor = vocabulary.terms.reduce(minSimilarity) { min($0, $1.minSimilarity ?? minSimilarity) }
 
         // Pre-compute normalized words for all timings
         let normalizedWords = wordTimings.map { Self.normalizeForSimilarity($0.word) }
@@ -240,11 +527,15 @@ extension VocabularyRescorer {
                 }
             }
 
-            // Find candidate vocabulary terms using BK-tree or linear scan
+            // Find candidate vocabulary terms using BK-tree or linear scan.
+            // `searchFloor` widens the BK-tree edit-distance bound to cover the
+            // most permissive per-term override; each candidate is then filtered
+            // against its own threshold inside the helper.
             let candidates = findCandidateTermsForWord(
                 normalizedWord: normalizedWord,
                 adjacentNormalized: adjacentNormalized,
-                minSimilarity: minSimilarity
+                minSimilarity: minSimilarity,
+                searchFloor: searchFloor
             )
 
             if !candidates.isEmpty {
@@ -300,9 +591,12 @@ extension VocabularyRescorer {
                     continue
                 }
 
-                // Apply similarity threshold adjustments
+                // Apply similarity threshold adjustments. Per-term override
+                // falls back to the vocabulary-level threshold; guards below
+                // still clamp it upward for short/stopword spans.
+                let termMinSimilarity = term.minSimilarity ?? minSimilarity
                 var minSimilarityForSpan = requiredSimilarity(
-                    minSimilarity: minSimilarity,
+                    minSimilarity: termMinSimilarity,
                     spanLength: spanLength
                 )
 
@@ -337,12 +631,15 @@ extension VocabularyRescorer {
 
                 // Evaluate CTC match using shared helper
                 let matchCandidate = CTCMatchCandidate(
+                    origin: .wordCentric,
                     originalPhrase: originalPhrase,
                     vocabTerm: vocabTerm,
+                    matchedAlias: nil,
                     vocabTokens: vocabTokens,
                     similarity: similarity,
                     spanLength: spanLength,
                     spanIndices: spanIndices,
+                    tokenRange: Self.tokenRange(for: spanIndices, in: wordTimings),
                     spanStartTime: spanStartTime,
                     spanEndTime: spanEndTime
                 )
@@ -354,10 +651,16 @@ extension VocabularyRescorer {
                     cbw: cbw,
                     marginSeconds: marginSeconds
                 )
+                let candidateID = Self.recordCandidateEvidence(
+                    candidate: matchCandidate,
+                    result: result,
+                    candidateEvidence: &candidateEvidence
+                )
 
                 if result.shouldReplace {
                     pendingReplacements.append(
                         PendingReplacement(
+                            candidateID: candidateID,
                             candidate: matchCandidate,
                             result: result,
                             similarity: similarity
@@ -372,7 +675,8 @@ extension VocabularyRescorer {
             pendingReplacements: pendingReplacements,
             modifiedWords: &modifiedWords,
             replacedIndices: &replacedIndices,
-            replacements: &replacements
+            replacements: &replacements,
+            candidateEvidence: &candidateEvidence
         )
     }
 
@@ -388,16 +692,14 @@ extension VocabularyRescorer {
     /// This approach processes vocabulary in file order and produces better benchmark results.
     private func rescoreWithConstrainedCTCTermCentric(
         transcript: String,
-        tokenTimings: [TokenTiming],
+        wordTimings: [WordTiming],
         logProbs: [[Float]],
         frameDuration: Double,
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
-        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        candidateEvidence: inout CandidateEvidenceCollector?
     ) -> RescoreOutput {
-        // Build word-level timings from token timings
-        let wordTimings = buildWordTimings(from: tokenTimings)
-
         guard !wordTimings.isEmpty, !logProbs.isEmpty else {
             return RescoreOutput(text: transcript, replacements: [], wasModified: false)
         }
@@ -420,6 +722,11 @@ extension VocabularyRescorer {
         // TERM-CENTRIC LOOP: For each vocabulary term, find similar TDT words and run constrained CTC
         for term in vocabulary.terms {
             let vocabTerm = term.text
+
+            // Per-term similarity override (falls back to the vocabulary-level
+            // threshold). Safety guards in requiredSimilarity/checkStopwordRules/
+            // checkLengthRatioRules still clamp this upward for short/stopword spans.
+            let termMinSimilarity = term.minSimilarity ?? minSimilarity
 
             // Skip short vocabulary terms (per NeMo CTC-WS paper)
             guard vocabTerm.count >= vocabulary.minTermLength else {
@@ -469,9 +776,13 @@ extension VocabularyRescorer {
 
                         // Check similarity against ALL forms (canonical + aliases)
                         var bestSimilarity: Float = 0
+                        var matchedAlias: String?
                         for form in multiWordForms {
                             let similarity = Self.stringSimilarity(normalizedPhrase, form.normalized)
-                            bestSimilarity = max(bestSimilarity, similarity)
+                            if similarity > bestSimilarity {
+                                bestSimilarity = similarity
+                                matchedAlias = form.matchedAlias
+                            }
                         }
 
                         // Skip if already exact match to canonical (no replacement needed)
@@ -490,10 +801,10 @@ extension VocabularyRescorer {
 
                         // Use adaptive similarity threshold
                         let minSimilarityForSpan = requiredSimilarity(
-                            minSimilarity: minSimilarity,
+                            minSimilarity: termMinSimilarity,
                             spanLength: spanLength
                         )
-                        guard bestSimilarity >= minSimilarityForSpan else { continue }
+                        if bestSimilarity < minSimilarityForSpan { continue }
 
                         // Get temporal window for the entire span
                         guard let firstIdx = spanIndices.first, let lastIdx = spanIndices.last else { continue }
@@ -502,12 +813,15 @@ extension VocabularyRescorer {
 
                         // Evaluate CTC match using shared helper
                         let matchCandidate = CTCMatchCandidate(
+                            origin: .termCentricMultiWord,
                             originalPhrase: tdtPhrase,
                             vocabTerm: vocabTerm,
+                            matchedAlias: matchedAlias,
                             vocabTokens: vocabTokens,
                             similarity: bestSimilarity,
                             spanLength: spanLength,
                             spanIndices: spanIndices,
+                            tokenRange: Self.tokenRange(for: spanIndices, in: wordTimings),
                             spanStartTime: spanStartTime,
                             spanEndTime: spanEndTime
                         )
@@ -519,11 +833,17 @@ extension VocabularyRescorer {
                             cbw: cbw,
                             marginSeconds: marginSeconds
                         )
+                        let candidateID = Self.recordCandidateEvidence(
+                            candidate: matchCandidate,
+                            result: result,
+                            candidateEvidence: &candidateEvidence
+                        )
 
                         if result.shouldReplace {
                             // Collect candidate instead of applying immediately
                             pendingReplacements.append(
                                 PendingReplacement(
+                                    candidateID: candidateID,
                                     candidate: matchCandidate,
                                     result: result,
                                     similarity: bestSimilarity
@@ -559,9 +879,13 @@ extension VocabularyRescorer {
                     // Check similarity against ALL forms (single word)
                     var bestSimilarity: Float = 0
                     var matchedSpanLength = 1
+                    var matchedAlias: String?
                     for form in singleWordForms {
                         let similarity = Self.stringSimilarity(normalizedWord, form.normalized)
-                        bestSimilarity = max(bestSimilarity, similarity)
+                        if similarity > bestSimilarity {
+                            bestSimilarity = similarity
+                            matchedAlias = form.matchedAlias
+                        }
                     }
 
                     // COMPOUND WORD MATCHING: For single-word vocabulary terms, also try
@@ -594,7 +918,7 @@ extension VocabularyRescorer {
                                 if concatSimilarity > bestSimilarity {
                                     bestSimilarity = concatSimilarity
                                     matchedSpanLength = 2
-
+                                    matchedAlias = form.matchedAlias
                                 }
                             }
                         }
@@ -616,7 +940,7 @@ extension VocabularyRescorer {
                                 if concatSimilarity > bestSimilarity {
                                     bestSimilarity = concatSimilarity
                                     matchedSpanLength = 3
-
+                                    matchedAlias = form.matchedAlias
                                 }
                             }
                         }
@@ -624,7 +948,7 @@ extension VocabularyRescorer {
 
                     // Use adaptive similarity threshold
                     var minSimilarityForSpan = requiredSimilarity(
-                        minSimilarity: minSimilarity,
+                        minSimilarity: termMinSimilarity,
                         spanLength: matchedSpanLength
                     )
 
@@ -653,7 +977,7 @@ extension VocabularyRescorer {
                     if shouldSkipStopword { continue }
                     minSimilarityForSpan = adjustedSimilarity
 
-                    guard bestSimilarity >= minSimilarityForSpan else { continue }
+                    if bestSimilarity < minSimilarityForSpan { continue }
 
                     // Build the original phrase (single word or concatenated span)
                     let spanIndices = Array(wordIdx..<(wordIdx + matchedSpanLength))
@@ -668,12 +992,15 @@ extension VocabularyRescorer {
 
                     // Evaluate CTC match using shared helper
                     let matchCandidate = CTCMatchCandidate(
+                        origin: .termCentricSingleWord,
                         originalPhrase: originalPhrase,
                         vocabTerm: vocabTerm,
+                        matchedAlias: matchedAlias,
                         vocabTokens: vocabTokens,
                         similarity: bestSimilarity,
                         spanLength: matchedSpanLength,
                         spanIndices: spanIndices,
+                        tokenRange: Self.tokenRange(for: spanIndices, in: wordTimings),
                         spanStartTime: spanStartTime,
                         spanEndTime: spanEndTime
                     )
@@ -685,11 +1012,17 @@ extension VocabularyRescorer {
                         cbw: cbw,
                         marginSeconds: marginSeconds
                     )
+                    let candidateID = Self.recordCandidateEvidence(
+                        candidate: matchCandidate,
+                        result: result,
+                        candidateEvidence: &candidateEvidence
+                    )
 
                     if result.shouldReplace {
                         // Collect candidate instead of applying immediately
                         pendingReplacements.append(
                             PendingReplacement(
+                                candidateID: candidateID,
                                 candidate: matchCandidate,
                                 result: result,
                                 similarity: bestSimilarity
@@ -700,12 +1033,321 @@ extension VocabularyRescorer {
             }
         }
 
+        // SPOTTER-ANCHORED RESCUE PASS:
+        //
+        // The string-similarity gate above only fires when TDT's
+        // hypothesis is near (in edit-distance) some vocabulary term.
+        // For rare brand names that TDT mangles beyond ~0.55 similarity
+        // (e.g. `Quhuo` → `chuhua`, `HepsiJet` → `the jet`,
+        // `DiaSorin` → `the solar`), the CTC keyword spotter still
+        // detects the keyword acoustically. This pass collects those
+        // detections and proposes them as replacements.
+        //
+        // **Size-gated**: only runs when vocabulary is small enough that
+        // the spotter's keyword-vs-keyword competition is reliable. On
+        // extra-large vocabularies (e.g. 670 drug names with ~600
+        // distractors), the spotter has too many phonetically-similar
+        // terms producing false-positive rescues like
+        // `and` → `Evenity`. The TDT-anchored path above already covers
+        // those cases via Levenshtein matching against the larger
+        // distractor pool.
+        // Opt-out (#724): `spotterRescueEnabled = false` skips the acoustic
+        // rescue entirely (pre-#634 / 0.14.5 behavior) for short-vocab KWS
+        // where it over-fires more than it recovers.
+        if config.spotterRescueEnabled,
+            vocabulary.terms.count <= ContextBiasingConstants.largeVocabThreshold
+        {
+            collectSpotterAnchoredCandidates(
+                wordTimings: wordTimings,
+                logProbs: logProbs,
+                frameDuration: frameDuration,
+                cbw: cbw,
+                marginSeconds: marginSeconds,
+                vocabularyNormalizedSet: vocabularyNormalizedSet,
+                pendingReplacements: &pendingReplacements,
+                candidateEvidence: &candidateEvidence
+            )
+        }
+
         // PASS 2 & 3: Sort, apply, and reconstruct (shared logic)
         return finalizeReplacements(
             pendingReplacements: pendingReplacements,
             modifiedWords: &modifiedWords,
             replacedIndices: &replacedIndices,
-            replacements: &replacements
+            replacements: &replacements,
+            candidateEvidence: &candidateEvidence
         )
+    }
+
+    // MARK: - Spotter-Anchored Rescue
+
+    /// Minimum CTC keyword-spotter score to consider a detection for the
+    /// rescue path. Looser than the production spotter floor (-15) but
+    /// strict enough that the CTC-vs-CTC comparison can still reject
+    /// borderline acoustic matches.
+    private static let spotterRescueMinScore: Float = -10.0
+
+    /// Collect candidate replacements grounded in CTC-keyword-spotter
+    /// detections rather than in TDT string similarity.
+    ///
+    /// For each detection, locate the TDT word indices whose timestamp
+    /// window overlaps the detection. Build a `CTCMatchCandidate`
+    /// (similarity is computed for ranking only — the gate is the
+    /// CTC-vs-CTC comparison plus cbw boost performed by
+    /// `evaluateCTCMatch`).
+    private func collectSpotterAnchoredCandidates(
+        wordTimings: [WordTiming],
+        logProbs: [[Float]],
+        frameDuration: Double,
+        cbw: Float,
+        marginSeconds: Double,
+        vocabularyNormalizedSet: Set<String>,
+        pendingReplacements: inout [PendingReplacement],
+        candidateEvidence: inout CandidateEvidenceCollector?
+    ) {
+        let result = spotter.spotKeywordsFromLogProbs(
+            logProbs: logProbs,
+            frameDuration: frameDuration,
+            customVocabulary: vocabulary,
+            minScore: Self.spotterRescueMinScore
+        )
+        guard !result.detections.isEmpty else { return }
+
+        // Sort detections by score descending — the highest-confidence
+        // acoustic detection for each (term, time-window) pair gets to
+        // race for the span first.
+        let detections = result.detections.sorted { $0.score > $1.score }
+        var seenSpans = Set<String>()  // dedupe by termLower:firstIdx:spanLength
+
+        for detection in detections {
+            let term = detection.term
+            let vocabTerm = term.text
+            guard vocabTerm.count >= vocabulary.minTermLength else { continue }
+
+            // Map detection time window → TDT word indices.
+            let span = wordIndices(
+                in: wordTimings,
+                overlapping: detection.startTime,
+                end: detection.endTime
+            )
+            guard !span.isEmpty else { continue }
+
+            // Bound to a sensible width so we don't replace whole
+            // sentences with a single keyword on a misaligned spotter
+            // hit. 4 mirrors the multi-word ceiling in the term-centric
+            // loop above.
+            guard span.count <= 4 else { continue }
+
+            let dedupeKey = "\(term.textLowercased):\(span.first!):\(span.count)"
+            guard seenSpans.insert(dedupeKey).inserted else { continue }
+
+            let spanWords = span.map { wordTimings[$0].word }
+            let originalPhrase = spanWords.joined(separator: " ")
+            let normalizedPhrase = Self.normalizeForSimilarity(originalPhrase)
+
+            // If the TDT phrase already matches some other vocabulary
+            // term verbatim, leave it alone — that's the same guard the
+            // primary path applies.
+            let normalizedForms = buildNormalizedForms(for: term)
+            let normalizedCurrentSet = Set(normalizedForms.map { $0.normalized })
+            if vocabularyNormalizedSet.contains(normalizedPhrase),
+                !normalizedCurrentSet.contains(normalizedPhrase)
+            {
+                continue
+            }
+
+            // If the TDT phrase already equals the canonical (or an
+            // alias), there's nothing to replace.
+            let normalizedCanonical = Self.normalizeForSimilarity(vocabTerm)
+            if normalizedPhrase == normalizedCanonical { continue }
+            if normalizedCurrentSet.contains(normalizedPhrase) { continue }
+
+            guard let vocabTokens = term.ctcTokenIds ?? term.tokenIds, !vocabTokens.isEmpty else {
+                continue
+            }
+
+            // STOPWORD/CONTENT GUARD:
+            // Reject rescues whose entire span is short common words.
+            // Without this, drug-list FPs like `and` → `Evenity`,
+            // `the` → `ELEVIDYS`, `by` → `Stelara` slip through because
+            // the spotter score, evaluated in its own (acoustic) window,
+            // beats the original stopword's CTC score in that same
+            // window — yet the spotter window is several frames wider
+            // than the lone TDT word it lands on.
+            let normalizedSpanWords =
+                span.map { Self.normalizeForSimilarity(wordTimings[$0].word) }
+            if span.count == 1 && Self.stopwords.contains(normalizedSpanWords[0]) {
+                continue
+            }
+            if span.count >= 2 {
+                let allStopwords = normalizedSpanWords.allSatisfy { Self.stopwords.contains($0) }
+                if allStopwords { continue }
+            }
+
+            // Compute similarity (best over canonical + aliases).
+            var bestSimilarity: Float = 0
+            var matchedAlias: String?
+            for form in normalizedForms {
+                let similarity = Self.stringSimilarity(normalizedPhrase, form.normalized)
+                if similarity > bestSimilarity {
+                    bestSimilarity = similarity
+                    matchedAlias = form.matchedAlias
+                }
+            }
+
+            // SIMILARITY FLOOR for the acoustic rescue path. The spotter
+            // rescue is acoustic-evidence driven and otherwise ignores
+            // similarity, which lets it force-replace low-similarity spans.
+            // The effective floor is the stricter of:
+            //   - the term's EXPLICIT per-term override (#647), and
+            //   - the opt-in span-aware config floor (#702; higher for
+            //     multi-word spans, which are the most error-prone).
+            // Both sources default to disabled, so by default this is a no-op
+            // and similarity stays "for ranking only".
+            let configSpotterFloor =
+                span.count >= 2
+                ? config.spotterRescueMultiWordMinSimilarity
+                : config.spotterRescueMinSimilarity
+            let spotterSimFloor = max(term.minSimilarity ?? 0, configSpotterFloor)
+            if bestSimilarity < spotterSimFloor {
+                debugLog(
+                    "  [SPOTTER-RESCUE] Skipping '\(vocabTerm)' over '\(originalPhrase)': "
+                        + "similarity \(String(format: "%.2f", bestSimilarity)) < floor "
+                        + "\(String(format: "%.2f", spotterSimFloor)) (span=\(span.count))")
+                continue
+            }
+
+            let firstIdx = span.first!
+            let lastIdx = span.last!
+            let candidate = CTCMatchCandidate(
+                origin: .spotterRescue,
+                originalPhrase: originalPhrase,
+                vocabTerm: vocabTerm,
+                matchedAlias: matchedAlias,
+                vocabTokens: vocabTokens,
+                similarity: bestSimilarity,
+                spanLength: span.count,
+                spanIndices: span,
+                tokenRange: Self.tokenRange(for: span, in: wordTimings),
+                spanStartTime: wordTimings[firstIdx].startTime,
+                spanEndTime: wordTimings[lastIdx].endTime
+            )
+
+            let evalResult = evaluateCTCMatch(
+                candidate: candidate,
+                logProbs: logProbs,
+                frameDuration: frameDuration,
+                cbw: cbw,
+                marginSeconds: marginSeconds
+            )
+            let candidateID = Self.recordCandidateEvidence(
+                candidate: candidate,
+                result: evalResult,
+                candidateEvidence: &candidateEvidence
+            )
+            guard evalResult.shouldReplace else { continue }
+
+            debugLog(
+                "  [SPOTTER-RESCUE] '\(originalPhrase)' → '\(vocabTerm)' "
+                    + "spotter=\(String(format: "%.2f", detection.score)), "
+                    + "sim=\(String(format: "%.2f", bestSimilarity))"
+            )
+
+            pendingReplacements.append(
+                PendingReplacement(
+                    candidateID: candidateID,
+                    candidate: candidate,
+                    result: evalResult,
+                    similarity: bestSimilarity
+                )
+            )
+        }
+    }
+
+    /// How far (seconds, detection centre to word centre) the nearest-word
+    /// fallback may reach when no TDT word overlaps a spotter detection.
+    /// Unbounded, a spurious low-score detection in the first 0.5 s of a
+    /// window snapped onto whatever word was nearest — `Hey` 0.68 s away on
+    /// one machine, `validate` on another (#899). Half a second covers the
+    /// CTC-vs-TDT timestamp skew a near miss can have; the session's search
+    /// margin is the same value.
+    static let spotterRescueFallbackRadiusSeconds: Double = 0.5
+
+    /// The word whose centre is closest to `center`, and how far it is. Pure,
+    /// so the fallback bound can be unit-tested without a rescorer.
+    static func nearestWord(
+        in wordTimings: [WordTiming], toCenter center: Double
+    ) -> (index: Int, delta: Double)? {
+        var best: (index: Int, delta: Double)?
+        for (idx, w) in wordTimings.enumerated() {
+            let delta = abs((w.startTime + w.endTime) / 2.0 - center)
+            if best == nil || delta < best!.delta {
+                best = (idx, delta)
+            }
+        }
+        return best
+    }
+
+    /// The bounded-fallback decision on its own: the nearest word's index when
+    /// it lies within `radius` seconds of `center`, nil otherwise (#899).
+    static func fallbackWordIndex(
+        in wordTimings: [WordTiming], toCenter center: Double,
+        radius: Double = spotterRescueFallbackRadiusSeconds
+    ) -> Int? {
+        guard let nearest = nearestWord(in: wordTimings, toCenter: center), nearest.delta <= radius else {
+            return nil
+        }
+        return nearest.index
+    }
+
+    /// Find the indices of TDT words whose [startTime, endTime] window
+    /// overlaps the supplied detection range. Returns at most a small
+    /// contiguous run; non-contiguous overlaps are reduced to the run
+    /// containing the time-center of the detection. With no overlap, the
+    /// nearest word is used only if it lies within `fallbackRadius` of the
+    /// detection centre; otherwise the detection maps to nothing.
+    private func wordIndices(
+        in wordTimings: [WordTiming],
+        overlapping start: Double,
+        end: Double,
+        fallbackRadius: Double = spotterRescueFallbackRadiusSeconds
+    ) -> [Int] {
+        guard !wordTimings.isEmpty, start < end else { return [] }
+
+        var overlapping: [Int] = []
+        for (idx, w) in wordTimings.enumerated() {
+            if w.endTime < start { continue }
+            if w.startTime > end { break }
+            overlapping.append(idx)
+        }
+        if overlapping.isEmpty {
+            // Fall back to the nearest word to the detection centre, bounded.
+            let center = (start + end) / 2.0
+            let nearest = Self.nearestWord(in: wordTimings, toCenter: center)
+            guard let nearest else { return [] }
+            guard nearest.delta <= fallbackRadius else {
+                debugLog(
+                    String(
+                        format:
+                            "  [SPOTTER-RESCUE] detection %.2f–%.2fs overlaps no word; nearest '%@' is %.2fs away (> %.2fs), skipped",
+                        start, end, wordTimings[nearest.index].word, nearest.delta, fallbackRadius))
+                return []
+            }
+            debugLog(
+                String(
+                    format: "  [SPOTTER-RESCUE] detection %.2f–%.2fs overlaps no word; using nearest '%@' (%.2fs away)",
+                    start, end, wordTimings[nearest.index].word, nearest.delta))
+            return [nearest.index]
+        }
+        // Ensure contiguity (consecutive indices).
+        var contiguous: [Int] = [overlapping[0]]
+        for i in 1..<overlapping.count {
+            if overlapping[i] == contiguous.last! + 1 {
+                contiguous.append(overlapping[i])
+            } else {
+                break
+            }
+        }
+        return contiguous
     }
 }

@@ -2,7 +2,8 @@ import Foundation
 
 /// `[510, 256]` flat fp32 voice pack (e.g. `af_heart.bin`).
 ///
-/// Indexed by phoneme-length bucket: `row = min(max(T_enc - 1, 0), 509)`.
+/// Indexed by phoneme-length bucket: `row = min(max(phonemeCount - 1, 0), 509)`
+/// where `phonemeCount` is the raw phoneme-string length (BOS/EOS excluded).
 /// Columns split into:
 ///   * `[0..<128]`   = `style_timbre` (fed into Noise + Vocoder)
 ///   * `[128..<256]` = `style_s`      (fed into PostAlbert + Prosody)
@@ -37,6 +38,37 @@ public struct KokoroAneVoicePack: Sendable {
             data.copyBytes(to: dst)
         }
         return try KokoroAneVoicePack(storage: storage)
+    }
+
+    /// Build a pack from a Kokoro-82M v1.0 JSON voice file (the
+    /// `voices/<name>.json` layout hosted at the repo root): an object whose
+    /// keys `"1"` … `"510"` hold the 256-float row for that phoneme count.
+    /// Row `k` of the flat pack is key `"k+1"` — verified byte-exact against
+    /// the shipped `af_heart.bin` (#896). Any extra keys (`"embedding"`) are
+    /// ignored.
+    public static func load(fromJSON data: Data) throws -> KokoroAneVoicePack {
+        let rows = KokoroAneConstants.voicePackRows
+        let cols = KokoroAneConstants.voicePackCols
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw KokoroAneError.invalidVoicePack("JSON voice pack is not an object")
+        }
+        var storage: [Float] = []
+        storage.reserveCapacity(rows * cols)
+        for row in 1...rows {
+            guard let values = object[String(row)] as? [NSNumber], values.count == cols else {
+                throw KokoroAneError.invalidVoicePack(
+                    "JSON voice pack row \(row) missing or not \(cols) numbers")
+            }
+            for value in values {
+                storage.append(value.floatValue)
+            }
+        }
+        return try KokoroAneVoicePack(storage: storage)
+    }
+
+    /// Flat little-endian fp32 bytes in the `<voice>.bin` layout.
+    public var binaryData: Data {
+        storage.withUnsafeBufferPointer { Data(buffer: $0) }
     }
 
     /// Pick the row that matches the phoneme-length bucket.

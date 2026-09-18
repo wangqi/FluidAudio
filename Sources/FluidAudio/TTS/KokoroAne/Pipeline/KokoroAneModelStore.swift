@@ -3,9 +3,21 @@ import Foundation
 
 /// Per-stage compute-unit assignment for the laishere chain.
 ///
-/// Mirrors the empirical optima from `iOSDemo` and the conversion script:
-/// Albert / PostAlbert / Alignment / Vocoder run on `cpuAndNeuralEngine`,
-/// while Prosody / Noise / Tail run on `all` (let the scheduler pick).
+/// Default placement (OS 26 and earlier): all stages on `cpuAndNeuralEngine`
+/// EXCEPT noise + tail (iSTFT) on `cpuAndGPU`. This is the only routing that
+/// runs on every Apple Silicon generation there: the prosody RNN crashes the
+/// GPU MPSGraph JIT (`GPURNNOps`) on M5/macOS 26.5 if placed on `all`, and
+/// the tail iSTFT crashes `libBNNS` if placed on CPU/ANE — so the RNN-bearing
+/// stages stay on ANE while the iSTFT goes to the GPU. See #667.
+///
+/// On OS 27+ the GPU stages themselves abort in MPSGraph under CoreML
+/// (#843), so the default swaps noise + tail to `.cpuOnly` — see
+/// ``aneTailCpu``.
+///
+/// (The earlier "Prosody/Noise/Tail on `all`" placement matched laishere's
+/// iOSDemo and ran fine on M2, but crashes by default on M5. The tail was
+/// always meant to run fp32 on CPU/GPU — ANE rejects the exp/sin/iSTFT — so
+/// pinning it to GPU is faithful, not a hack.)
 public struct KokoroAneComputeUnits: Sendable, Equatable {
     public var albert: MLComputeUnits
     public var postAlbert: MLComputeUnits
@@ -19,10 +31,15 @@ public struct KokoroAneComputeUnits: Sendable, Equatable {
         albert: MLComputeUnits = .cpuAndNeuralEngine,
         postAlbert: MLComputeUnits = .cpuAndNeuralEngine,
         alignment: MLComputeUnits = .cpuAndNeuralEngine,
-        prosody: MLComputeUnits = .all,
-        noise: MLComputeUnits = .all,
+        prosody: MLComputeUnits = .cpuAndNeuralEngine,
+        // Noise defaults to GPU: the stage is all-fp32 (its sin(cumsum)
+        // phase collapses in fp16), so the fp16-only ANE takes none of it
+        // and `.cpuAndNeuralEngine` degenerates to plain CPU — measured
+        // slower than `.cpuOnly`. It has zero RNN ops, so the #667 GPU ban
+        // never applied to it. Measurements in the `aneTailGpu` note.
+        noise: MLComputeUnits = .cpuAndGPU,
         vocoder: MLComputeUnits = .cpuAndNeuralEngine,
-        tail: MLComputeUnits = .all
+        tail: MLComputeUnits = .cpuAndGPU
     ) {
         self.albert = albert
         self.postAlbert = postAlbert
@@ -33,8 +50,24 @@ public struct KokoroAneComputeUnits: Sendable, Equatable {
         self.tail = tail
     }
 
-    /// Empirical default — matches laishere's iOSDemo + this repo's conversion.
-    public static let `default` = KokoroAneComputeUnits()
+    /// Default — OS-dependent. On OS 26 and earlier: RNN stages on ANE,
+    /// noise + tail iSTFT on GPU (both are fp32-only graphs the ANE cannot
+    /// take); identical to ``aneTailGpu``. See #667 and the `noise:`
+    /// parameter note above.
+    ///
+    /// On OS 27+: identical to ``aneTailCpu`` — the GPU stages abort
+    /// intermittently inside MPSGraph under CoreML on the 27 line (#843,
+    /// FB24243070), so noise + tail move to `.cpuOnly`. That route is not
+    /// known to be safe either (#889); `KokoroAneManager.initialize()` logs
+    /// the advisory on the 27 line.
+    public static var `default`: KokoroAneComputeUnits {
+        defaultUnits(for: ProcessInfo.processInfo.operatingSystemVersion)
+    }
+
+    /// Testable seam for the OS-conditional ``default``.
+    static func defaultUnits(for version: OperatingSystemVersion) -> KokoroAneComputeUnits {
+        version.majorVersion >= 27 ? .aneTailCpu : .aneTailGpu
+    }
 
     /// CPU+GPU only (skip ANE entirely). Useful for a baseline / debugging.
     public static let cpuAndGpu = KokoroAneComputeUnits(
@@ -59,6 +92,42 @@ public struct KokoroAneComputeUnits: Sendable, Equatable {
         prosody: .cpuOnly, noise: .cpuOnly, vocoder: .cpuOnly, tail: .cpuOnly
     )
 
+    /// M5 / macOS 26.5 stability: all stages `.cpuAndNeuralEngine` except the
+    /// tail (iSTFT) and noise on `.cpuAndGPU`. Keeps the prosody RNN off the
+    /// GPU (which otherwise hits the `GPURNNOps` JIT assert) while keeping the
+    /// iSTFT off the CPU/BNNS path (which otherwise segfaults in `libBNNS`).
+    /// See #667.
+    ///
+    /// Noise is `.cpuAndGPU` deliberately: the stage is all-fp32 (its
+    /// `sin(cumsum)` phase math collapses in fp16), so the fp16-only ANE can
+    /// take none of it and `.cpuAndNeuralEngine` degenerates to plain CPU —
+    /// measured even slower than `.cpuOnly` (131.9 vs 116.8 ms at T2=800).
+    /// It contains zero RNN ops, so the #667 GPU ban never applied to it;
+    /// MLComputePlan places 239/239 ops on GPU at 1.9-3.3x the CPU speed
+    /// (28.9 vs 55.8 ms at T2=400), ~10% of en synth / ~15% of zh. Same
+    /// fp32 math, so output is unchanged.
+    public static let aneTailGpu = KokoroAneComputeUnits(
+        albert: .cpuAndNeuralEngine, postAlbert: .cpuAndNeuralEngine,
+        alignment: .cpuAndNeuralEngine, prosody: .cpuAndNeuralEngine,
+        noise: .cpuAndGPU, vocoder: .cpuAndNeuralEngine,
+        tail: .cpuAndGPU
+    )
+
+    /// OS 27 default: like ``aneTailGpu`` but noise + tail on `.cpuOnly`,
+    /// so Metal is never invoked. On the 27 line the GPU stages abort
+    /// intermittently inside MPSGraph under CoreML (uncatchable in-process
+    /// abort, #843, FB24243070). This route is the lesser evil, not a safe
+    /// one: on iOS 27.0 it has crashed in libBNNS (`vadd_fp16_sme_internal`
+    /// SIGSEGV, ~54 min into a session, #889), so the 26.x libBNNS class is
+    /// not confined to 26.x. Short-run field validation on iPadOS 27.0 showed
+    /// imperceptible perf cost; long sessions are the open risk.
+    public static let aneTailCpu = KokoroAneComputeUnits(
+        albert: .cpuAndNeuralEngine, postAlbert: .cpuAndNeuralEngine,
+        alignment: .cpuAndNeuralEngine, prosody: .cpuAndNeuralEngine,
+        noise: .cpuOnly, vocoder: .cpuAndNeuralEngine,
+        tail: .cpuOnly
+    )
+
     /// Build a configuration from a generic preset (used by the
     /// `tts-benchmark` CLI so a single flag maps cleanly across
     /// backends).
@@ -72,6 +141,8 @@ public struct KokoroAneComputeUnits: Sendable, Equatable {
             self = .cpuAndGpu
         case .cpuOnly:
             self = .cpuOnly
+        case .aneTailGpu:
+            self = .aneTailGpu
         }
     }
 
@@ -101,6 +172,7 @@ public actor KokoroAneModelStore {
     private var voicePacks: [String: KokoroAneVoicePack] = [:]
     private var repoDirectory: URL?
     private var mandarinG2P: MandarinG2P?
+    private var japaneseG2P: JapaneseG2P?
     private var mandarinCustomLexicon: MandarinCustomLexicon = .empty
 
     private let directory: URL?
@@ -260,6 +332,27 @@ public actor KokoroAneModelStore {
         return pipeline
     }
 
+    /// Lazy-load and cache the Japanese frontend (MeCab over the trimmed
+    /// unidic-lite dictionary + Cutlet rules). The asset download is
+    /// independent of the CoreML model download and occurs only when a caller
+    /// supplies plain Japanese text.
+    func japaneseG2PPipeline() async throws -> JapaneseG2P {
+        if let japaneseG2P { return japaneseG2P }
+        guard variant == .japanese else {
+            throw KokoroAneError.inputProcessingFailed(
+                "Japanese G2P requested on a non-japanese store")
+        }
+        let repoDirectory =
+            try repoDirectory
+            ?? KokoroAneResourceDownloader.repositoryDirectory(
+                variant: .japanese, directory: directory)
+        let g2pDirectory = try await KokoroAneResourceDownloader.ensureJapaneseG2P(repoDirectory: repoDirectory)
+        let pipeline = try JapaneseG2P(directory: g2pDirectory)
+        japaneseG2P = pipeline
+        logger.info("Loaded Japanese G2P (MeCab + Cutlet)")
+        return pipeline
+    }
+
     /// Best-effort load of the g2pW polyphone disambiguator. Returns
     /// `nil` (and logs) when the assets are missing or fail to load,
     /// so the Mandarin G2P pipeline can keep running on the dict
@@ -310,5 +403,6 @@ public actor KokoroAneModelStore {
         vocab = nil
         repoDirectory = nil
         mandarinG2P = nil
+        japaneseG2P = nil
     }
 }

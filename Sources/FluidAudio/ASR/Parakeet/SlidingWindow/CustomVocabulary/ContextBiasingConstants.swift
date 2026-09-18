@@ -167,9 +167,13 @@ public enum ContextBiasingConstants {
     /// When aligning vocabulary terms to transcript words, this margin
     /// allows for timing imprecision in word boundaries.
     ///
-    /// - Value: `0.5` seconds (500ms tolerance)
+    /// - Value: `0.10` seconds (~5 encoder frames each side at 12.5 fps).
+    ///   Reduced from 0.5 after the +1-frame TDT emission-delay correction
+    ///   in `AsrManager+TokenProcessing.createTokenTimings`. Sweep on
+    ///   earnings22 / FDA / FDA-extended showed identical metrics from 0.5
+    ///   down to 0.10, with the first regression at 0.05 (-8 TP earnings22).
     /// - Used in: `VocabularyRescorer+TokenRescoring.ctcTokenRescore()`
-    public static let defaultMarginSeconds: Double = 0.5
+    public static let defaultMarginSeconds: Double = 0.10
 
     // MARK: - Vocabulary Size
 
@@ -192,16 +196,62 @@ public enum ContextBiasingConstants {
         public let cbw: Float
     }
 
+    /// Threshold for classifying vocabulary as "extra-large".
+    ///
+    /// Vocabularies above this size require even tighter similarity
+    /// thresholds because the dictionary contains many real drug/brand
+    /// names that *don't* appear in the audio (distractors). At V=670
+    /// with `minSimilarity=0.55`, FDA-extended produced 33 false
+    /// positives (precision 86.2%); raising to 0.60 cut that to 8
+    /// (precision 96.3%) at the cost of 1 TP. Above V=100 the
+    /// distractor density becomes large enough that the looser large-
+    /// vocab threshold becomes harmful.
+    ///
+    /// - Value: `100` terms
+    /// - Used in: `rescorerConfig(forVocabSize:)`
+    public static let extraLargeVocabThreshold: Int = 100
+
     /// Returns rescorer configuration tuned for the given vocabulary size.
+    ///
+    /// Tuning was performed on three benchmarks after the blank-aware DP fix:
+    ///
+    /// **Small-vocab path (earnings22 KWS, ≤9 terms/file):**
+    /// CBW sweep showed F-score plateaus at cbw ≈ 4.5 (TP=1075/1253,
+    /// FP unchanged at 8 across cbw ∈ [3.5, 6.0]). Below 3.5 each step
+    /// costs 1-5 TPs; above 4.5 the curve is flat.
+    ///
+    /// **Large-vocab path (FDA-approved-drugs KWS, 37-55 terms/file):**
+    /// minSimilarity sweep showed F-score peaks at 0.50-0.55 (TP=218,
+    /// FP=0, F-score 96.0%). The prior 0.60 default left 5 TPs on the
+    /// table.
+    ///
+    /// **Extra-large-vocab path (FDA-extended, ~670 terms/file with
+    /// 600+ Purple Book biologic distractors that never appear in
+    /// audio):**
+    /// minSimilarity 0.55 → 33 FPs, F=86.8%. Raising to 0.60 collapses
+    /// FPs to 8 (precision 86.2 → 96.3%) for only -1 TP, F=91.4%.
+    /// At V≥100 the distractor pool becomes large enough that the
+    /// 0.55 gate is too permissive.
+    ///
+    /// CBW had no measurable effect on either large-vocab benchmark
+    /// (precision was already high or the gate was the binding
+    /// constraint, not the score-vs-baseline comparison). All sizes
+    /// converge on cbw=4.5.
     ///
     /// - Parameter size: Number of vocabulary terms.
     /// - Returns: `VocabSizeConfig` with appropriate thresholds.
     public static func rescorerConfig(forVocabSize size: Int) -> VocabSizeConfig {
+        let isExtraLarge = size > extraLargeVocabThreshold
         let isLarge = size > largeVocabThreshold
-        return VocabSizeConfig(
-            minSimilarity: isLarge ? 0.60 : 0.50,
-            cbw: isLarge ? 2.5 : 3.0
-        )
+        let minSimilarity: Float
+        if isExtraLarge {
+            minSimilarity = 0.60
+        } else if isLarge {
+            minSimilarity = 0.55
+        } else {
+            minSimilarity = 0.50
+        }
+        return VocabSizeConfig(minSimilarity: minSimilarity, cbw: 4.5)
     }
 
     /// Baseline token count for multi-token phrase threshold adjustment.
@@ -236,6 +286,88 @@ public enum ContextBiasingConstants {
     /// - Value: `3` tokens
     /// - Used in: `VocabularyRescorer.Config.default` and init
     public static let defaultReferenceTokenCount: Int = 3
+
+    // MARK: - Short-Term Over-Fire Controls (#702, opt-in)
+    //
+    // The blank-aware DP score is a per-token average log-prob. A short
+    // keyword (few tokens) can free-start align to its single best-matching
+    // frame-run and score close to zero per token, so it can beat a correctly
+    // transcribed common word — short distractors over-fire (`ran` → `CRAN`,
+    // `Hall of Q4.` → `Snyk`). Benchmarking shows that gating this hard enough
+    // to suppress short-vocab false positives also costs KWS recall on
+    // distinctive-name vocabularies (earnings22), because the same mechanisms
+    // produce both. These controls therefore DEFAULT TO DISABLED (no behavior
+    // change) and are opt-in for short-keyword KWS via `VocabularyRescorer.Config`,
+    // the `transcribe` CLI flags, or the `FLUID_*` env overrides below.
+    //
+    // Recommended short-vocab opt-in values: taper pivot 5 / exponent 2.0,
+    // spotter floors 0.30 (single) / 0.50 (multi-word).
+
+    /// Default token-count pivot for the short-term cbw taper. A value `<= 1`
+    /// disables the taper (the default). When enabled (e.g. 5), terms with
+    /// fewer tokens than the pivot have their boost scaled by
+    /// `(tokenCount / pivot) ** exponent`. Env: `FLUID_CBW_TAPER_PIVOT`.
+    public static var defaultShortTermCbwTaperPivot: Int {
+        envInt("FLUID_CBW_TAPER_PIVOT") ?? 1
+    }
+
+    /// Default exponent for the short-term cbw taper. Higher = more
+    /// conservative on short terms. Env: `FLUID_CBW_TAPER_EXP`.
+    public static var defaultShortTermCbwTaperExponent: Float {
+        envFloat("FLUID_CBW_TAPER_EXP") ?? 2.0
+    }
+
+    /// Default minimum string similarity for a single-word spotter-anchored
+    /// rescue. `0.0` disables the floor (the default), preserving the
+    /// acoustic-only rescue. Env: `FLUID_SPOTTER_MIN_SIM`.
+    public static var defaultSpotterRescueMinSimilarity: Float {
+        envFloat("FLUID_SPOTTER_MIN_SIM") ?? 0.0
+    }
+
+    /// Default minimum string similarity for a multi-word spotter-anchored
+    /// rescue (replacing several words with one term is more error-prone).
+    /// `0.0` disables. Env: `FLUID_SPOTTER_MIN_SIM_MULTI`.
+    public static var defaultSpotterRescueMultiWordMinSimilarity: Float {
+        envFloat("FLUID_SPOTTER_MIN_SIM_MULTI") ?? 0.0
+    }
+
+    /// Whether the spotter-anchored acoustic rescue pass runs at all (#724).
+    /// `true` (default) preserves current behavior. The acoustic rescue is the
+    /// mechanism #634 added on top of the pre-0.14.5 pipeline; it recovers
+    /// brand names TDT mangles past the string-similarity gate, but it is also
+    /// the dominant source of short-keyword over-firing (#702) — on a 90-clip
+    /// short-distractor set, disabling it drops false-positive insertions from
+    /// ~94 to ~19 (the pre-#634 / 0.14.5 level) with no loss of biasing recall
+    /// on distinctive-name vocabularies. Set to `false` for short-vocab KWS
+    /// where the acoustic rescue costs more than it recovers. Env:
+    /// `FLUID_SPOTTER_RESCUE` (`0`/`false`/`no`/`off` disables).
+    public static var defaultSpotterRescueEnabled: Bool {
+        envBool("FLUID_SPOTTER_RESCUE") ?? true
+    }
+
+    /// Read a `Float` tuning override from the environment, if present and valid.
+    private static func envFloat(_ name: String) -> Float? {
+        guard let raw = ProcessInfo.processInfo.environment[name], let value = Float(raw) else { return nil }
+        return value
+    }
+
+    /// Read a `Bool` tuning override from the environment. Accepts
+    /// `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); nil if
+    /// absent/invalid.
+    private static func envBool(_ name: String) -> Bool? {
+        guard let raw = ProcessInfo.processInfo.environment[name]?.lowercased() else { return nil }
+        switch raw {
+        case "1", "true", "yes", "on": return true
+        case "0", "false", "no", "off": return false
+        default: return nil
+        }
+    }
+
+    /// Read an `Int` tuning override from the environment, if present and valid.
+    private static func envInt(_ name: String) -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment[name], let value = Int(raw) else { return nil }
+        return value
+    }
 
     /// Default setting for adaptive thresholds.
     ///

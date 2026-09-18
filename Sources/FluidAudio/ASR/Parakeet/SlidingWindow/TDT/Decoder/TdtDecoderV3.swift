@@ -37,6 +37,46 @@ internal struct TdtDecoderV3: Sendable {
     private let modelInference = TdtModelInference()
     // Parakeet‑TDT‑v3: duration head has 5 bins mapping directly to frame advances
 
+    // English-exclusive whole-word token IDs used by applyEnglishBlocklist.
+    // Space-prefixed SentencePiece tokens that are essentially impossible in French prose.
+    static let englishBlocklistIds: Set<Int> = [
+        506, 1502,  // ' the', ' The'
+        575, 1976,  // ' and', ' And'
+        2530,  // ' they'
+        1180, 3247,  // ' you', ' You'
+        1868,  // ' with'
+        1050, 7603,  // ' that', ' That'
+        1974, 5831,  // ' this', ' This'
+        1647,  // ' have'
+        3109,  // ' from'
+        924, 4020,  // ' was', ' Was'
+        4250,  // ' were'
+        1714,  // ' are'
+        4908,  // ' been'
+        4223,  // ' would'
+        6167,  // ' could'
+        2783,  // ' will'
+        4396,  // ' their'
+        3357,  // ' there'
+        4611,  // ' when'
+        3470,  // ' what'
+        6843,  // ' where'
+        4333,  // ' which'
+        4980,  // ' who'
+        1491,  // ' not'
+        3592, 2681,  // ' But', ' but'
+        1960, 547,  // ' So', ' so'
+        2336,  // ' It'
+        750, 1842,  // ' we', ' We'
+        3285,  // ' our'
+        3629,  // ' your'
+        1103,  // ' my'
+        4384,  // ' him'
+        1535,  // ' her'
+        4421,  // ' them'
+        5726,  // ' these'
+    ]
+
     init(config: ASRConfig) {
         self.config = config
     }
@@ -71,7 +111,10 @@ internal struct TdtDecoderV3: Sendable {
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0,
         language: Language? = nil,
-        vocabulary: [Int: String]? = nil
+        vocabulary: [Int: String]? = nil,
+        punctuationTokenIds: Set<Int>? = nil,
+        emitTokensAfterGlobalFrame: Int? = nil,
+        initialTimeIndexOverride: Int? = nil
     ) async throws -> TdtHypothesis {
         // Early exit for very short audio (< 160ms)
         guard encoderSequenceLength > 1 else {
@@ -100,10 +143,12 @@ internal struct TdtDecoderV3: Sendable {
         // timeIndices: Current position in encoder frames (advances by duration)
         // timeJump: Tracks overflow when we process beyond current chunk (for streaming)
         // contextFrameAdjustment: Adjusts for adaptive context overlap
-        var timeIndices = TdtFrameNavigation.calculateInitialTimeIndices(
-            timeJump: decoderState.timeJump,
-            contextFrameAdjustment: contextFrameAdjustment
-        )
+        var timeIndices =
+            initialTimeIndexOverride
+            ?? TdtFrameNavigation.calculateInitialTimeIndices(
+                timeJump: decoderState.timeJump,
+                contextFrameAdjustment: contextFrameAdjustment
+            )
 
         let navigationState = TdtFrameNavigation.initializeNavigationState(
             timeIndices: timeIndices,
@@ -246,6 +291,13 @@ internal struct TdtDecoderV3: Sendable {
                 vocabulary: vocabulary,
                 blankId: blankId
             )
+            if Self.englishBlocklistApplies(to: language),
+                let ids = decision.topKIds, let logits = decision.topKLogits, let vocab = vocabulary
+            {
+                Self.applyEnglishBlocklist(
+                    label: &label, score: &score,
+                    topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
+            }
 
             // Map duration bin to actual frame count
             // durationBins typically = [0,1,2,3,4] meaning skip 0-4 frames
@@ -326,6 +378,14 @@ internal struct TdtDecoderV3: Sendable {
                     vocabulary: vocabulary,
                     blankId: blankId
                 )
+                if Self.englishBlocklistApplies(to: language),
+                    let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits,
+                    let vocab = vocabulary
+                {
+                    Self.applyEnglishBlocklist(
+                        label: &label, score: &score,
+                        topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
+                }
 
                 duration = try TdtDurationMapping.mapDurationBin(
                     innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
@@ -354,12 +414,21 @@ internal struct TdtDecoderV3: Sendable {
                     break
                 }
 
-                // Add token to output sequence
-                hypothesis.ySequence.append(label)
-                hypothesis.score += score
-                hypothesis.timestamps.append(timeIndicesCurrentLabels + globalFrameOffset)
-                hypothesis.tokenConfidences.append(score)
-                hypothesis.tokenDurations.append(duration)
+                let emissionTimestamp = timeIndicesCurrentLabels + globalFrameOffset
+                if Self.shouldEmitToken(
+                    emissionTimestamp: emissionTimestamp,
+                    emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame
+                ) {
+                    // Add token to output sequence
+                    hypothesis.ySequence.append(label)
+                    hypothesis.score += score
+                    hypothesis.timestamps.append(emissionTimestamp)
+                    hypothesis.tokenConfidences.append(score)
+                    hypothesis.tokenDurations.append(duration)
+                } else {
+                    hypothesis.suppressedTokens.append(label)
+                    hypothesis.suppressedTimestamps.append(emissionTimestamp)
+                }
                 hypothesis.lastToken = label  // Remember for next iteration
 
                 // CRITICAL: Update decoder LSTM with the new token
@@ -462,8 +531,8 @@ internal struct TdtDecoderV3: Sendable {
                     needsTopK: needsTopK
                 )
 
-                var token = decision.token
-                var score = TdtDurationMapping.clampProbability(decision.probability)
+                let token = decision.token
+                let score = TdtDurationMapping.clampProbability(decision.probability)
 
                 // Also get duration for proper timestamp calculation
                 let duration = try TdtDurationMapping.mapDurationBin(
@@ -474,15 +543,23 @@ internal struct TdtDecoderV3: Sendable {
                 } else {
                     consecutiveBlanks = 0  // Reset on non-blank
 
-                    // Non-blank token found - emit it
-                    hypothesis.ySequence.append(token)
-                    hypothesis.score += score
-                    // Use the current processing position for timestamp, ensuring it doesn't exceed bounds
                     let finalTimestamp =
                         min(finalProcessingTimeIndices, effectiveSequenceLength - 1) + globalFrameOffset
-                    hypothesis.timestamps.append(finalTimestamp)
-                    hypothesis.tokenConfidences.append(score)
-                    hypothesis.tokenDurations.append(duration)
+                    if Self.shouldEmitToken(
+                        emissionTimestamp: finalTimestamp,
+                        emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame
+                    ) {
+                        // Non-blank token found - emit it
+                        hypothesis.ySequence.append(token)
+                        hypothesis.score += score
+                        // Use the current processing position for timestamp, ensuring it doesn't exceed bounds
+                        hypothesis.timestamps.append(finalTimestamp)
+                        hypothesis.tokenConfidences.append(score)
+                        hypothesis.tokenDurations.append(duration)
+                    } else {
+                        hypothesis.suppressedTokens.append(token)
+                        hypothesis.suppressedTimestamps.append(finalTimestamp)
+                    }
                     hypothesis.lastToken = token
 
                     // Update decoder state
@@ -514,10 +591,11 @@ internal struct TdtDecoderV3: Sendable {
         decoderState.lastToken = hypothesis.lastToken
 
         // Clear cached predictor output if ending with punctuation
-        // This prevents punctuation from being duplicated at chunk boundaries
-        if let lastToken = hypothesis.lastToken,
-            ASRConstants.punctuationTokens.contains(lastToken)
-        {
+        // This prevents punctuation from being duplicated at chunk boundaries.
+        // Ids come from the loaded vocabulary (issue #905); the v3 constant is
+        // only the fallback when the caller has none.
+        let punctuation = punctuationTokenIds ?? Set(ASRConstants.punctuationTokens)
+        if let lastToken = hypothesis.lastToken, punctuation.contains(lastToken) {
             decoderState.predictorOutput = nil
             // Keep lastToken for linguistic context - deduplication handles duplicates at higher level
         }
@@ -536,26 +614,65 @@ internal struct TdtDecoderV3: Sendable {
         return hypothesis
     }
 
-    /// Update hypothesis with new token
-    internal func updateHypothesis(
-        _ hypothesis: inout TdtHypothesis,
-        token: Int,
-        score: Float,
-        duration: Int,
-        timeIdx: Int,
-        decoderState: TdtDecoderState
-    ) {
-        hypothesis.ySequence.append(token)
-        hypothesis.score += score
-        hypothesis.timestamps.append(timeIdx)
-        hypothesis.tokenConfidences.append(score)
-        hypothesis.decState = decoderState
-        hypothesis.lastToken = token
-
-        hypothesis.tokenDurations.append(duration)
+    internal static func shouldEmitToken(
+        emissionTimestamp: Int,
+        emitTokensAfterGlobalFrame: Int?
+    ) -> Bool {
+        guard let emitTokensAfterGlobalFrame else { return true }
+        return emissionTimestamp >= emitTokensAfterGlobalFrame
     }
 
     // MARK: - Private Helper Methods
+
+    /// The blocklist is French-only: its token list was tuned against French
+    /// prose (#630), and the same ids are core vocabulary elsewhere — Dutch
+    /// ' we'/' was', German ' so', Italian ' so' — so running it for every
+    /// non-English Latin language corrupts clean speech (#840).
+    static func englishBlocklistApplies(to language: Language?) -> Bool {
+        language == .french
+    }
+
+    /// When the target language is French and the winning token is in the
+    /// English-exclusive blocklist, replace it with the highest-logit top-K
+    /// token that is not in the blocklist.
+    ///
+    /// This runs AFTER `tokenLanguageFilter` (which only distinguishes
+    /// Latin from Cyrillic and leaves English/French ambiguous). It targets
+    /// the spontaneous-speech translation phenomenon where the model falls back
+    /// to its English prior on acoustically ambiguous frames.
+    static func applyEnglishBlocklist(
+        label: inout Int,
+        score: inout Float,
+        topKIds: [Int],
+        topKLogits: [Float],
+        vocabulary: [Int: String],
+        blankId: Int
+    ) {
+        guard label != blankId, englishBlocklistIds.contains(label) else { return }
+
+        var bestIdx = -1
+        var bestLogit: Float = -.infinity
+        for i in 0..<min(topKIds.count, topKLogits.count) {
+            let id = topKIds[i]
+            let logit = topKLogits[i]
+            guard id != blankId, !englishBlocklistIds.contains(id) else { continue }
+            if let text = vocabulary[id], TokenLanguageFilter.matches(text, script: .latin) {
+                if bestIdx < 0 || logit > bestLogit {
+                    bestLogit = logit
+                    bestIdx = i
+                }
+            }
+        }
+
+        guard bestIdx >= 0 else { return }
+        label = topKIds[bestIdx]
+
+        var maxLogit: Float = -.infinity
+        for l in topKLogits { if l > maxLogit { maxLogit = l } }
+        var sumExp: Float = 0
+        for l in topKLogits { sumExp += expf(l - maxLogit) }
+        score = sumExp > 0 ? expf(bestLogit - maxLogit) / sumExp : 0
+    }
 
     /// Replace `label`/`score` with the best right-language top-K candidate
     /// when the joint's top-1 token is in the wrong language for `language`.

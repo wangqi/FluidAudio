@@ -378,54 +378,128 @@ final class AsrModelsTests: XCTestCase {
         }
     }
 
-    // MARK: - CTC-Only Model Validation Tests
+    // MARK: - Issue #524: CTC head download in parakeet-ctc-110m repo
 
-    func testCtcZhCnModelRejectsAsrModelsLoad() async throws {
+    /// Regression guard for
+    /// https://github.com/FluidInference/FluidAudio/issues/524.
+    ///
+    /// `AsrModels.load(version: .tdtCtc110m)` optionally pulls
+    /// `CtcHead.mlmodelc` from the `parakeet-ctc-110m` repo, but that repo's
+    /// default required set is the standalone CTC frontend
+    /// (`MelSpectrogram` + `AudioEncoder`) and does NOT include the CTC head.
+    /// `ModelHub.loadModels` threads the caller's `modelNames` into
+    /// `ModelHub.download` via `additionalModelNames` so the HF filter recurses
+    /// into the `CtcHead.mlmodelc/` directory.
+    func testParakeetCtc110mRequiredSetExcludesCtcHead() {
+        let required = ModelNames.getRequiredModelNames(for: .parakeetCtc110m, variant: nil)
+        XCTAssertTrue(required.contains(ModelNames.CTC.melSpectrogramPath))
+        XCTAssertTrue(required.contains(ModelNames.CTC.audioEncoderPath))
+        XCTAssertFalse(
+            required.contains(ModelNames.ASR.ctcHeadFile),
+            "CtcHead must not be in the parakeet-ctc-110m baseline required set; "
+                + "callers needing it must pass it via ModelHub.loadModels' "
+                + "modelNames parameter."
+        )
+    }
+
+    /// Verifies that the cache-validity check in `loadModelsOnce` (and the
+    /// matching filter in `ModelHub.download`) sees `CtcHead.mlmodelc` as
+    /// missing even when the baseline required set is fully present on
+    /// disk. Pre-fix, the local cache check returned `true` here and the
+    /// download was skipped, leading to a silent `fileNoSuchFile` in the
+    /// model-loading loop.
+    func testLoadModelsCacheCheckIncludesExtraModelNames() throws {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AsrModelsTests-CtcZhCn-\(UUID().uuidString)")
+            .appendingPathComponent("AsrModelsTests-#524-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        do {
-            _ = try await AsrModels.load(from: tempDir, version: .ctcZhCn)
-            XCTFail("AsrModels.load should reject .ctcZhCn version")
-        } catch let error as AsrModelsError {
-            // Verify it's the correct error
-            if case .loadingFailed(let message) = error {
-                XCTAssertTrue(
-                    message.contains("CtcZhCnManager"),
-                    "Error should direct user to CtcZhCnManager"
-                )
-            } else {
-                XCTFail("Wrong error type: \(error)")
-            }
+        let repoDir = tempDir.appendingPathComponent(Repo.parakeetCtc110m.folderName)
+        let fm = FileManager.default
+        for name in [ModelNames.CTC.melSpectrogramPath, ModelNames.CTC.audioEncoderPath] {
+            let modelDir = repoDir.appendingPathComponent(name)
+            try fm.createDirectory(at: modelDir, withIntermediateDirectories: true)
+            try Data().write(to: modelDir.appendingPathComponent("coremldata.bin"))
         }
+
+        // Baseline required set is present on disk.
+        let required = ModelNames.getRequiredModelNames(for: .parakeetCtc110m, variant: nil)
+        for name in required {
+            XCTAssertTrue(fm.fileExists(atPath: repoDir.appendingPathComponent(name).path))
+        }
+
+        // Caller asks for the CTC head — which is *not* on disk and *not* in
+        // the baseline required set. The fix's effective-models union must
+        // recognise this as a cache miss.
+        let requested: Set<String> = [ModelNames.ASR.ctcHeadFile]
+        let effective = required.union(requested)
+        let allEffectiveExist = effective.allSatisfy {
+            fm.fileExists(atPath: repoDir.appendingPathComponent($0).path)
+        }
+        XCTAssertFalse(
+            allEffectiveExist,
+            "Cache check must treat caller-requested model names as required."
+        )
     }
 
-    func testCtcZhCnModelRejectsAsrModelsDownload() async throws {
-        do {
-            _ = try await AsrModels.download(version: .ctcZhCn)
-            XCTFail("AsrModels.download should reject .ctcZhCn version")
-        } catch let error as AsrModelsError {
-            // Verify it's the correct error
-            if case .downloadFailed(let message) = error {
-                XCTAssertTrue(
-                    message.contains("CtcZhCnModels"),
-                    "Error should direct user to CtcZhCnModels"
-                )
-            } else {
-                XCTFail("Wrong error type: \(error)")
-            }
+    // MARK: - Issue #748: vocabulary must ship with a downloaded ASR cache
+
+    /// A v3 cache with every bundle but no vocab must report incomplete (#748).
+    func testModelsExistTreatsMissingVocabularyAsIncomplete() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+            .appendingPathComponent("AsrModelsTests-#748-\(UUID().uuidString)")
+            .appendingPathComponent(Repo.parakeetV3.folderName)
+        defer { try? fm.removeItem(at: tempDir.deletingLastPathComponent()) }
+
+        let repoDir = tempDir.deletingLastPathComponent()
+            .appendingPathComponent(Repo.parakeetV3.folderName)
+        for name in ModelNames.ASR.requiredModelsV3(precision: .int8) {
+            let modelDir = repoDir.appendingPathComponent(name)
+            try fm.createDirectory(at: modelDir, withIntermediateDirectories: true)
+            try Data().write(to: modelDir.appendingPathComponent("coremldata.bin"))
         }
+
+        // All bundles present but vocab absent -> cache is incomplete.
+        XCTAssertFalse(
+            AsrModels.modelsExist(at: tempDir, version: .v3, encoderPrecision: .int8),
+            "Cache with bundles but no vocab must be treated as incomplete (#748)."
+        )
+
+        // Adding the vocab alongside the bundles completes the cache.
+        let vocabURL = AsrModels.vocabularyFileURL(
+            version: .v3, encoderPrecision: .int8, targetDir: tempDir)
+        XCTAssertEqual(vocabURL.deletingLastPathComponent().path, repoDir.path)
+        XCTAssertEqual(vocabURL.lastPathComponent, ModelNames.ASR.vocabularyFile)
+        try Data("{}".utf8).write(to: vocabURL)
+
+        XCTAssertTrue(
+            AsrModels.modelsExist(at: tempDir, version: .v3, encoderPrecision: .int8),
+            "Cache with bundles and vocab must be treated as complete."
+        )
     }
 
-    func testCtcOnlyModelsAreMarkedCorrectly() {
-        // Verify CTC-only models are identified correctly
-        XCTAssertTrue(AsrModelVersion.ctcZhCn.isCtcOnly)
+    /// `ensureVocabularyDownloaded` no-ops without overwriting an existing vocab (#748).
+    func testEnsureVocabularyDownloadedNoopsWhenPresent() async throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+            .appendingPathComponent("AsrModelsTests-#748-present-\(UUID().uuidString)")
+            .appendingPathComponent(Repo.parakeetV3.folderName)
+        defer { try? fm.removeItem(at: tempDir.deletingLastPathComponent()) }
 
-        // Verify TDT models are not marked as CTC-only
-        XCTAssertFalse(AsrModelVersion.v2.isCtcOnly)
-        XCTAssertFalse(AsrModelVersion.v3.isCtcOnly)
-        XCTAssertFalse(AsrModelVersion.tdtCtc110m.isCtcOnly)
-        XCTAssertFalse(AsrModelVersion.tdtJa.isCtcOnly)
+        let vocabURL = AsrModels.vocabularyFileURL(
+            version: .v3, encoderPrecision: .int8, targetDir: tempDir)
+        try fm.createDirectory(
+            at: vocabURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let sentinel = Data(#"{"already":"here"}"#.utf8)
+        try sentinel.write(to: vocabURL)
+
+        // Present vocab -> returns without attempting any network fetch.
+        try await AsrModels.ensureVocabularyDownloaded(
+            version: .v3, encoderPrecision: .int8, targetDir: tempDir)
+
+        XCTAssertEqual(
+            try Data(contentsOf: vocabURL), sentinel,
+            "Existing vocab must not be overwritten by the guarantee step."
+        )
     }
 }

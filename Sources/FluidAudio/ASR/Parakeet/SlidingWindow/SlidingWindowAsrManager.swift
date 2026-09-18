@@ -31,6 +31,15 @@ public actor SlidingWindowAsrManager {
     private var segmentIndex: Int = 0
     private var lastProcessedFrame: Int = 0
     private var accumulatedTokens: [Int] = []
+    // Global encoder-frame timestamp for each accumulated token (1:1 with
+    // accumulatedTokens). Lets per-chunk dedup require temporal adjacency so a
+    // coincidental subword-prefix match between far-apart words isn't dropped (#787).
+    private var accumulatedTokenTimestamps: [Int] = []
+    /// The previous window's last word as it was appended to the transcript
+    /// text — the vocabulary replacement when rescoring replaced it — so seam
+    /// retirement can remove it even when it no longer equals the raw token
+    /// text (#897).
+    private var lastWindowRenderedLastWord: String?
 
     // Raw sample buffer for sliding-window assembly (absolute indexing)
     private var sampleBuffer: [Float] = []
@@ -50,13 +59,16 @@ public actor SlidingWindowAsrManager {
     private var startTime: Date?
     private var processedChunks: Int = 0
 
+    // Window-processing error tracking so total failure is surfaced by finish()
+    // instead of being silently absorbed by error recovery
+    private var failedWindowCount: Int = 0
+    private var lastWindowError: SlidingWindowAsrError?
+
     // Vocabulary boosting
-    // These are initialized via configureVocabularyBoosting() before start()
-    private var customVocabulary: CustomVocabularyContext?
-    private var ctcSpotter: CtcKeywordSpotter?
-    private var vocabularyRescorer: VocabularyRescorer?
-    private var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
-    private var vocabBoostingEnabled: Bool { customVocabulary != nil && vocabularyRescorer != nil }
+    // Initialized via configureVocabularyBoosting() before start()
+    // Internal (not private) so tests can inspect the configured vocabulary.
+    var vocabularyBoosting: VocabularyBoostingSession?
+    private var vocabBoostingEnabled: Bool { vocabularyBoosting != nil }
 
     /// Initialize the sliding-window ASR manager
     /// - Parameter config: Configuration for streaming behavior
@@ -75,8 +87,10 @@ public actor SlidingWindowAsrManager {
 
     /// Configure vocabulary boosting for streaming transcription
     ///
-    /// When configured, vocabulary terms will be rescored when text is confirmed during streaming.
-    /// This provides real-time vocabulary corrections visible in confirmed updates.
+    /// When configured, every window is rescored against CTC evidence as it is
+    /// decoded — confirmed or not (#851) — so corrections appear in both volatile
+    /// and confirmed updates and in `finish()`. Terms without `ctcTokenIds` are
+    /// tokenized here with the CTC tokenizer.
     ///
     /// - Parameters:
     ///   - vocabulary: Custom vocabulary context with terms to detect
@@ -88,27 +102,11 @@ public actor SlidingWindowAsrManager {
         ctcModels: CtcModels,
         config: VocabularyRescorer.Config? = nil
     ) async throws {
-        self.customVocabulary = vocabulary
-
-        // Create CTC spotter
-        let blankId = ctcModels.vocabulary.count
-        self.ctcSpotter = CtcKeywordSpotter(models: ctcModels, blankId: blankId)
-
-        // Use vocabulary-size-aware config (matching batch mode behavior)
-        let vocabSize = vocabulary.terms.count
-        let vocabConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: vocabSize)
-        self.vocabSizeConfig = vocabConfig
-        let effectiveConfig = config ?? .default
-
-        // Create rescorer
-        let ctcModelDir = CtcModels.defaultCacheDirectory(for: ctcModels.variant)
-        self.vocabularyRescorer = try await VocabularyRescorer.create(
-            spotter: ctcSpotter!,
-            vocabulary: vocabulary,
-            config: effectiveConfig,
-            ctcModelDirectory: ctcModelDir
+        self.vocabularyBoosting = try await VocabularyBoostingSession(
+            vocabulary: vocabulary, ctcModels: ctcModels, config: config
         )
 
+        let vocabSize = vocabulary.terms.count
         let isLargeVocab = vocabSize > ContextBiasingConstants.largeVocabThreshold
         logger.info(
             "Vocabulary boosting configured with \(vocabSize) terms (isLargeVocab: \(isLargeVocab))"
@@ -125,7 +123,7 @@ public actor SlidingWindowAsrManager {
     ///   - progressHandler: Optional download progress callback
     public func loadModels(
         to directory: URL? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws {
         logger.info("Loading ASR models...")
         let models = try await AsrModels.downloadAndLoad(
@@ -152,8 +150,12 @@ public actor SlidingWindowAsrManager {
     /// Models must be loaded first via `loadModels()` or `loadModels(_:)`
     ///
     /// - Parameter source: The audio source to use (default: microphone)
-    /// - Throws: ASRError.notInitialized if models are not loaded
+    /// - Throws: `SlidingWindowAsrError.invalidConfiguration` if the configured window
+    ///   (left + chunk + right context) exceeds the model's maximum input size,
+    ///   `ASRError.notInitialized` if models are not loaded
     public func startStreaming(source: AudioSource = .microphone) async throws {
+        try config.validate()
+
         guard asrManager != nil else {
             throw ASRError.notInitialized
         }
@@ -171,6 +173,10 @@ public actor SlidingWindowAsrManager {
         segmentIndex = 0
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
+        accumulatedTokenTimestamps.removeAll()
+        lastWindowRenderedLastWord = nil
+        failedWindowCount = 0
+        lastWindowError = nil
 
         startTime = Date()
 
@@ -242,6 +248,21 @@ public actor SlidingWindowAsrManager {
             throw error
         }
 
+        // Surface total failure: every window errored, so the transcript is empty
+        // or covers only a fraction of the audio. Silently returning it would be
+        // indistinguishable from silence in the input.
+        if processedChunks == 0, let windowError = lastWindowError {
+            logger.error(
+                "All \(self.failedWindowCount) window(s) failed to process; throwing last error instead of returning an empty transcript"
+            )
+            throw windowError
+        }
+        if failedWindowCount > 0 {
+            logger.warning(
+                "\(self.failedWindowCount) window(s) failed during streaming; transcript may be missing segments"
+            )
+        }
+
         let finalText: String
         if vocabBoostingEnabled {
             // Text-based reconstruction preserves rescored corrections from processWindow().
@@ -272,6 +293,8 @@ public actor SlidingWindowAsrManager {
         volatileTranscript = ""
         confirmedTranscript = ""
         processedChunks = 0
+        failedWindowCount = 0
+        lastWindowError = nil
         startTime = Date()
         sampleBuffer.removeAll(keepingCapacity: false)
         bufferStartIndex = 0
@@ -286,6 +309,8 @@ public actor SlidingWindowAsrManager {
         segmentIndex = 0
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
+        accumulatedTokenTimestamps.removeAll()
+        lastWindowRenderedLastWord = nil
 
         logger.info("SlidingWindowAsrManager reset for source: \(String(describing: self.audioSource))")
     }
@@ -342,8 +367,9 @@ public actor SlidingWindowAsrManager {
             // Advance by chunk size
             nextWindowCenterStart += chunk
 
-            // Trim buffer to keep only what's needed for left context
-            let trimToAbs = max(0, nextWindowCenterStart - left)
+            // Keep a full chunk plus the left context behind the next center so a
+            // short final flush window can be end-aligned (see `flushRemaining`).
+            let trimToAbs = max(0, nextWindowCenterStart - left - chunk)
             let dropCount = max(0, trimToAbs - bufferStartIndex)
             if dropCount > 0 && dropCount <= sampleBuffer.count {
                 sampleBuffer.removeFirst(dropCount)
@@ -367,14 +393,21 @@ public actor SlidingWindowAsrManager {
             if availableAhead <= 0 { break }
             let effectiveChunk = min(chunk, availableAhead)
 
-            let leftStartAbs = max(0, nextWindowCenterStart - left)
             let rightEndAbs = nextWindowCenterStart + effectiveChunk
+            let isLastWindow = rightEndAbs >= currentAbsEnd
+            // End-align a short final window: a fresh decoder state needs more
+            // than a couple of seconds of audio to emit anything, and the
+            // re-decode cutoff suppresses what previous windows already emitted.
+            let leftStartAbs =
+                isLastWindow
+                ? Self.finalWindowStart(
+                    nextCenterStart: nextWindowCenterStart, effectiveChunk: effectiveChunk, chunk: chunk, left: left)
+                : max(0, nextWindowCenterStart - left)
             let startIdx = max(leftStartAbs - bufferStartIndex, 0)
             let endIdx = max(rightEndAbs - bufferStartIndex, startIdx)
             if startIdx < 0 || endIdx > sampleBuffer.count || startIdx >= endIdx { break }
 
             let window = Array(sampleBuffer[startIdx..<endIdx])
-            let isLastWindow = (nextWindowCenterStart + effectiveChunk) >= currentAbsEnd
             await processWindow(
                 window,
                 windowStartSample: leftStartAbs,
@@ -384,7 +417,7 @@ public actor SlidingWindowAsrManager {
             nextWindowCenterStart += effectiveChunk
 
             // Trim
-            let trimToAbs = max(0, nextWindowCenterStart - left)
+            let trimToAbs = max(0, nextWindowCenterStart - left - chunk)
             let dropCount = max(0, trimToAbs - bufferStartIndex)
             if dropCount > 0 && dropCount <= sampleBuffer.count {
                 sampleBuffer.removeFirst(dropCount)
@@ -417,14 +450,40 @@ public actor SlidingWindowAsrManager {
                     windowSamples,
                     decoderState: &state,
                     previousTokens: accumulatedTokens,
-                    isLastChunk: isLastChunk
+                    previousTokenTimestamps: accumulatedTokenTimestamps,
+                    globalFrameOffset: windowStartSample / ASRConstants.samplesPerEncoderFrame,
+                    isLastChunk: isLastChunk,
+                    language: config.language
                 )
             else { return }
 
             // Update stored decoder state
             self.decoderState = state
 
-            let (tokens, timestamps, confidences, _) = result
+            let (tokens, timestamps, confidences, _, droppedPreviousTokens) = result
+
+            // The window re-decoded the previous window's last word in full (#897):
+            // retire that word from the accumulated tokens and from the text state.
+            if droppedPreviousTokens > 0, droppedPreviousTokens < accumulatedTokens.count {
+                let dropped = Array(accumulatedTokens.suffix(droppedPreviousTokens))
+                accumulatedTokens.removeLast(droppedPreviousTokens)
+                accumulatedTokenTimestamps.removeLast(min(droppedPreviousTokens, accumulatedTokenTimestamps.count))
+                if let droppedText = await asrManager?.convertTokensToText(dropped), !droppedText.isEmpty {
+                    // The text state may hold a vocabulary-rescored replacement
+                    // for that word rather than its raw token text.
+                    let candidates = [droppedText] + (lastWindowRenderedLastWord.map { [$0] } ?? [])
+                    for candidate in candidates {
+                        if let trimmed = Self.removingTrailingWord(candidate, from: volatileTranscript) {
+                            volatileTranscript = trimmed
+                            break
+                        }
+                        if let trimmed = Self.removingTrailingWord(candidate, from: confirmedTranscript) {
+                            confirmedTranscript = trimmed
+                            break
+                        }
+                    }
+                }
+            }
 
             let adjustedTimestamps = Self.applyGlobalFrameOffset(
                 to: timestamps,
@@ -441,13 +500,25 @@ public actor SlidingWindowAsrManager {
                     timestamps: adjustedTimestamps,
                     confidences: confidences,
                     encoderSequenceLength: 0,
-                    audioSamples: windowSamples,
+                    audioSampleCount: windowSamples.count,
                     processingTime: processingTime
                 )
             else { return }
 
             // Update state only after all required async calls complete successfully
             accumulatedTokens.append(contentsOf: tokens)
+            // Keep global timestamps aligned 1:1 with accumulatedTokens for #787 dedup.
+            // `tokens`/`adjustedTimestamps` are already post-dedup and same length; guard
+            // against any mismatch so the arrays never drift out of alignment.
+            if adjustedTimestamps.count == tokens.count {
+                accumulatedTokenTimestamps.append(contentsOf: adjustedTimestamps)
+            } else {
+                accumulatedTokenTimestamps.append(contentsOf: adjustedTimestamps.prefix(tokens.count))
+                if adjustedTimestamps.count < tokens.count {
+                    accumulatedTokenTimestamps.append(
+                        contentsOf: Array(repeating: -1, count: tokens.count - adjustedTimestamps.count))
+                }
+            }
             lastProcessedFrame = max(lastProcessedFrame, adjustedTimestamps.max() ?? 0)
             segmentIndex += 1
             processedChunks += 1
@@ -461,38 +532,45 @@ public actor SlidingWindowAsrManager {
             let isHighConfidence = Double(interim.confidence) >= config.confirmationThreshold
             let shouldConfirm = isHighConfidence && hasMinimumContext
 
-            // Rescore before updating transcript state so finish() returns rescored content
+            // Rescore before updating transcript state so finish() returns rescored content.
+            // Every window is rescored, not only confirmed ones: confirmation is a display
+            // promotion, but a window's text is promoted verbatim later, so a window that
+            // was volatile when decoded (short clip under `minContextForConfirmation`, low
+            // confidence, the final flush) would otherwise never see its vocabulary (#851).
             var displayResult = interim
-            if shouldConfirm && vocabBoostingEnabled,
+            var appliedReplacements: [VocabularyRescorer.RescoringResult] = []
+            if vocabBoostingEnabled,
                 let chunkLocalResult = await asrManager?.processTranscriptionResult(
                     tokenIds: tokens,
                     timestamps: timestamps,  // Original chunk-local timestamps (not adjusted)
                     confidences: confidences,
                     encoderSequenceLength: 0,
-                    audioSamples: windowSamples,
+                    audioSampleCount: windowSamples.count,
                     processingTime: processingTime
                 )
             {
                 let chunkLocalTimings = chunkLocalResult.tokenTimings ?? []
 
-                if let rescored = await applyVocabularyRescoring(
+                // Rescoring ran for this window: report its detections even when
+                // there are none, so `ctcDetectedTerms` is nil only when boosting
+                // is not configured (a deterministic "rescored" signal, #899).
+                let rescored = await applyVocabularyRescoring(
                     text: interim.text,
                     tokenTimings: chunkLocalTimings,
                     windowSamples: windowSamples
-                ) {
-                    let detected = rescored.replacements.compactMap { $0.replacementWord }
-                    let applied = rescored.replacements.filter { $0.shouldReplace }.compactMap {
-                        $0.replacementWord
-                    }
-                    displayResult = interim.withRescoring(
-                        text: rescored.text,
-                        detected: detected.isEmpty ? nil : detected,
-                        applied: applied.isEmpty ? nil : applied
-                    )
-                }
+                )
+                appliedReplacements = (rescored?.replacements ?? []).filter { $0.shouldReplace }
+                let applied = appliedReplacements.compactMap { $0.replacementWord }
+                displayResult = interim.withRescoring(
+                    text: rescored?.text ?? interim.text,
+                    detected: rescored?.detectedTerms ?? [],
+                    applied: applied.isEmpty ? nil : applied
+                )
             }
 
             await updateTranscriptionState(with: displayResult, shouldConfirm: shouldConfirm)
+            lastWindowRenderedLastWord = Self.renderedLastWord(
+                rawText: interim.text, renderedText: displayResult.text, replacements: appliedReplacements)
 
             let update = SlidingWindowTranscriptionUpdate(
                 text: displayResult.text,
@@ -500,7 +578,9 @@ public actor SlidingWindowAsrManager {
                 confidence: interim.confidence,
                 timestamp: Date(),
                 tokenIds: tokens,
-                tokenTimings: displayResult.tokenTimings ?? []
+                tokenTimings: displayResult.tokenTimings ?? [],
+                ctcDetectedTerms: displayResult.ctcDetectedTerms,
+                ctcAppliedTerms: displayResult.ctcAppliedTerms
             )
 
             updateContinuation?.yield(update)
@@ -510,7 +590,11 @@ public actor SlidingWindowAsrManager {
                 return
             }
             let streamingError = SlidingWindowAsrError.modelProcessingFailed(error)
-            logger.error("Model processing error: \(streamingError.localizedDescription)")
+            failedWindowCount += 1
+            lastWindowError = streamingError
+            logger.error(
+                "Model processing error (window failure #\(self.failedWindowCount)): \(streamingError.localizedDescription)"
+            )
 
             // Attempt error recovery
             await attemptErrorRecovery(error: streamingError)
@@ -534,7 +618,12 @@ public actor SlidingWindowAsrManager {
                 "CONFIRMED (\(result.confidence), \(String(format: "%.1f", totalAudioProcessed))s context): promoted to confirmed; new volatile '\(result.text)'"
             )
         } else {
-            volatileTranscript = result.text
+            // Each window carries new audio, so an unconfirmed window extends the
+            // volatile tail rather than replacing it. Overwriting lost the previous
+            // window's text whenever two consecutive windows went unconfirmed — with
+            // boosting on, finish() builds from this text, and a trailing empty flush
+            // window returned an empty transcript for a 15 s clip (#851).
+            volatileTranscript = Self.appendingVolatile(volatileTranscript, result.text)
             let hasMinimumContext = totalAudioProcessed >= config.minContextForConfirmation
             let reason =
                 !hasMinimumContext
@@ -543,7 +632,50 @@ public actor SlidingWindowAsrManager {
         }
     }
 
-    /// Apply vocabulary rescoring to confirmed text using CTC-based constrained decoding.
+    /// Start sample of the final flush window: end-aligned so the window spans a
+    /// full chunk plus the left context even when little new audio remains
+    /// (#897). A 2–3 s window decoded from a fresh state emits nothing and the
+    /// last words are lost; the re-decode cutoff makes the longer window safe.
+    /// Never later than the regular `center - left` start. Pure.
+    static func finalWindowStart(nextCenterStart: Int, effectiveChunk: Int, chunk: Int, left: Int) -> Int {
+        let regular = max(0, nextCenterStart - left)
+        let endAligned = max(0, nextCenterStart + effectiveChunk - chunk - left)
+        return min(regular, endAligned)
+    }
+
+    /// The form in which a window's last word reached the transcript text: the
+    /// vocabulary replacement when rescoring replaced that word (possibly a
+    /// multi-word term), otherwise the last word of the rendered text. Pure.
+    static func renderedLastWord(
+        rawText: String, renderedText: String, replacements: [VocabularyRescorer.RescoringResult]
+    ) -> String? {
+        func core(_ word: String) -> String {
+            word.lowercased().trimmingCharacters(in: .punctuationCharacters.union(.whitespaces))
+        }
+        guard let rawLast = rawText.split(separator: " ").last.map(String.init) else { return nil }
+        if let hit = replacements.last(where: { $0.shouldReplace && core($0.originalWord) == core(rawLast) }),
+            let replacement = hit.replacementWord, !replacement.isEmpty
+        {
+            return replacement
+        }
+        return renderedText.split(separator: " ").last.map(String.init)
+    }
+
+    /// `text` without its trailing `word` when `text` ends with that word as a
+    /// whole word (equal, or preceded by a space); nil otherwise. Pure.
+    static func removingTrailingWord(_ word: String, from text: String) -> String? {
+        if text == word { return "" }
+        guard text.hasSuffix(" " + word) else { return nil }
+        return String(text.dropLast(word.count + 1))
+    }
+
+    /// Join the still-volatile text with a newer unconfirmed window's text.
+    /// Empty pieces (a silent flush window) contribute nothing. Pure, for testability.
+    static func appendingVolatile(_ existing: String, _ incoming: String) -> String {
+        [existing, incoming].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// Apply vocabulary rescoring to a window's text using CTC-based constrained decoding.
     ///
     /// This runs CTC inference on the chunk audio and applies vocabulary rescoring
     /// to replace misrecognized words with vocabulary terms when acoustic evidence supports it.
@@ -558,62 +690,10 @@ public actor SlidingWindowAsrManager {
         tokenTimings: [TokenTiming],
         windowSamples: [Float]
     ) async -> VocabularyRescorer.RescoreOutput? {
-        guard let spotter = ctcSpotter,
-            let rescorer = vocabularyRescorer,
-            let vocab = customVocabulary,
-            !tokenTimings.isEmpty
-        else {
-            return nil
-        }
-
-        do {
-            // Run CTC inference on the chunk audio to get log probabilities
-            let spotResult = try await spotter.spotKeywordsWithLogProbs(
-                audioSamples: windowSamples,
-                customVocabulary: vocab,
-                minScore: nil
-            )
-
-            let logProbs = spotResult.logProbs
-            guard !logProbs.isEmpty else {
-                logger.debug("Vocabulary rescoring skipped: no log probs from CTC")
-                return nil
-            }
-
-            // Determine rescoring parameters based on vocabulary size,
-            // but respect the caller-specified threshold when stricter.
-            let vocabConfig = vocabSizeConfig ?? ContextBiasingConstants.rescorerConfig(forVocabSize: 0)
-            let minSimilarity = max(vocabConfig.minSimilarity, vocab.minSimilarity)
-            let cbw = vocabConfig.cbw
-
-            // Apply constrained CTC rescoring
-            let rescoreOutput = rescorer.ctcTokenRescore(
-                transcript: text,
-                tokenTimings: tokenTimings,
-                logProbs: logProbs,
-                frameDuration: spotResult.frameDuration,
-                cbw: cbw,
-                marginSeconds: 0.5,
-                minSimilarity: minSimilarity
-            )
-
-            if rescoreOutput.wasModified {
-                logger.info(
-                    "Vocabulary rescoring applied \(rescoreOutput.replacements.count) replacement(s) in streaming chunk"
-                )
-                for replacement in rescoreOutput.replacements where replacement.shouldReplace {
-                    logger.debug(
-                        "  '\(replacement.originalWord)' → '\(replacement.replacementWord ?? "")'"
-                    )
-                }
-                return rescoreOutput
-            }
-
-            return nil
-        } catch {
-            logger.warning("Vocabulary rescoring failed: \(error.localizedDescription)")
-            return nil
-        }
+        guard let boosting = vocabularyBoosting else { return nil }
+        return await boosting.rescore(
+            text: text, tokenTimings: tokenTimings, audioSamples: windowSamples
+        )
     }
 
     /// Apply encoder-frame offset derived from the absolute window start sample.
@@ -689,11 +769,29 @@ public struct SlidingWindowAsrConfig: Sendable {
 
     /// Confidence threshold for promoting volatile text to confirmed (0.0...1.0)
     public let confirmationThreshold: Double
-    /// Default configuration aligned with previous API expectations
+
+    /// TDT decoder configuration. When `nil`, `TdtConfig()` is used (blankId 8192, v3 default).
+    /// Pass an explicit value when using a v2 model (blankId 1024) to avoid relying on
+    /// `AsrManager`'s internal blank-token auto-adaptation.
+    public let tdtConfig: TdtConfig?
+
+    /// Optional language hint for script-aware token filtering (v3 joint decoder only).
+    ///
+    /// Streaming windows carry much less acoustic context than offline chunks, which
+    /// makes the multilingual v3 model prone to emitting wrong-script tokens (e.g.
+    /// Cyrillic while transcribing German — see issue #512). Batch transcription
+    /// already accepts a `language` hint via `AsrManager.transcribe(_:language:)`;
+    /// this extends the same filter to the sliding-window path. Ignored by v2 and
+    /// tdtJa models (same behavior as the batch API).
+    public let language: Language?
+
+    /// Default configuration using the proven 11+2+2 window layout.
+    /// The assembled window (left + chunk + right) must fit the model's fixed
+    /// 15 s input (`ASRConstants.maxModelSamples`); 2 + 11 + 2 = 15 s fits exactly.
     public static let `default` = SlidingWindowAsrConfig(
-        chunkSeconds: 15.0,
+        chunkSeconds: 11.0,
         hypothesisChunkSeconds: 2.0,
-        leftContextSeconds: 10.0,
+        leftContextSeconds: 2.0,
         rightContextSeconds: 2.0,
         minContextForConfirmation: 10.0,
         confirmationThreshold: 0.85
@@ -717,7 +815,9 @@ public struct SlidingWindowAsrConfig: Sendable {
         leftContextSeconds: TimeInterval = 2.0,
         rightContextSeconds: TimeInterval = 2.0,
         minContextForConfirmation: TimeInterval = 10.0,
-        confirmationThreshold: Double = 0.85
+        confirmationThreshold: Double = 0.85,
+        tdtConfig: TdtConfig? = nil,
+        language: Language? = nil
     ) {
         self.chunkSeconds = chunkSeconds
         self.hypothesisChunkSeconds = hypothesisChunkSeconds
@@ -725,6 +825,36 @@ public struct SlidingWindowAsrConfig: Sendable {
         self.rightContextSeconds = rightContextSeconds
         self.minContextForConfirmation = minContextForConfirmation
         self.confirmationThreshold = confirmationThreshold
+        self.tdtConfig = tdtConfig
+        self.language = language
+    }
+
+    /// Returns a copy of this config with the given TDT configuration applied.
+    public func applying(tdtConfig: TdtConfig) -> SlidingWindowAsrConfig {
+        SlidingWindowAsrConfig(
+            chunkSeconds: chunkSeconds,
+            hypothesisChunkSeconds: hypothesisChunkSeconds,
+            leftContextSeconds: leftContextSeconds,
+            rightContextSeconds: rightContextSeconds,
+            minContextForConfirmation: minContextForConfirmation,
+            confirmationThreshold: confirmationThreshold,
+            tdtConfig: tdtConfig,
+            language: language
+        )
+    }
+
+    /// Returns a copy of this config with the given language hint applied.
+    public func applying(language: Language?) -> SlidingWindowAsrConfig {
+        SlidingWindowAsrConfig(
+            chunkSeconds: chunkSeconds,
+            hypothesisChunkSeconds: hypothesisChunkSeconds,
+            leftContextSeconds: leftContextSeconds,
+            rightContextSeconds: rightContextSeconds,
+            minContextForConfirmation: minContextForConfirmation,
+            confirmationThreshold: confirmationThreshold,
+            tdtConfig: tdtConfig,
+            language: language
+        )
     }
 
     /// Backward-compatible convenience initializer used by tests (chunkDuration label)
@@ -735,7 +865,7 @@ public struct SlidingWindowAsrConfig: Sendable {
         self.init(
             chunkSeconds: chunkDuration,
             hypothesisChunkSeconds: min(1.0, chunkDuration / 2.0),  // Default to half chunk duration
-            leftContextSeconds: 10.0,
+            leftContextSeconds: 2.0,
             rightContextSeconds: 2.0,
             minContextForConfirmation: 10.0,
             confirmationThreshold: confirmationThreshold
@@ -750,7 +880,7 @@ public struct SlidingWindowAsrConfig: Sendable {
         SlidingWindowAsrConfig(
             chunkSeconds: chunkDuration,
             hypothesisChunkSeconds: min(1.0, chunkDuration / 2.0),  // Default to half chunk duration
-            leftContextSeconds: 10.0,
+            leftContextSeconds: 2.0,
             rightContextSeconds: 2.0,
             minContextForConfirmation: 10.0,
             confirmationThreshold: confirmationThreshold
@@ -761,7 +891,7 @@ public struct SlidingWindowAsrConfig: Sendable {
     var asrConfig: ASRConfig {
         ASRConfig(
             sampleRate: 16000,
-            tdtConfig: TdtConfig()
+            tdtConfig: tdtConfig ?? TdtConfig()
         )
     }
 
@@ -771,6 +901,25 @@ public struct SlidingWindowAsrConfig: Sendable {
     var leftContextSamples: Int { Int(leftContextSeconds * 16000) }
     var rightContextSamples: Int { Int(rightContextSeconds * 16000) }
     var minContextForConfirmationSamples: Int { Int(minContextForConfirmation * 16000) }
+
+    /// Total samples in an assembled window: left context + chunk + right context.
+    public var windowSamples: Int { leftContextSamples + chunkSamples + rightContextSamples }
+
+    /// Validates that the assembled window fits the model's fixed input size.
+    /// - Throws: `SlidingWindowAsrError.invalidConfiguration` if
+    ///   `leftContextSeconds + chunkSeconds + rightContextSeconds` exceeds the
+    ///   model's maximum input (`ASRConstants.maxModelSamples`, 15 s at 16 kHz).
+    public func validate() throws {
+        guard windowSamples <= ASRConstants.maxModelSamples else {
+            let windowSeconds = leftContextSeconds + chunkSeconds + rightContextSeconds
+            let maxSeconds = Double(ASRConstants.maxModelSamples) / 16000.0
+            throw SlidingWindowAsrError.invalidConfiguration(
+                "leftContextSeconds + chunkSeconds + rightContextSeconds = \(windowSeconds)s "
+                    + "(\(windowSamples) samples) exceeds the model's maximum input of "
+                    + "\(maxSeconds)s (\(ASRConstants.maxModelSamples) samples at 16 kHz)"
+            )
+        }
+    }
 
     // Backward-compat convenience for existing call-sites/tests
     var chunkDuration: TimeInterval { chunkSeconds }
@@ -803,13 +952,23 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         tokenTimings.map(\.token)
     }
 
+    /// Vocabulary terms the CTC spotter detected in this window's audio (#899).
+    /// `nil` when vocabulary boosting is not configured; empty when rescoring
+    /// ran on this window and detected nothing. Present even if nothing was
+    /// replaced.
+    public let ctcDetectedTerms: [String]?
+    /// Vocabulary terms applied as replacements in this window's text.
+    public let ctcAppliedTerms: [String]?
+
     public init(
         text: String,
         isConfirmed: Bool,
         confidence: Float,
         timestamp: Date,
         tokenIds: [Int] = [],
-        tokenTimings: [TokenTiming] = []
+        tokenTimings: [TokenTiming] = [],
+        ctcDetectedTerms: [String]? = nil,
+        ctcAppliedTerms: [String]? = nil
     ) {
         self.text = text
         self.isConfirmed = isConfirmed
@@ -817,5 +976,7 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         self.timestamp = timestamp
         self.tokenIds = tokenIds
         self.tokenTimings = tokenTimings
+        self.ctcDetectedTerms = ctcDetectedTerms
+        self.ctcAppliedTerms = ctcAppliedTerms
     }
 }

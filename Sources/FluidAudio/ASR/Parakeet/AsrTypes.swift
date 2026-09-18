@@ -23,6 +23,36 @@ public struct ASRConfig: Sendable {
     /// Default: 480,000 samples (~30 seconds at 16kHz)
     public let streamingThreshold: Int
 
+    /// 80ms mel-context prepend on non-first long-form chunks (PR #264
+    /// blank-boundary fix). `nil` (default) resolves per model version:
+    /// `false` on v3 — the no-mel path's silence-aligned chunk starts avoid
+    /// both the multilingual drift (issue #594) and quiet-speech drops near
+    /// long silence runs (issue #803) — and `true` elsewhere. Set via the
+    /// `melChunkContext:` init parameter. See "Current Paths" in
+    /// Documentation/ASR/LongTranscription.md.
+    public let melChunkContextOverride: Bool?
+
+    /// Legacy Boolean view of `melChunkContextOverride`. Reports the explicit
+    /// setting, or the non-v3 default (`true`) when unset — it cannot see the
+    /// version-aware resolution applied at model load (v3 resolves to `false`).
+    @available(*, deprecated, renamed: "melChunkContextOverride")
+    public var melChunkContext: Bool { melChunkContextOverride ?? true }
+
+    /// Opt-in probe-then-commit chunking arbitration for the v3 + no-mel
+    /// batch path (default `false`) — strategies, commitment rationale, and
+    /// cost in "Current Paths" (Documentation/ASR/LongTranscription.md).
+    public let dualDecodeArbitration: Bool
+
+    /// Post-merge repair pass for chunk-seam content drops in long-form
+    /// batch transcription (issue #758, default `true`) — mechanics, cost,
+    /// and limitations in "Post-Merge Repair Pass"
+    /// (Documentation/ASR/LongTranscription.md).
+    public let seamGapRepair: Bool
+
+    /// Minimum inter-token gap, in seconds, that triggers a seam-gap repair
+    /// probe when `seamGapRepair` is enabled.
+    public let seamGapRepairMinGapSeconds: Double
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -31,7 +61,11 @@ public struct ASRConfig: Sendable {
         encoderHiddenSize: Int = ASRConstants.encoderHiddenSize,
         parallelChunkConcurrency: Int = 4,
         streamingEnabled: Bool = true,
-        streamingThreshold: Int = 480_000
+        streamingThreshold: Int = 480_000,
+        melChunkContext: Bool? = nil,
+        dualDecodeArbitration: Bool = false,
+        seamGapRepair: Bool = true,
+        seamGapRepairMinGapSeconds: Double = 1.5
     ) {
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
@@ -39,6 +73,15 @@ public struct ASRConfig: Sendable {
         self.parallelChunkConcurrency = max(1, parallelChunkConcurrency)
         self.streamingEnabled = streamingEnabled
         self.streamingThreshold = streamingThreshold
+        self.melChunkContextOverride = melChunkContext
+        self.dualDecodeArbitration = dualDecodeArbitration
+        self.seamGapRepair = seamGapRepair
+        self.seamGapRepairMinGapSeconds = max(0.5, seamGapRepairMinGapSeconds)
+    }
+
+    /// Resolve the mel-context tri-state against the loaded model version.
+    func resolvedMelChunkContext(for modelVersion: AsrModelVersion?) -> Bool {
+        melChunkContextOverride ?? (modelVersion != .v3)
     }
 }
 
@@ -116,6 +159,64 @@ public struct TokenTiming: Codable, Sendable {
     }
 }
 
+/// Word-level timing, aggregated from a sequence of `TokenTiming`s by grouping
+/// SentencePiece sub-word tokens on their word-boundary markers (`▁` / leading space).
+public struct WordTiming: Codable, Sendable {
+    public let word: String
+    public let startTime: TimeInterval
+    public let endTime: TimeInterval
+
+    public init(word: String, startTime: TimeInterval, endTime: TimeInterval) {
+        self.word = word
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
+/// Build word-level timings from token timings (e.g. from
+/// `StreamingUnifiedAsrManager.consumeTokenTimings()`).
+///
+/// Tokens whose raw piece starts with a word-boundary marker (`▁` or a leading
+/// space) begin a new word; the rest are appended to the current word. The
+/// resulting word spans from the first sub-word token's `startTime` to the last
+/// sub-word token's `endTime`.
+public func buildWordTimings(from tokenTimings: [TokenTiming]) -> [WordTiming] {
+    var wordTimings: [WordTiming] = []
+    var currentWord = ""
+    var wordStart: TimeInterval = 0
+    var wordEnd: TimeInterval = 0
+
+    func flush() {
+        let trimmed = currentWord.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        wordTimings.append(WordTiming(word: trimmed, startTime: wordStart, endTime: wordEnd))
+    }
+
+    for timing in tokenTimings {
+        let token = timing.token
+        if token.isEmpty || token == "<blank>" || token == "<pad>" {
+            continue
+        }
+
+        let startsNewWord = isWordBoundary(token) || currentWord.isEmpty
+        if startsNewWord && !currentWord.isEmpty {
+            flush()
+            currentWord = ""
+        }
+
+        if startsNewWord {
+            currentWord = stripWordBoundaryPrefix(token)
+            wordStart = timing.startTime
+        } else {
+            currentWord += token
+        }
+        wordEnd = timing.endTime
+    }
+
+    flush()
+    return wordTimings
+}
+
 // MARK: - Errors
 
 public enum ASRError: Error, LocalizedError {
@@ -127,6 +228,7 @@ public enum ASRError: Error, LocalizedError {
     case unsupportedPlatform(String)
     case streamingConversionFailed(Error)
     case fileAccessFailed(URL, Error)
+    case encoderInstantiationFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -146,6 +248,8 @@ public enum ASRError: Error, LocalizedError {
             return "Streaming audio conversion failed: \(error.localizedDescription)"
         case .fileAccessFailed(let url, let error):
             return "Failed to access audio file at \(url.path): \(error.localizedDescription)"
+        case .encoderInstantiationFailed(let message):
+            return "Encoder ANE program failed to instantiate: \(message)"
         }
     }
 }

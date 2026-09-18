@@ -25,16 +25,47 @@ public actor AsrManager {
         asrModels?.version.decoderLayers ?? 2
     }
 
+    internal var modelVersion: AsrModelVersion? {
+        asrModels?.version
+    }
+
     internal var parallelChunkConcurrency: Int {
         config.parallelChunkConcurrency
     }
 
+    /// Resolved mel-context flag exposed to `ChunkProcessor`. When `false`,
+    /// disables PR #264's 80ms mel-context prepend so v3 long-form audio
+    /// uses the no-mel boundary warmup path with silence-aligned chunk
+    /// starts (issues #594, #803). Unset config resolves to `false` on v3.
+    internal var melChunkContext: Bool {
+        config.resolvedMelChunkContext(for: modelVersion)
+    }
+
+    /// Opt-in dual-decode arbitration flag exposed to `ChunkProcessor`.
+    /// Only active alongside `melChunkContext == false` on v3.
+    internal var dualDecodeArbitration: Bool {
+        config.dualDecodeArbitration
+    }
+
+    /// Seam-gap repair flag exposed to `ChunkProcessor` (issue #758).
+    internal var seamGapRepair: Bool {
+        config.seamGapRepair
+    }
+
+    /// Minimum inter-token gap that triggers a seam-gap repair probe.
+    internal var seamGapRepairMinGapSeconds: Double {
+        config.seamGapRepairMinGapSeconds
+    }
+
     /// Cached vocabulary loaded once during initialization
     internal var vocabulary: [Int: String] = [:]
+    /// Sentence-final punctuation ids resolved from `vocabulary` (issue #905).
+    internal var punctuationTokenIds: Set<Int> = Set(ASRConstants.punctuationTokens)
     #if DEBUG
     // Test-only setter
     internal func setVocabularyForTesting(_ vocab: [Int: String]) {
         vocabulary = vocab
+        punctuationTokenIds = ASRConstants.punctuationTokenIds(in: vocab)
     }
     #endif
 
@@ -53,6 +84,7 @@ public actor AsrManager {
             self.decoderModel = models.decoder
             self.jointModel = models.joint
             self.vocabulary = models.vocabulary
+            self.punctuationTokenIds = ASRConstants.punctuationTokenIds(in: models.vocabulary)
         }
 
         // Pre-warm caches if possible
@@ -113,6 +145,7 @@ public actor AsrManager {
         self.decoderModel = models.decoder
         self.jointModel = models.joint
         self.vocabulary = models.vocabulary
+        self.punctuationTokenIds = ASRConstants.punctuationTokenIds(in: models.vocabulary)
 
         logger.info("AsrManager loaded successfully with provided models")
     }
@@ -204,7 +237,9 @@ public actor AsrManager {
         contextFrameAdjustment: Int = 0,
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0,
-        language: Language? = nil
+        language: Language? = nil,
+        emitTokensAfterGlobalFrame: Int? = nil,
+        initialTimeIndexOverride: Int? = nil
     ) async throws -> TdtHypothesis {
         // Route to appropriate decoder based on model version
         guard let models = asrModels, let decoder_ = decoderModel, let joint = jointModel else {
@@ -231,7 +266,9 @@ public actor AsrManager {
                 encoderHiddenSize: workingConfig.encoderHiddenSize,
                 parallelChunkConcurrency: workingConfig.parallelChunkConcurrency,
                 streamingEnabled: workingConfig.streamingEnabled,
-                streamingThreshold: workingConfig.streamingThreshold
+                streamingThreshold: workingConfig.streamingThreshold,
+                melChunkContext: workingConfig.melChunkContextOverride,
+                dualDecodeArbitration: workingConfig.dualDecodeArbitration
             )
         }
 
@@ -244,7 +281,9 @@ public actor AsrManager {
                 encoderHiddenSize: models.version.encoderHiddenSize,
                 parallelChunkConcurrency: workingConfig.parallelChunkConcurrency,
                 streamingEnabled: workingConfig.streamingEnabled,
-                streamingThreshold: workingConfig.streamingThreshold
+                streamingThreshold: workingConfig.streamingThreshold,
+                melChunkContext: workingConfig.melChunkContextOverride,
+                dualDecodeArbitration: workingConfig.dualDecodeArbitration
             )
         } else {
             adaptedConfig = workingConfig
@@ -267,7 +306,10 @@ public actor AsrManager {
                 decoderState: &decoderState,
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
-                globalFrameOffset: globalFrameOffset
+                globalFrameOffset: globalFrameOffset,
+                punctuationTokenIds: punctuationTokenIds,
+                emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+                initialTimeIndexOverride: initialTimeIndexOverride
             )
         case .v3:
             // Pass `vocabulary` unconditionally. `TdtDecoderV3.tokenLanguageFilter`
@@ -285,7 +327,10 @@ public actor AsrManager {
                 isLastChunk: isLastChunk,
                 globalFrameOffset: globalFrameOffset,
                 language: language,
-                vocabulary: vocabulary
+                vocabulary: vocabulary,
+                punctuationTokenIds: punctuationTokenIds,
+                emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+                initialTimeIndexOverride: initialTimeIndexOverride
             )
         case .tdtJa:
             // The Japanese model outputs Kanji / Hiragana / Katakana, none of
@@ -308,11 +353,10 @@ public actor AsrManager {
                 decoderState: &decoderState,
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
-                globalFrameOffset: globalFrameOffset
-            )
-        case .ctcZhCn:
-            throw ASRError.processingFailed(
-                "CTC-only model .ctcZhCn does not support TDT decoding. Use CtcZhCnManager instead."
+                globalFrameOffset: globalFrameOffset,
+                punctuationTokenIds: punctuationTokenIds,
+                emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+                initialTimeIndexOverride: initialTimeIndexOverride
             )
         }
     }
@@ -480,7 +524,7 @@ public actor AsrManager {
     }
 
     nonisolated internal func normalizedTimingToken(_ token: String) -> String {
-        token.replacingOccurrences(of: "▁", with: " ")
+        token.replacingOccurrences(of: ASRConstants.sentencePieceWordBoundary, with: " ")
     }
 
     /// Decode token IDs to text using SentencePiece conventions.
@@ -489,7 +533,7 @@ public actor AsrManager {
 
         let tokens = tokenIds.compactMap { vocabulary[$0] }.filter { !$0.isEmpty }
         return tokens.joined()
-            .replacingOccurrences(of: "▁", with: " ")
+            .replacingOccurrences(of: ASRConstants.sentencePieceWordBoundary, with: " ")
             .trimmingCharacters(in: .whitespaces)
     }
 
