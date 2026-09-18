@@ -456,6 +456,26 @@ public enum KokoroAneResourceDownloader {
                 at: parentDir, withIntermediateDirectories: true)
         }
 
+        // Local-first: the host app stages the repo-root `voices/<name>.json` catalog alongside
+        // the variant bundle, so an English voice other than `af_heart` can be converted without
+        // touching the network. `repoDirectory` is the variant bundle (…/ANE), so the catalog sits
+        // one level up. Mirrors step 2 below, minus the fetch.
+        // wangqi modified 2026-09-18
+        if variant == .english {
+            let localJSON = repoDirectory
+                .deletingLastPathComponent()
+                .appendingPathComponent("voices/\(sanitized).json")
+            if FileManager.default.fileExists(atPath: localJSON.path),
+                let json = try? Data(contentsOf: localJSON),
+                let pack = try? KokoroAneVoicePack.load(fromJSON: json)
+            {
+                try pack.binaryData.write(to: localURL, options: [.atomic])
+                logger.info(
+                    "Converted voice pack '\(sanitized)' from staged voices/\(sanitized).json")
+                return localURL
+            }
+        }
+
         logger.info("Downloading voice pack '\(sanitized)' (\(variant.rawValue)) from HuggingFace...")
         let repo = variant.repo
         let remoteFilePath: String

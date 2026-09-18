@@ -35,7 +35,16 @@ let package = Package(
             name: "NemoTextProcessing",
             description: "Link the bundled NeMo text-normalization engine (TTS frontends, ITN)."
         ),
-        .default(enabledTraits: ["NemoTextProcessing"]),
+        // Off by default in this fork. `NemoTextProcessing.xcframework` is a static-library
+        // xcframework, so Xcode unpacks its headers into `$BUILT_PRODUCTS_DIR/include/` — the
+        // same place the app's `libgit2.xcframework` (SwiftGit2) puts its own, and both ship a
+        // `module.modulemap`, which fails the build with "Multiple commands produce
+        // .../include/module.modulemap". The app already ran on `TextNormalizer`'s
+        // `isNativeAvailable == false` path (it never linked a NeMo staticlib), so opting out
+        // preserves existing behaviour. To turn it back on, first repackage libgit2 as a
+        // framework-style xcframework so the two stop sharing `include/`.
+        // wangqi modified 2026-09-18
+        .default(enabledTraits: []),
     ],
     dependencies: [],
     targets: [
