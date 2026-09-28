@@ -204,6 +204,21 @@ public enum KokoroAneResourceDownloader {
         _ fileName: String,
         directory: URL? = nil
     ) async throws -> URL {
+        // Flat lookup + offline gate, as `ensureEnglishLexicon` has: a host app that points
+        // `TtsCacheDirectory.overrideDirectory` at its own download folder stages the lexicon at
+        // that root. Checked before anything is created, so a read-only stage works, and a
+        // missing file throws instead of reaching HuggingFace from the app sandbox. Spanish
+        // catches this and runs on its spelling rules; French cannot run without its lexicon.
+        // wangqi modified 2026-09-28
+        if directory == nil, let override = TtsCacheDirectory.overrideDirectory {
+            let flatURL = override.appendingPathComponent(fileName)
+            if FileManager.default.fileExists(atPath: flatURL.path) {
+                return flatURL
+            }
+            throw KokoroAneError.downloadFailed(
+                "\(fileName) not staged under \(override.path); downloads are disabled by the cache override")
+        }
+
         let modelsDirectory = try directory ?? defaultModelsDirectory()
         let kokoroDir = modelsDirectory.appendingPathComponent(Repo.kokoro.folderName)
         try FileManager.default.createDirectory(at: kokoroDir, withIntermediateDirectories: true)
@@ -231,6 +246,26 @@ public enum KokoroAneResourceDownloader {
         directory: URL? = nil,
         progressHandler: ProgressHandler? = nil
     ) async throws {
+        // Flat check + offline gate. `MultilingualG2PModel.modelsDirectory(base:)` already loads
+        // the pair from the override root when the nested layout is absent (fork patch), so a
+        // complete flat pair is all that is needed; an incomplete one throws rather than
+        // downloading into the nested path from the app sandbox.
+        // wangqi modified 2026-09-28
+        if directory == nil, let override = TtsCacheDirectory.overrideDirectory {
+            let base = MultilingualG2PModel.modelsDirectory(base: override)
+            for bundle in ModelNames.MultilingualG2P.requiredModels.sorted() {
+                let bundleDir = base.appendingPathComponent(bundle)
+                let complete = compiledBundleFiles.allSatisfy {
+                    FileManager.default.fileExists(atPath: bundleDir.appendingPathComponent($0).path)
+                }
+                guard complete else {
+                    throw KokoroAneError.downloadFailed(
+                        "\(bundle) not staged under \(base.path); downloads are disabled by the cache override")
+                }
+            }
+            return
+        }
+
         let modelsDirectory = try directory ?? defaultModelsDirectory()
         let kokoroDir = modelsDirectory.appendingPathComponent(Repo.kokoro.folderName)
         for bundle in ModelNames.MultilingualG2P.requiredModels.sorted() {
@@ -521,7 +556,10 @@ public enum KokoroAneResourceDownloader {
         // touching the network. `repoDirectory` is the variant bundle (…/ANE), so the catalog sits
         // one level up. Mirrors step 2 below, minus the fetch.
         // wangqi modified 2026-09-18
-        if variant == .english {
+        // Every `ANE/` variant, matching upstream's step 2: Spanish and French voices
+        // (`ef_*`/`em_*`/`ff_*`) are staged in the same `voices/` catalog.
+        // wangqi modified 2026-09-28
+        if variant.repo == .kokoroAne {
             let localJSON = repoDirectory
                 .deletingLastPathComponent()
                 .appendingPathComponent("voices/\(sanitized).json")

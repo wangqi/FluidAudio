@@ -260,8 +260,8 @@ requiredModelsZh`. Upstream grew `KokoroAneVariant` to five cases, so `.spanish`
 variant, matching upstream's own switch below it. The only effect was a misleading warning
 (the patch never throws), but it would have misreported any Spanish or French adoption.
 
-**Not yet patched: two new upstream network paths**, both reachable only from the Spanish and
-French variants the app does not use:
+**Patched 2026-09-28, with the Spanish/French adoption (§5.2): two new upstream network
+paths**, both reachable only from the Spanish and French variants:
 
 - `KokoroAneResourceDownloader.ensureLexiconCache(_:directory:)` (`es_`/`fr_lexicon_cache.json`)
   resolves `<TtsCacheDirectory>/Models/kokoro/<file>` and downloads from upstream when it is
@@ -270,7 +270,12 @@ French variants the app does not use:
 - `KokoroAneResourceDownloader.ensureMultilingualG2PAssets` calls `ModelHub.download` for the
   CharsiuG2P pair.
 
-Both need the patch-12 treatment before Spanish or French is wired (§5.2).
+Both now have the patch-12 treatment (patches 15 and 16): a flat lookup at the
+`TtsCacheDirectory.overrideDirectory` root, checked before anything is created, and a throw
+instead of a download when the file is missing. A third gap turned up in wiring: patch 13's
+local-first `voices/<name>.json` conversion only ran for `.english`, so a Spanish or French voice
+would have fallen through to upstream's network fetch. It now runs for every `ANE/` variant
+(patch 13, widened).
 
 ---
 
@@ -290,24 +295,43 @@ With this change the app no longer writes `Repo.overrideFolderNames` anywhere. T
 that adds it stays, because the regression harness and `FluidAudioVAD`'s open issue
 (tag-20260918 §3.12, which suggested an override for `.vad`) may still want it.
 
-### 5.2 NOT ADOPTED, worth doing — Kokoro Spanish and French
+### 5.2 ADOPTED 2026-09-28 — Kokoro Spanish and French
 
-The `fa-kokoro-82m` catalogue already lists `ef_dora`, `em_alex`, `em_santa` and `ff_siwis` and
-advertises `es`/`fr` in `language_list`. Today those voices run on the **English** variant, so
-Spanish or French text is spoken through English G2P with a Spanish or French timbre.
-Upstream's new variants fix that **without a new speaker class**: `FluidAudioKokoroAneSpeaker`
-would map the `ef_`/`em_` prefixes to `.spanish` and `ff_` to `.french` when constructing
-`KokoroAneManager`. Prerequisites:
+The `fa-kokoro-82m` catalogue already listed `ef_dora`, `em_alex`, `em_santa` and `ff_siwis` and
+advertised `es`/`fr`, but those voices ran on the **English** variant: Spanish or French text
+was spoken through English G2P with a Spanish or French timbre. Done, without a new speaker
+class:
 
-1. Mirror `es_lexicon_cache.json` (3.9 MB) and `fr_lexicon_cache.json` (13.6 MB) to the
-   `kokoro-82m-coreml/` root. Neither is in our mirror today. `MultilingualG2PEncoder/Decoder.mlmodelc`
-   already are.
-2. Add the flat-layout + offline gates from §4 to `ensureLexiconCache` and
-   `ensureMultilingualG2PAssets`.
-3. Reload the manager when the voice crosses a language, since a manager is bound to one
-   variant. The seven stage bundles are the same `ANE/` files, so this costs a reload, not a
-   download.
-4. Bump `fa-kokoro-82m` `components.revision` again if the lexicons join the default download.
+1. **Mirrored** `es_lexicon_cache.json` (3.9 MB) and `fr_lexicon_cache.json` (13.6 MB) to the
+   `kokoro-82m-coreml/` root, at upstream's exact sizes (mirror commit `0df94432`).
+2. **Fork gates** on `ensureLexiconCache`, `ensureMultilingualG2PAssets` and the voice-pack
+   conversion (§4).
+3. **Speaker:** `FluidAudioKokoroAneSpeaker.variant(forEngine:voice:)` maps upstream's
+   `spanishVoices` / `frenchVoices` to `.spanish` / `.french`; `loadManagerIfNeeded(voice:)`
+   tracks `loadedVariant` and reloads when the voice crosses a language (same `ANE/` bundles,
+   no download). `speakText` checks per chunk, so a voice change still applies from the next
+   sentence.
+4. **Catalogue:** the CharsiuG2P pair (`MultilingualG2PEncoder/Decoder.mlmodelc`, ~83 MB) was
+   **not** in `required`, so the app never downloaded it; French needs it for words its lexicon
+   lacks, which otherwise phonemize to nothing and are dropped. Added to all four tiers, `size`
+   1400 → 1500, and `components.revision` 2 → **3**. It is 3 rather than folding into 2 because
+   the test tier had already synced 2; prod still goes 1 → 3 in one re-download. Test tier
+   synced; audit and prod go out with the release.
+
+Verified on real weights (`run_fluidaudio_tests.py --only kokoro`, report
+`fluidaudio-20260928-150456.md`), with assets re-staged from our mirror:
+
+| Probe | Result | Phonemes |
+|---|---|---|
+| `:ANE-ES` (`ef_dora`) | PASS, 2.8 s | `el θˈoro marˈon sˈalta sˌoβɾe los tɾˈes pˈeros.` Spanish `θ` and tap `ɾ`; "3" read as *tres* |
+| `:ANE-FR` (`ff_siwis`) | PASS, 3.1 s | `lə ʁənˈaʁ bʁˈœ̃ sˈot paʁdəsˈy le tʁwˈa ʃjˈɛ̃.` Uvular `ʁ`, nasal vowels; "3" read as *trois* |
+
+Both probes gate on the phonemes (French must contain a nasal vowel, Spanish must not contain
+English `ɹ`), because the old bug produced audio too.
+
+Still not done: the row's `description` ("ANE engine: English, 54 voices") does not mention
+Spanish or French. It is translated through the localization pipeline, so changing it means a
+re-translation run; left for the release.
 
 ### 5.3 ADOPTED — SenseVoice detected language
 
@@ -352,7 +376,7 @@ still apply.
 | **Parakeet Redux** (`.redux`) | **No**, same branch | Same wiring as Ultra. A smaller download (183 MB encoder) but **iOS 18+ only**, less accurate on English, ~35% slower, and a ~7 min first ANE compile on a Mac. It only makes sense as a "small download" option |
 | **Nemotron 3 Diarization** | **Yes, a new diarizer case**: a fourth `DiarizerType` in `FluidAudioDiarizer`, around `Nemotron3Diarizer` + `Nemotron3Models` | Different API shape from LS-EEND / Sortformer (`Nemotron3ChunkResult`, `Nemotron3Diarizer.segments(…)`), 8 speakers vs Sortformer's 4, 10 ms resolution. Needs catalogue rows too, and **no FluidAudio diarizer row is in any live tier today** (§3.4) |
 | **LocalVQE** (echo cancellation / noise suppression) | **Yes, a new component type**, not a speaker, ASR, VAD or diarizer | A pre-ASR enhancement stage (`LocalVqeStream`) for voice chat, where the app's own TTS leaks into the mic. **Beta**, 16 kHz only, CPU default, live-device behaviour unvalidated upstream |
-| **Kokoro Spanish / French** | **No**, extends `FluidAudioKokoroAneSpeaker` | §5.2 |
+| **Kokoro Spanish / French** | **No**, extends `FluidAudioKokoroAneSpeaker` | **Done 2026-09-28**, §5.2 |
 
 ---
 
