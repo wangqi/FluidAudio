@@ -24,6 +24,26 @@
 
 ---
 
+# Computer-use decision models
+
+Measured separately on September 19, 2026: Apple M5 Pro, 24 GB, macOS 27.0.
+CUA-S1-FORMS uses real text inputs, not audio. With `.cpuAndNeuralEngine`, its
+plan assigns 149 operations to ANE and 24 to CPU; `.all` selects 173 GPU operations.
+
+| Model | ANE ops | GPU ops | CPU ops | Portable size | Warm model call |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CUA-S1-FORMS (`.cpuAndNeuralEngine`) | 149 (86.1%) | 0 | 24 (13.9%) | 1.51 MB | p50 0.929 ms / p95 0.973 ms |
+| CUA-S1-FORMS `ane-gather` (optional) | 162 (98.2%) | 0 | 3 (1.8%) | ~1.51 MB | paired p50 0.970 ms / p95 0.988 ms |
+
+Timing uses 30 Python Core ML calls over three real form inputs after warmup,
+excluding encoding and UI work. Counts are scheduler assignments, not measured
+runtime shares. See [the conversion toolkit](https://github.com/FluidInference/mobius/tree/codex/cua-s1-forms/models/computer-use/cua-s1-forms/coreml#device-placement) for the
+four-policy comparison, load timings, fallback reasons, protocol, and raw report.
+The optional unsigned-gather variant leaves only three input casts on CPU. Its
+matched ABBA comparison used 60 calls per model and measured 0.915 ms for the
+default versus 0.970 ms for `ane-gather`; more ANE placement was about 6% slower.
+The default artifact is retained. No utilization or energy saving was measured.
+
 # ASR
 
 | Model | Type | Chunk | ANE | GPU | CPU | ops | Size | Heavy graph → device |
@@ -136,6 +156,51 @@ fused `decoder_joint` (B1).
 | Model | Type | Chunk | ANE | GPU | CPU | ops | Size | Lat ms |
 |-------|------|------:|----:|----:|----:|----:|-----:|-------:|
 | Silero VAD (single graph) | streaming | 256 ms | 0% | 0% | 100% | 357 | 2 MB | 0.19 |
+
+---
+
+# Diarization (streaming)
+
+Compute plan (`Scripts/ane_profile.swift`, `--units all`) plus **warm per-call latency on real audio**
+(NVIDIA's 97.6 s 8-voice demo clip, M5 Pro, macOS 26.7; Nemotron via `nemotron3-diarize --profile`,
+Sortformer derived from wall RTFx over its 203 calls, so it includes host time and the cold first call).
+Both models are pure forward passes over `[speaker cache | FIFO | chunk]`; `T` is that packed length.
+
+| Model | Preset | Latency | Audio/call | T | ANE | GPU | CPU | ops | Size | ANE ms/call | GPU ms/call | ANE ms per audio-s |
+|-------|--------|--------:|-----------:|--:|----:|----:|----:|----:|-----:|------------:|------------:|-------------------:|
+| Sortformer v2.1 | fast | 1.04 s | 0.48 s | 242 | 94% | 0% | 6% | 1526 | 229 MB | 12.5 | 10.4 | 26 |
+| Sortformer v2.1 | high context | 30.4 s | 27.2 s | — | 94% | 0% | 6% | 1526 | 243 MB | — | — | — |
+| Sortformer v2.1 | offline (fused) | 30.7 s | 30.7 s | — | 99% | 0% | 1% | 1497 | 230 MB | — | — | — |
+| Nemotron 3 | low | 1.04 s | 0.72 s | 541 | 98% | 0% | 2% | 1178 | 190 MB | 27.1 | 12.0 | 38 |
+| Nemotron 3 | fast32 | 2.88 s | 2.56 s | 340 | 98% | 0% | 2% | 1178 | 190 MB | 11.6 | 12.6 | 4.5 |
+| Nemotron 3 | fast128 | 10.56 s | 10.24 s | 436 | 98% | 0% | 2% | 1178 | 190 MB | 20.6 | 37.0 | 2.0 |
+| Nemotron 3 | offline | 30.4 s | 27.2 s | 684 | 98%* | 0% | 2% | 1178 | 190 MB | fails* | 11.2 | — |
+| Nemotron 3 | fast32-split-w8a8 | 2.88 s | 2.56 s | 340 | 100% | 0% | 0% | 1649 | 95 MB | 9.7 | — | 3.8 |
+| Nemotron 3 | c128-split-w8a8 | 10.56 s | 10.24 s | 436 | 100% | 0% | 0% | 1649 | 95 MB | ~18 | — | 1.8 |
+
+\* `MLComputePlan` reports the placement CoreML *intends*; Nemotron 3 `offline` (3040 mel frames) fails
+`ANECCompile` at runtime and silently runs on the GPU. Chunk mel input ≤ 1376 frames compiles for the
+ANE; 1440+ does not. The split-graph presets bypass the cliff (host does feature stacking + the
+1024→512 projection).
+
+**Reading the table**
+
+- Sortformer's 2% CPU residue and Nemotron's 2% are index/gather ops around the state packing; the
+  split-graph variants move that packing to the host and leave a pure-fp transformer that is 100% ANE.
+- **Per-call cost scales with `T`, not with audio advanced.** Nemotron `low` (T=541) costs 2.2× Sortformer
+  fast (T=242) per call on the ANE and advances 1.5× the audio; at 1.04 s latency the two are within 1.5×
+  of each other per audio-second. Bigger Nemotron chunks amortize the fixed state: fast32 is 8× cheaper
+  than `low` per audio-second at higher DER-neutral latency, fast128 19× cheaper.
+- **The M5 Pro GPU beats the ANE at 1.04 s latency for both models** (Nemotron `low` 12.0 vs 27.1 ms,
+  Sortformer fast 10.4 vs 12.5) — ANE tiling of these packed sequences is unfavourable — while the ANE
+  wins for fast128 (20.6 vs 37.0). `.all` picks per-op, not
+  per-model, so choose the route explicitly for `low` on Macs; on iPhone the ANE is the only fast route.
+- Sortformer's first GPU run on a fresh process paid a ~2.4 s cold compile on call 1 (whole-clip RTFx
+  22× instead of 46×); the table's GPU figure is the warm second run. Its ANE cold cost is small.
+  Nemotron's cold ANE compile is ~1 s for the monolithic presets.
+- Sequence length is the cost: zero-shot layer drops, W8A8 on the monolithic graph, batch>1 on the ANE
+  and speaker-cache/FIFO shrinking were all measured and rejected (see the Nemotron 3 conversion notes);
+  the remaining lever is reusing the static state's attention across speaker-cache updates, untested.
 
 ---
 
