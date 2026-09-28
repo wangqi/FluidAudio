@@ -35,9 +35,16 @@ public enum KokoroAneResourceDownloader {
         // trigger an unnecessary HuggingFace download even when all files are present.
         // wangqi modified 2026-05-04
         if let explicitDir = directory {
-            let requiredNames: Set<String> = variant == .english
-                ? ModelNames.KokoroAne.requiredModels
-                : ModelNames.KokoroAne.requiredModelsZh
+            // Per-variant set, matching the switch below: Spanish and French share the `ANE/`
+            // bundle, so a bare english-vs-else check held them (and Japanese) to Mandarin's
+            // g2pW + voices/zf_001.bin and warned about files the variant never loads.
+            // wangqi modified 2026-09-28
+            let requiredNames: Set<String>
+            switch variant {
+            case .english, .spanish, .french: requiredNames = ModelNames.KokoroAne.requiredModels
+            case .mandarin: requiredNames = ModelNames.KokoroAne.requiredModelsZh
+            case .japanese: requiredNames = ModelNames.KokoroAne.requiredModelsJa
+            }
             if requiredNames.allSatisfy({ FileManager.default.fileExists(atPath: explicitDir.appendingPathComponent($0).path) }) {
                 logger.info("laishere Kokoro models (\(variant.rawValue)) found at \(explicitDir.path)")
             } else {

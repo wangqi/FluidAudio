@@ -1,521 +1,387 @@
-# FluidAudio Upgrade Notes: tag-20260509 → tag-20260918
+# FluidAudio Upgrade Notes: tag-20260918 → tag-20260928
 
-**216 commits, 2026-05-09 → 2026-09-18** (55 `feat`, 82 `fix`, 3 `perf`, 4 `refactor`, 4 `chore`).
-284 source files changed: +35,657 / −17,499.
+**31 commits, 2026-09-19 → 2026-09-26** (8 `feat`, 11 `fix`, 1 `perf`, 4 `docs`, plus 3 untyped
+feature commits and 4 README/showcase edits). Upstream versions **v0.17.0 → v0.17.4** (podspec).
+149 files changed, +15,816 / −364; 71 of them under `Sources/` (+7,798 / −315). Most of the
+added lines are new backends the app does not wrap (Nemotron 3 diarization, LocalVQE, CUA-S1,
+Spanish/French Kokoro G2P, LuxTTS chunking).
 
-This is the largest upgrade the fork has absorbed. It removes four backends the app depended on,
-rewrites the whole download stack, and introduces an **iOS 27 crash advisory that affects the
-engine the app now relies on for Kokoro TTS**. Read the Risks section before shipping.
+This is a small merge next to tag-20260918, but it contained **one silent ship-blocker**:
+upstream renamed a Kokoro stage bundle, and our HuggingFace mirror did not have the new file.
+**Resolved 2026-09-28** (mirror updated, test tier synced); see §3.1 for what is still pending
+at release.
 
----
-
-## 1. Breaking removals
-
-| Removed upstream | Commit | App code that used it | Resolution |
-|------------------|--------|----------------------|------------|
-| `DownloadUtils` → `Shared/Download/*` (`ModelHub`, `ModelCache`, `HFClient`, `FileDownloader`, `HFTreeLister`, `RetryPolicy`, `ProgressReporter`, `DownloadTypes`) | `refactor(download)!: Wave 6 — ModelHub replaces DownloadUtils (#765)` | `VadManager` fork patch; `FluidAudioASR` comments | Fork patches re-homed onto `ModelHub.loadModels`. `DownloadUtils.ProgressHandler` → top-level `ProgressHandler`; `DownloadUtils.HuggingFaceDownloadError` / `.OfflineError` → one merged `DownloadError` |
-| Standard CoreML Kokoro — 13 files (`KokoroTtsManager`, `TtsModels`, `KokoroSynthesizer`, `TtsResourceDownloader`, `KokoroVocabulary`, `KokoroChunker`, `TtsTextPreprocessor`, `TtsCustomLexicon`, …) | `deprecate: remove CosyVoice3 and mono Kokoro (#571)` | `FluidAudioKokoroSpeaker` | Speaker deleted. Its catalog, `tts_fluidKokoro_voice` and `tts_fluidKokoro_speed` moved onto `FluidAudioKokoroAneSpeaker` |
-| `Qwen3AsrManager` + 5 files | `chore(asr): remove experimental Qwen3 ASR backend` | `FluidAudioASR` `fa-qwen3-asr` branch | Branch and catalog row removed |
-| `CtcZhCnManager` / `CtcZhCnModels` | `chore(asr): remove experimental Parakeet CTC zh-CN Mandarin model` | `FluidAudioASR` `fa-parakeet-ctc-zh-cn` branch | Branch and catalog row removed. Upstream's Mandarin replacements are `ParaformerManager` / `SenseVoiceManager` — **not adopted** |
-| Magpie TTS (22 files), CosyVoice3 TTS (20 files) | `Remove experimental Magpie multilingual TTS backend`, `deprecate: … (#571)` | — | Never used by the app |
-
-`TtsModels.overrideCacheDirectory` — the fork's central hook for pointing FluidAudio at the app's
-flat download folder — died with `TtsModels`. It now lives on upstream's new
-`TtsCacheDirectory.overrideDirectory` (`TTS/Shared/TtsCacheDirectory.swift`).
+All 14 fork patches carried through the merge unchanged. The per-file fork delta against
+upstream `main` is identical in size to the tag-20260918 delta. One patch needed a follow-up
+fix; see §4.
 
 ---
 
-## 2. What the upgrade brings that matters to this app
+## 1. Upstream changes, by area
 
-### 2.1 Kokoro ANE inherited the full voice catalog
+### 1.1 Kokoro ANE (the app's FluidAudio Kokoro engine)
 
-`feat(tts/kokoro-ane): any Kokoro-82M v1.0 voice for the English variant (#896)` is what makes the
-removal of the standard chain survivable. The ANE variant now serves **54 English voices** (up from
-`af_heart` alone), 103 Mandarin, and 5 Japanese. English voices other than `af_heart` are published
-as repo-root `voices/<name>.json` and converted to the flat fp32 `.bin` on first use.
+| Commit | What it does | Reaches the app? |
+|---|---|---|
+| `fix(tts/kokoro-ane): quiet onset on long utterances — use fp32 KokoroProsody_v2 (#947) (#963)` | The shipped fp16 prosody stage miscomputed F0/energy over the first 1–3 s once an utterance passed ~10 s of audio, so the **opening words came out 12–15 dB quiet**. Not iOS-specific; every variant affected. The stage is now `KokoroProsody_v2.mlmodelc` (fp32 compute, same fp16 I/O). It was **renamed, not overwritten**. Reporter's sentence: onset −38.2 dB → −26.5 dB, ASR WER 7.7% → 3.8% | **Yes, but only after the mirror is updated.** See §3.1 |
+| `fix(tts/kokoro-ane): restore long-text chunking in synthesizeDetailed(text:) (#940) (#965)` | #790 had dropped the phoneme chunker, so text past 510 phonemes threw `phonemeSequenceTooLong`. It is chunked again, after normalization and G2P, and the cap is now counted in **Unicode scalars**. `synthesize(text:)` goes through `synthesizeDetailed`, so both are fixed | **Yes, directly.** See §2.1 |
+| `feat(tts/kokoro-ane): Spanish and French variants (#950)` | `KokoroAneVariant.spanish` / `.french` share the `ANE/` bundle, with new frontends: `SpanishG2P` (spelling rules plus a 49k-word `es_lexicon_cache.json`) and `FrenchG2P` (244k-word `fr_lexicon_cache.json`, CharsiuG2P fallback, elision and liaison). Phoneme error vs espeak-ng on FLEURS: es 0.48%, fr 1.27% | Not adopted. See §5.2 |
+| (same commit) Vocoder tail-slack fix | On OS 27, the BNNS kernels that Core ML runs for CPU-routed ops **read a few bytes past the end of their input**. When a buffer's byte size is a whole number of pages, that read lands on an unmapped page and **segfaults in libBNNS**; otherwise it produced full-scale noise. Hit at T ≡ 8 mod 24 in 416–584. Every chain input now carries a 16 KB zeroed tail | **Yes.** Upstream says it is *"possibly the same class as #889 (iOS 27); not verified there"*. See §3.2 |
+| (same commit) `KokoroAneVocab` encodes by Unicode scalar | French nasal vowels (`ɑ̃` = two scalars) were being dropped | No: the app runs English and Mandarin only |
+| `feat(tts/kokoro-ane): expose normalizedText + phonemes on synthesizeDetailed (#944)` | For callers that align display words to per-token durations | No: the app does not highlight words for this engine |
 
-Related quality work on the English frontend, all landed in this range:
+### 1.2 ASR
 
-- `fix(tts): Misaki-lexicon-first English frontend for KokoroAne` — lexicon lookup before BART G2P.
-- `fix(tts/kokoro-ane): read uppercase initialisms as letter names (#710)` — "NASA" → letter names.
-- `fix(tts/kokoro-ane): smart-apostrophe contractions + hyphenated lexicon lookups (#774, #775)`.
-- `fix(tts/kokoro-ane): stem possessives instead of G2P-ing the whole token`.
-- `fix(tts/kokoro-ane): treat quote delimiters as punctuation`.
-- `feat(tts): shared English text normalization for raw numbers/times (#711)`.
-- `feat(tts): auto-chunk long text in KokoroAne high-level synthesize (#712)` — **landed then
-  reverted** inside this same range. `feat(tts/kokoro): byte-exact NeMo text normalization before
-  G2P (#790)` removed the `PhonemeChunker` call and the `synthesizeChunks` helper from
-  `KokoroAneManager`, and restored the header doc line *"IPA input capped at 512 tokens — chunk
-  longer prompts upstream."* `synthesize(text:voice:speed:)` still runs one chain and still throws
-  `KokoroAneError.phonemeSequenceTooLong` on over-cap input, so **the app's own chunker in
-  `FluidAudioKokoroAneSpeaker.splitIntoChunks` remains required.**
+| Commit | What it does | Reaches the app? |
+|---|---|---|
+| `perf(asr): bulk-fill MLMultiArray resets and copies (#941)` | `resetData(to:)` became one `memset` and `copyData(from:)` one `memcpy`, replacing a per-element `NSNumber` loop. `MLArrayCache.returnArray` also stopped clearing arrays that every consumer overwrites anyway. `AsrManager.transcribe` on an 11 s clip went **71.1 ms → 48.3 ms** (M3 Pro, release, median of 20), with identical transcripts | **Yes, free.** Parakeet v3 and Japanese |
+| `Load local Orukeet-compatible ASR bundles without repository fallback (#928)` | New `AsrModels.loadLocal(from:version:…)`: loads from the exact directory, **no repository resolution, no download** | **Adopted.** See §5.1 |
+| `feat(asr): AsrModelVersion.ultra — Parakeet Ultra (#956)` | Post-trained v3 with the same contract, iOS 17+. test-clean WER 2.27% → **2.13%**, test-other 4.12% → **3.81%**, FLEURS 24-language mean 14.81% → **11.67%** (won all 24). One int8 encoder (595 MB). Upstream now *recommends* it for new integrations, but v3 stays the library default | Not adopted. See §6 |
+| `feat(asr): AsrModelVersion.redux — Parakeet Redux (#955)` | Ternary (2-bit) re-training of v3: **183 MB encoder** vs 445 MB, **iOS 18+ only**. Slightly worse on English (2.71% / 5.12%), better on FLEURS (13.06%), ~35% slower (83.9× vs 128.6× RTFx). First ANE load compiles ~7 min on an M-series Mac | Not adopted. See §6 |
+| `feat(diarizer): … SenseVoiceManager.transcribeDetailed` (inside #883) | Returns the model's leading tags: detected language (`zh`/`en`/`yue`/`ja`/`ko`/`nospeech`), emotion, audio event | **Adopted.** See §5.3 |
+| `fix(vocab): make alignBaseWordsToUTF8Ranges iterative (#961) (#962)` | Custom-vocabulary rescoring recursed once per word and SIGBUSed at ~1–2k words inside a Swift Task. Now an explicit stack: 16k words in 7 ms | No: the app does not use vocabulary boosting |
 
-### 2.2 Audio-quality fixes to the ANE chain
+### 1.3 PocketTTS
 
-- `fix(tts/kokoro-ane): KokoroNoise v2 — atan2 phase fix (removes HF sharpness)`.
-- `fix(tts/kokoro-ane): adopt COLA-corrected KokoroTail_v2 + native output level for all variants`.
-- `fix(tts/kokoro-ane): throw instead of trapping on non-finite PostAlbert durations` — a `fatalError`
-  class turned into a catchable throw.
-- `Fix KokoroAne strided MLMultiArray handling`.
+`fix(tts/pocket): keep cache-safe long sentences whole (#938)`. The 50-token chunk size is now a
+grouping preference, not a hard sentence limit. A longer sentence is kept whole when the chosen
+voice's KV offset plus a speech-duration budget still fits the 512-position cache. Generation
+loops are bounded at that boundary, and every cache write is validated. **Reaches the app**:
+long sentences are no longer cut mid-clause, and a cache overrun now fails a bounds check
+instead of reading past the cache. There are no model or file-name changes, so there is no
+catalogue impact.
 
-### 2.3 Download stack rewrite (`#765`, Waves 2–6)
+### 1.4 Diarization
 
-- `feat(download): resume interrupted downloads with HTTP Range requests` — a dropped transfer
-  continues from the bytes on disk instead of restarting.
-- `feat(download): stall watchdog + DownloadConfig plumbing (#810)` — `minStallBytes` (default 1 MiB)
-  / `stallWindow` (default 120 s) surface a frozen CDN connection in seconds rather than at the
-  30-minute idle timeout.
-- `fix: preserve model cache when first load is cancelled` and
-  `fix(download): preserve model cache on transient network errors` — cancellation and transient
-  failures no longer delete a fully-downloaded multi-hundred-MB repo.
-- `perf(download): skip unused PocketTTS variants + concurrent subdirectory fetches` —
-  `maxConcurrentFiles` (default 4).
-- `Validate downloaded model artifacts before caching (#740)`,
-  `feat(download): byte-weighted progress for downloadSubdirectory`,
-  `fix(download): deliver byte-level progress during download (#756)`.
-- `feat(download): add offline-only enforcement` → today's `ModelHub.offlineMode`.
+- `feat(diarizer): Nemotron 3 Diarization support (8-speaker streaming Sortformer) (#883)`: an
+  NVIDIA general-access checkpoint with 8 speakers, 10 ms output resolution, and a streaming API
+  (`appendAudio` / `processBufferedAudio` / `finishStream`, bit-exact with `processComplete`). A
+  split-graph mode gives 100% ANE residency. AMI 16-meeting DER 9.36–9.75 depending on preset.
+- `fix(diarizer/nemotron3): type output backings from the model description, retry if rejected (#952)`
+  and `feat(diarizer/nemotron3): load monolithic presets from monolithic/v2 (M3 ANE compile fix) (#960)`:
+  follow-ups for the M3 (h15g) `ANECCompile()` failure.
+- `Pin diarization artifacts to immutable revision (#927) (#939)`: `Repo.diarizer` now downloads
+  from commit `df2625ac…`, not `main`. New `ModelRegistry.revisionOverrides` covers mirrors, and
+  a `.fluidaudio-revision` marker invalidates the cache when the pin moves. See §3.4.
 
-### 2.4 iOS storage location
+### 1.5 New, outside the app's scope
 
-`TTS: store downloaded models in Application Support, not Caches (iOS) (#642)` — every TTS
-downloader used `Library/Caches/`, which the system reclaims under disk pressure, silently purging
-hundreds of MB while the app is backgrounded. Now `.applicationSupportDirectory`, matching the ASR
-side. **No impact on this app**, which stages every model itself under `models/fluidaudio/` via
-`DownloadManagerCoreML` and never lets FluidAudio choose a path — but it removes a latent trap for
-the default path used by the shared G2P assets.
+- `feat(enhancement): LocalVQE AEC with safe streaming and benchmark validation (beta) (#930)`:
+  acoustic echo cancellation, noise suppression and dereverberation for 16 kHz speech.
+  `LocalVqeManager` handles whole clips; `LocalVqeStream` takes arbitrary buffer sizes. On
+  upstream's exploratory ASR study, leakage fell from 34.0% to 0.95%. **Live capture/playback
+  on target devices is explicitly unvalidated upstream.**
+- `Add CUA-S1-FORMS Core ML scoring and benchmarks (#936)`: an on-device decision scorer that
+  picks one of 2–32 UI actions. Not audio.
+- `fix(tts/luxtts): remove spurious mid-phrase pauses and chunk long text (#937) (#942)`: LuxTTS
+  is not wrapped by the app.
+- `feat(logger): AppLogger.minimumLevel + mirrorsToConsole (#958) (#959)`: see §5.4.
+- `fix(build): bump NemoTextProcessing to v0.3.1 for Mac Catalyst (#949)`: adds a Catalyst slice.
+  **Inert here**: the fork disables the `NemoTextProcessing` trait (tag-20260918 §3.2, the
+  libgit2 `module.modulemap` collision), and this bump does not change that.
 
-### 2.5 PocketTTS
+---
 
-- `PocketTTS v2.1: fused flow decoder (ANE) + cond prefill + fp16 flowlm (~1.8× RTFx)`.
-- `feat(tts/pocket): ANE placements — rank-4 split-KV models (.ane) + MLState pipeline (.aneState)`.
-- `feat(tts/pocket): per-stage compute-unit overrides (#881)` — `PocketTtsComputeUnits`, including
-  `.avoidNeuralEngine` for hardware where a stage aborts.
-- `feat(tts/pockettts): add 5 native-language voices + slim language-pack downloads ~40%`.
-- `fix(tts/pocket-tts): per-language mimi encoders for non-English voice cloning (#793)` and
-  `fix(tts/pocket-tts): enable voice cloning for 24-layer non-English packs (#793)` — cloning on the
-  French/German/Italian/Portuguese/Spanish packs can now use the pack's own encoder instead of
-  reprojecting through the English one. **Not reachable as configured**:
-  `ensurePackMimiEncoder` looks for `v2.1/<lang>/mimi_encoderv3.mlmodelc`, which is not in the
-  app's `components.required`, and `DownloadManagerCoreML` fetches only listed components. The
-  fork's offline gate returns `nil` for it, so cloning falls back to the shared encoder +
-  reprojection exactly as before. Adding `mimi_encoderv3.mlmodelc` to the six pocket rows would
-  claim it, at the cost of a larger download for every user whether they clone voices or not —
-  **left as a decision, not applied.**
-- `fix(tts/pockettts): normalize French text and preserve mid-sentence chunks (#584)`.
+## 2. What users get from this merge
 
-### 2.6 ASR
+### 2.1 Kokoro Text to Audio stops failing on long chunks
 
-Applicable to the models this app ships:
+This is the most concrete user-facing fix, and it was already broken before this merge.
+`TTSConvModels.defaultChunkMaxChars(for: .fluidAudio)` is **600 characters**, and
+`FluidAudioKokoroAneSpeaker.generateAudioFile` passes the whole chunk to one `synthesize(text:)`
+call. English runs at about 1.02 phonemes per character (upstream's 916-char paragraph was 936
+phonemes), so a full 600-character chunk is ~610 phonemes. That is **over the 510 cap, so it
+threw `phonemeSequenceTooLong`**. Upstream's restored chunking removes the failure with no app
+change. Interactive read-aloud (`speakText`) was mostly safe: its own `splitIntoChunks` keeps
+chunks to at most ~500 characters, which sits right at the cap, so an unusually phoneme-dense
+paragraph could still have thrown there. It no longer can.
 
-- `perf(asr): opt-in GPU encoder placement for Parakeet v3 (+~8% RTFx, WER-neutral)`.
-- `feat(asr/v3): opt-in int8-linear Encoder_v2 encoder precision (#760)`.
-- `feat(asr/eou): opt-in fused decoder+joint_decision path (+7-9% RTFx, WER neutral-or-better)`.
-- `Add timestamp support to EoU Streaming` / `Timestamping RTTN decoder`.
-- `fix(asr/eou): debounce on wall-clock silence, not consecutive EOU emissions` — upstream
-  reimplemented the EOU debounce as the pure `evaluateEouDebounce`. **The fork's per-utterance EOU
-  patch is still required on top** (see §4, item 10).
-- A long run of seam/merge correctness fixes for long-form transcription (`#683`, `#706`, `#825`,
-  `#855`, `#897`, `#909`) — chunk-boundary word loss, final-window truncation, blank-decode rescue.
-- `fix(asr): fetch parakeet_vocab.json in AsrModels.download (#748)`,
-  `fix(asr): resolve sentence-final punctuation ids from the loaded vocabulary (#905)`.
+### 2.2 Kokoro's opening words are no longer quiet
 
-Not applicable (new backends, none adopted): Nemotron 3.5 Multilingual (40 locales),
-Parakeet Unified 0.6B, SenseVoiceSmall, Paraformer-large (zh), Canary-1B-v2 [beta].
+This fix applies once the mirror carries `KokoroProsody_v2.mlmodelc` (§3.1). On any utterance
+longer than ~10 s of audio, the first words used to come out 12–15 dB quieter than the rest.
 
-### 2.7 VAD and diarization
+### 2.3 Faster Parakeet transcription
 
-- `Update Silero VAD CoreML artifact to v6.2.1` — the `VadManager` API is unchanged (only
-  `DownloadUtils.ProgressHandler` → `ProgressHandler`), but `ModelNames.VAD.sileroVad` was renamed
-  from `silero-vad-unified-256ms-v6.0.0` to `…-v6.2.1`. **This silently breaks the app's VAD**:
-  `VadManager.loadUnifiedModel` resolves `models[ModelNames.VAD.sileroVadFile]`, so a cache
-  staged under the old name yields `nil` and `VadError.modelLoadingFailed`. Fixed by bumping
-  `components` for `fa-silero-vad` in all five config tiers; existing installs re-download (~5 MB).
-- `feat(vad): FSMN-VAD backend (CoreML) [beta]` — new, not adopted.
-- `Fixed LS-EEND Memory Leak + Updated Docs`, `LS-EEND Speaker Pre-Enrollment Bugfixes`.
-- `OfflineDiarizerManager: split process() into prepare()/cluster()` — cacheable
-  segmentation+embeddings.
-- `feat(diarizer): optional progressHandler on performCompleteDiarization`.
-- `feat(diarizer): expose per-chunk embeddings on DiarizationResult`.
-- `fix(offline-diarizer): pyannote-parity clustering — threshold semantics, constraint count,
-  constrained assignment` and `fix(diarization): deterministic & robust offline VBx re-clustering`
-  — **offline diarization output will differ from tag-20260509 for the same audio.**
-- `fix(diarizer/offline): propagate cancellation to workers`.
-- `feat(speaker): CAM++ speaker-embedding backend (CoreML) [beta]` — new, not adopted.
+About 20 ms is saved per `transcribe` call on an 11 s clip (~30%). The saving comes from work
+after the models finish, so it applies equally on the Neural Engine and the CPU.
 
-### 2.8 ITN / text normalization
+### 2.4 SenseVoice reports the language it heard
 
-`fix(itn): link the bundled NeMo engine directly instead of dlopen(nil) discovery` changes
-`TextNormalizer.isNativeAvailable` from a runtime `dlsym` probe into a **compile-time constant**
-driven by the `NemoTextProcessing` package trait. See §3.1 — this is the one change that would
-alter app behaviour for free, and the one this fork currently cannot take.
+See §5.3.
 
 ---
 
 ## 3. Risk assessment
 
-### 3.1 HIGH — iOS 27: no safe Core ML route for Kokoro ANE
+### 3.1 RESOLVED (was ship-blocker) — `KokoroProsody_v2.mlmodelc` was not in our mirror
 
-`KokoroAneManager.osAdvisory(for:)` now returns, for **any non-macOS OS ≥ 27**:
+`ModelNames.KokoroAne.prosody` changed from `KokoroProsody.mlmodelc` to
+`KokoroProsody_v2.mlmodelc`. Every catalogue row is served from our own mirror,
+`flyingfishinwater/fluidaudios`. On 2026-09-28 the live tree listed:
 
-> iOS/iPadOS 27: no Core ML route for Kokoro ANE is known to be safe. The default Metal-free route
-> (noise + tail on CPU) has crashed in libBNNS (`vadd_fp16_sme_internal` SIGSEGV) after ~1 h of
-> synthesis, and the Metal route aborts in MPSGraph within minutes. Both are uncatchable
-> in-process. Consider disabling Kokoro ANE on this OS line until a safe route is shown.
-> — FluidInference/FluidAudio#889
+| Path | Has `KokoroProsody_v2.mlmodelc`? |
+|---|---|
+| `FluidInference/kokoro-82m-coreml/ANE/` (upstream) | yes |
+| `FluidInference/kokoro-82m-coreml/ANE-zh/` (upstream) | yes |
+| `flyingfishinwater/fluidaudios/kokoro-82m-coreml/ANE/` (**ours**) | **no**: only `KokoroProsody.mlmodelc` |
+| `flyingfishinwater/fluidaudios/kokoro-82m-coreml/ANE-zh/` (**ours**) | **no** |
 
-`isBnnsCrashProneOS` flags **everything from iOS 26.4 onward** (macOS is clear from 26.6, and
-macOS 27 is unflagged).
+**Consequence if shipped as-is:** FluidAudio Kokoro produces no audio at all, on every install,
+new or existing, in English and Mandarin. The fork's explicit-directory patch (§4, patch 8) is
+designed not to reach HuggingFace, so the model store's per-file guard throws, and the
+`.cpuOnly` retry in `FluidAudioKokoroAneSpeaker.loadManagerIfNeeded` throws the same way.
+There is no compile error and no failing test: the catalogue's component is the whole `ANE`
+directory, so `FluidAudioCatalogueSchemaTests.assertCovers(…, scope: "ANE")` is satisfied by
+whatever the folder contains. This is the same failure class as tag-20260918's `KokoroNoise_v2`
+and PocketTTS renames.
 
-Why this matters more than it did last upgrade: before this merge the app could fall back to the
-standard CoreML Kokoro chain, which does not use this route. Upstream deleted it, so
-`FluidAudioKokoroAneSpeaker` is now the **only** FluidAudio Kokoro engine. On an iOS 27 device a
-long Text-to-Audio job is a crash candidate, and the crash is a SIGSEGV inside Apple's framework —
-`do/catch` cannot contain it.
+**Done in this branch:**
 
-Mitigations, in order of preference:
+- `fa-kokoro-82m` `components.revision` bumped **1 → 2** in all four tiers
+  (`helper/fluidaudio_model{,_test,_audit}.json`, `data/fluidaudio_model.json`, still
+  byte-identical). This makes existing installs report "not downloaded" and fetch the folder
+  again. **Not synced to S3.**
+- New gate `FluidAudioCatalogueSchemaTests.testKokoroAneStageNamesMatchTheMirroredRevision`
+  freezes `ModelNames.KokoroAne.requiredCoreMLModels` to the seven mirrored names and pins
+  revision 2. The next upstream stage rename fails that test by name.
 
-1. Ship no FluidAudio Kokoro on iOS 27 — the app already has three other Kokoro paths
-   (SherpaONNX, Core AI, MLX Audio). `SpeakerType.visibleCases` is the established mechanism for
-   hiding an engine the OS cannot run.
-2. Cap exposure: keep it for short read-aloud, exclude it from Text-to-Audio long-form jobs.
-3. Ship as-is and accept the crash risk.
+**Resolved 2026-09-28**, in this order:
 
-This is a product call, not a merge call — **it is not resolved in this branch.**
+1. Uploaded both bundles to the mirror, exactly as upstream publishes them (four files each; v2,
+   like upstream, ships no `metadata.json`). Mirror commit
+   [`3dbab147`](https://huggingface.co/flyingfishinwater/fluidaudios/commit/3dbab14721f1c46a903fe1ac0c4070e2bf5b230a).
+   The old `KokoroProsody.mlmodelc` is kept in both folders for older app versions. The
+   `weight.bin` SHA-256 fetched back from the mirror matches upstream: `ANE` `70eea4cd…`,
+   `ANE-zh` `9835a7d1…`.
+2. Re-listed the mirror tree: all eight files are present.
+3. Synced the test tier: `./sync_models_json.sh fluidaudio_model test`. **Audit and prod are not
+   synced**; they go out with the release.
 
-### 3.2 HIGH — `NemoTextProcessing` cannot be linked (build-breaking)
+The procedure, for the record:
 
-`feat(package): make NemoTextProcessing an opt-out trait (#880, #888)` adds a prebuilt Rust
-staticlib xcframework. It is a **static-library** xcframework, so Xcode unpacks its headers into
-`$BUILT_PRODUCTS_DIR/include/` — where the app's `libgit2.xcframework` (SwiftGit2) already puts
-its own. Both ship a `module.modulemap`, and the app build fails outright:
+1. Upload `KokoroProsody_v2.mlmodelc` from upstream into the mirror under **both**
+   `kokoro-82m-coreml/ANE/` and `kokoro-82m-coreml/ANE-zh/`. Use the Python API, as
+   `helper/docs/audio-fluidaudio.md` §5 describes:
+   ```python
+   from huggingface_hub import snapshot_download, HfApi
+   for v in ["ANE", "ANE-zh"]:
+       d = snapshot_download(repo_id="FluidInference/kokoro-82m-coreml",
+                             allow_patterns=[f"{v}/KokoroProsody_v2.mlmodelc/**"],
+                             local_dir="/Volumes/ssd2t/fluidaudio/_prosody_v2")
+   HfApi().upload_folder(repo_id="flyingfishinwater/fluidaudios",
+                         folder_path="/Volumes/ssd2t/fluidaudio/_prosody_v2",
+                         path_in_repo="kokoro-82m-coreml",
+                         allow_patterns=["ANE/KokoroProsody_v2.mlmodelc/**",
+                                         "ANE-zh/KokoroProsody_v2.mlmodelc/**"])
+   ```
+2. Re-list the mirror tree and confirm both bundles are present.
+3. Only then run `cd helper && ./sync_models_json.sh fluidaudio_model test`.
 
-```
-error: Multiple commands produce '.../Build/Products/Debug-iphonesimulator/include/module.modulemap'
-```
+**Cost of the revision bump:** the catalogue is remote and shared across app versions. Once the
+audit and prod tiers carry revision 2, **every device with FluidAudio Kokoro re-downloads the
+~1.4 GB pack, including devices still on older app versions.** Those devices keep working: they
+load `KokoroProsody.mlmodelc`, which stays in the mirror. The download is wasted for them,
+though. The alternative is worse, because without the bump the new app version cannot load
+Kokoro at all on an existing install. **Keep the old `KokoroProsody.mlmodelc` in the mirror**:
+older app versions still need it.
 
-The fork sets `.default(enabledTraits: [])` in `Package@swift-6.2.swift` to unblock the build.
+### 3.2 HIGH, reduced — iOS 27 Kokoro crash advisory is still in force
 
-**Correction to the first read of this**: because §2.8 turned `isNativeAvailable` into a
-compile-time constant, enabling the trait is no longer a no-op. Pre-upgrade the app's `ITNHelper`
-always fell through to `SwiftITN` (nothing ever linked a NeMo staticlib, so the `dlsym` probe
-always failed). Disabling the trait preserves exactly that behaviour — nothing regresses — but it
-also means the app **forgoes a real upgrade**: byte-exact NeMo inverse text normalization in 7
-languages for ASR output and the TTS frontends, replacing a hand-rolled Swift fallback that
-handles only cardinals, currency, percentages and ordinals.
+`KokoroAneManager.osAdvisory` is unchanged. It still flags every non-macOS OS ≥ 26.4, and on
+iOS 27 it still says *"no Core ML route for Kokoro ANE is known to be safe"* (#889). This merge
+**lowers but does not remove** the risk. The vocoder tail-slack fix (§1.1) addresses a
+confirmed BNNS past-the-end read on OS 27, which crashed on macOS 27. Upstream suspects #889 is
+the same class but has not verified it on iOS. The product decision recorded in tag-20260918
+§3.1 (keep, cap, or hide FluidAudio Kokoro on iOS 27) still stands. This merge is evidence for
+revisiting it, not a resolution.
 
-To claim it: repackage libgit2 as a framework-style xcframework
-(`thirdparty/SwiftGit2/build-xcframework.sh`) so the two stop sharing `include/`. Cost is roughly
-+8 MB per architecture slice.
+### 3.3 MEDIUM — `AsrModels.loadLocal` is stricter than `load`
 
-### 3.3 MEDIUM — offline diarization results change
+§5.1 moves Parakeet v3, v2 and Japanese onto `loadLocal`. What changes:
 
-`fix(offline-diarizer): pyannote-parity clustering` changes threshold semantics and constrained
-assignment; `fix(diarization): deterministic & robust offline VBx re-clustering (K-Means n_init)`
-changes initialization. Speaker labels and boundaries for the same recording will not match
-tag-20260509. Anything that stored diarization output and compares it across app versions will see
-a discontinuity. Upstream frames both as accuracy improvements.
+- A missing file is now a local `AsrModelsError.modelNotFound`. Before, `ModelHub` fetched it
+  from **upstream** `FluidInference/*`, not our mirror, which bypassed the pinning the mirror
+  exists for.
+- A model that fails to load is no longer purged and re-downloaded
+  (`ModelCache.purgeCorruptedCache` in `ModelHub.loadWithRecovery`). A transient ANE compile
+  failure used to cost the user the whole ~620 MB folder.
+- `loadLocal` rejects a vocabulary missing any id below the blank id. Checked against the
+  staged files in `/Volumes/ssd2t/fluidaudio`: v3 `parakeet_vocab.json` has 8192 contiguous
+  ids (blank 8192) and Japanese `vocab.json` has 3072 (blank 3072). Both pass.
+- Compute units are identical: preprocessor `.cpuOnly`, everything else from
+  `defaultConfiguration()` (`.cpuAndNeuralEngine`).
 
-### 3.4 WAS-BROKEN, NOW FIXED — Silero VAD model filename
+The risk is a file-name assumption the harness has not exercised. It is gated by
+`FluidAudioCatalogueRegressionTests`, whose `probeParakeet` now calls the same `loadLocal`.
 
-`Update Silero VAD CoreML artifact to v6.2.1` renamed `ModelNames.VAD.sileroVad` from
-`silero-vad-unified-256ms-v6.0.0` to `…-v6.2.1`. `VadManager.loadUnifiedModel` resolves the loaded
-bundle by that exact key, so a cache staged under the old name returns `nil` and throws
-`VadError.modelLoadingFailed` — FluidAudio VAD would have stopped working entirely after this
-upgrade, with no compile error to warn anyone.
+### 3.4 LOW, dormant — diarizer revision pin can wipe an app-staged folder
 
-Fixed by bumping the `fa-silero-vad` `components` in the four live config tiers
-(`helper/fluidaudio_model{,_test,_audit}.json`, `data/fluidaudio_model.json`;
-`_global.json` is an orphan with zero references repo-wide and was deliberately left alone).
-Existing installs will see the required component missing and re-download (~5 MB).
+For a pinned repo (`Repo.diarizer`), `ModelHub` treats a cache with no `.fluidaudio-revision`
+marker as stale. It marks every file incomplete and calls `ModelCache.prepareForDownload`,
+which **deletes the folder** and re-downloads from upstream. `DownloadManagerCoreML` never
+writes that marker. So the offline diarizer (`fa-speaker-diar`) would, on first load, delete a
+pack the app staged and fetch it again from `FluidInference/speaker-diarization-coreml`.
 
-**Now gated by `FluidAudioCatalogueSchemaTests`**, which asserts the row's components are a
-superset of `ModelNames.VAD.requiredModels` — composed from the constant, not copied as a
-string, so the next rename is a compile error or a named assertion failure rather than a silent
-break. Verified against the live HF tree: `silero-vad-unified-256ms-v6.2.1.mlmodelc` exists in
-`FluidInference/silero-vad-coreml` (1.1 MB).
+**Dormant today:** the three diarizer rows exist only in the orphaned
+`helper/fluidaudio_model_global.json`, so no shipping tier can download them. It must be
+handled before any diarizer row reaches a live tier. The simplest fix is
+`ModelRegistry.revisionOverrides["FluidInference/speaker-diarization-coreml"] = "main"` at
+startup, the escape hatch upstream added for mirrors.
 
-### 3.5 WAS-BROKEN, NOW FIXED — PocketTTS pack path and two model filenames
+### 3.5 LOW — PocketTTS phrasing changes
 
-`PocketTTS v2.1: fused flow decoder (ANE) + cond prefill + fp16 flowlm (~1.8× RTFx)` re-converted
-every language pack and changed three things the app's download config pins:
+Sentences over 50 tokens are now synthesized whole where the cache allows. Output for the same
+text will differ from tag-20260918 at those sentence boundaries. Upstream frames this as a fix
+(no more mid-clause breaks), but anything that compares PocketTTS audio across app versions will
+see a difference.
 
-| | tag-20260509 | tag-20260918 |
+### 3.6 NONE — everything else
+
+No other `ModelNames` constant used by a catalogue row changed; §3.1 is the only rename. No app
+code switches exhaustively over `KokoroAneVariant` or `AsrModelVersion`, both of which gained
+cases, so the new cases do not break compilation. `Package.swift` and `Package@swift-6.2.swift`
+still carry the fork's `.swiftLanguageMode(.v5)` and the disabled `NemoTextProcessing` trait.
+
+---
+
+## 4. Fork patches
+
+All 14 from tag-20260918 are carried unchanged: `Repo.overrideFolderNames`, the `ModelHub` and
+`G2PModel` / `MultilingualG2PModel` flat-layout fallbacks, the `VadManager` external-directory
+patch, `TtsCacheDirectory.overrideDirectory`, the PocketTTS `skipDownload` gates, the Kokoro ANE
+explicit-directory short-circuit, the G2P-skip, lexicon and voice-pack offline gates, the
+`StreamingEouAsrManager` per-utterance EOU fix, and Swift 5 language mode in both manifests.
+
+**Fixed in this merge**, patch 8 (`KokoroAneResourceDownloader.ensureModels` explicit-directory
+short-circuit). It chose the required set with `variant == .english ? requiredModels :
+requiredModelsZh`. Upstream grew `KokoroAneVariant` to five cases, so `.spanish`, `.french` and
+`.japanese` were held to Mandarin's `g2pw/` and `voices/zf_001.bin`. It now switches per
+variant, matching upstream's own switch below it. The only effect was a misleading warning
+(the patch never throws), but it would have misreported any Spanish or French adoption.
+
+**Not yet patched: two new upstream network paths**, both reachable only from the Spanish and
+French variants the app does not use:
+
+- `KokoroAneResourceDownloader.ensureLexiconCache(_:directory:)` (`es_`/`fr_lexicon_cache.json`)
+  resolves `<TtsCacheDirectory>/Models/kokoro/<file>` and downloads from upstream when it is
+  absent. It has no flat-layout check and no offline gate, unlike its English sibling
+  `ensureEnglishLexicon` (patch 12).
+- `KokoroAneResourceDownloader.ensureMultilingualG2PAssets` calls `ModelHub.download` for the
+  CharsiuG2P pair.
+
+Both need the patch-12 treatment before Spanish or French is wired (§5.2).
+
+---
+
+## 5. `libs/audio/fluidaudio/` audit
+
+### 5.1 ADOPTED — `AsrModels.loadLocal` for Parakeet v3 / v2 / Japanese
+
+`FluidAudioASR.loadManagerIfNeeded` used to write the process-global
+`Repo.overrideFolderNames[.parakeetV3 | .parakeetV2 | .parakeetJa] = cacheFolder` and then call
+`AsrModels.load(from:)`. That relied on `load` doing `directory.deletingLastPathComponent()` and
+re-appending the overridden `folderName`. It now calls
+`AsrModels.loadLocal(from: modelURL, version:)`, which is the upstream API made for exactly this
+case. Trade-offs are in §3.3. `FluidAudioCatalogueRegressionTests.probeParakeet` was changed to
+match, so the regression harness still exercises the app's own load path.
+
+With this change the app no longer writes `Repo.overrideFolderNames` anywhere. The fork patch
+that adds it stays, because the regression harness and `FluidAudioVAD`'s open issue
+(tag-20260918 §3.12, which suggested an override for `.vad`) may still want it.
+
+### 5.2 NOT ADOPTED, worth doing — Kokoro Spanish and French
+
+The `fa-kokoro-82m` catalogue already lists `ef_dora`, `em_alex`, `em_santa` and `ff_siwis` and
+advertises `es`/`fr` in `language_list`. Today those voices run on the **English** variant, so
+Spanish or French text is spoken through English G2P with a Spanish or French timbre.
+Upstream's new variants fix that **without a new speaker class**: `FluidAudioKokoroAneSpeaker`
+would map the `ef_`/`em_` prefixes to `.spanish` and `ff_` to `.french` when constructing
+`KokoroAneManager`. Prerequisites:
+
+1. Mirror `es_lexicon_cache.json` (3.9 MB) and `fr_lexicon_cache.json` (13.6 MB) to the
+   `kokoro-82m-coreml/` root. Neither is in our mirror today. `MultilingualG2PEncoder/Decoder.mlmodelc`
+   already are.
+2. Add the flat-layout + offline gates from §4 to `ensureLexiconCache` and
+   `ensureMultilingualG2PAssets`.
+3. Reload the manager when the voice crosses a language, since a manager is bound to one
+   variant. The seven stage bundles are the same `ANE/` files, so this costs a reload, not a
+   download.
+4. Bump `fa-kokoro-82m` `components.revision` again if the lexicons join the default download.
+
+### 5.3 ADOPTED — SenseVoice detected language
+
+The SenseVoice branch now calls `transcribeDetailed(audio:)` and returns the model's language
+tag in `ASRResult.language`, falling back to the caller's hint. SenseVoice takes no language
+input, so the tag is what was actually recognised. That matches how `WhisperKitASR` fills the
+same field. A `nospeech` tag is treated as no language. The text is identical to
+`transcribe(audio:)`, which is now a wrapper over `transcribeDetailed`.
+
+### 5.4 RECOMMENDED, not applied — `FluidAudio.AppLogger.minimumLevel`
+
+In Debug builds FluidAudio mirrors every log level to stderr, and some ASR debug lines include
+recognised words. `FluidAudio.AppLogger.minimumLevel = .info` at startup keeps transcript text
+out of both `os_log` and the console. Release builds already go to `os_log` only, so the benefit
+is limited to developer builds. The type is qualified as `FluidAudio.AppLogger` because the app
+has its own `AppLogger`.
+
+### 5.5 Free — no app change needed
+
+- Parakeet `memset`/`memcpy` speedup (§2.3).
+- Kokoro long-text chunking (§2.1). `FluidAudioKokoroAneSpeaker.splitIntoChunks` stays: it is
+  what gives `speakText` its per-chunk playback and `onChunkStarted` callbacks, not a length
+  workaround any more.
+- Kokoro vocoder tail slack (§3.2).
+- PocketTTS long-sentence handling (§1.3).
+
+### 5.6 Still standing from tag-20260918 §5
+
+The Parakeet v3 GPU encoder, the `.int8V2` encoder, the EOU fused decoder, PocketTTS `.ane`
+placements, and `ModelHub.offlineMode` are unchanged by this merge. The recommendations there
+still apply.
+
+---
+
+## 6. New models that would need new app code
+
+**None is required for this upgrade.** If you want any of these, this is the work:
+
+| Model | New class? | What it takes |
 |---|---|---|
-| `PocketTtsLanguage.repoSubdirectory` | `v2/<lang>` | `v2.1/<lang>` |
-| conditioner | `cond_step.mlmodelc` | `cond_prefill.mlmodelc` |
-| flow decoder | `flow_decoder.mlmodelc` | `flow_decoder_fused.mlmodelc` |
-
-`ModelNames.PocketTTS.requiredModels(precision:placement:)` checks the new names, so a pack staged
-under the old ones fails `allPresent`, fails the flat-layout fallback, and — because the app passes
-`skipDownload: true` — throws `PocketTTSError.modelNotFound`. **PocketTTS would have produced no
-audio at all, in any of the six languages, with no compile error to warn anyone.**
-
-Fixed by updating `repo_subpath` and `components` for all six `fa-pocket-tts-*` rows in the four
-live config tiers. Existing installs re-download the pack (~750 MB each). The `size` fields were
-left alone; `feat(tts/pockettts): … slim language-pack downloads ~40%` suggests the real figure is
-now lower, but upstream publishes no per-pack number — **re-measure on device and correct the
-config.**
-
-**Now gated by `FluidAudioCatalogueSchemaTests`** on both axes: the components against
-`ModelNames.PocketTTS.requiredModels(precision: .fp16, placement: .gpu)`, and `repo_subpath`
-against `PocketTtsLanguage.repoSubdirectory` — the engine's own copy of the path, so the two can
-no longer drift apart unnoticed. Verified against the live HF tree: `v2.1/english/` contains
-`cond_prefill.mlmodelc` and `flow_decoder_fused.mlmodelc`.
-
-### 3.6 MEDIUM — 54 English Kokoro voices are newly reachable, and only the first is proven
-
-`tts_fluidKokoro_voice` now actually reaches synthesis on the ANE chain, where it previously did
-nothing. 53 of those voices have never been exercised through this app. Each non-`af_heart` voice
-takes a conversion path on first use (repo-root `voices/<name>.json` → flat fp32 `.bin`) that the
-fork patched to work offline; a voice whose JSON was not staged fails at synthesis time, not at
-load time. Worth a pass over the voice list on device before release.
-
-### 3.7 RESOLVED — Mandarin ASR replacement is wired
-
-`fa-parakeet-ctc-zh-cn` and `fa-qwen3-asr` are gone from the catalog. **Both upstream
-replacements are now adopted**, so this is no longer a feature removal:
-
-| New row | Manager | Size (int8) | Notes |
-|---|---|---|---|
-| `fa-paraformer-zh` | `ParaformerManager` | 222 MB | Mandarin, **has timestamps** (`transcribeWithTimestamps` → `[TimestampedSegment]`, maps 1:1 onto `ASRSegment`) |
-| `fa-sensevoice` | `SenseVoiceManager` | 240 MB | zh/en/yue/ja/ko, auto-detect, text only |
-
-Both ship int8 rather than fp16: 222 MB vs 436 MB and 240 MB vs 473 MB, at an upstream-measured
-identical CER (2.12% for Paraformer on AISHELL). Both beat what they replace on size *and*
-accuracy — `fa-parakeet-ctc-zh-cn` was 571 MB at 8.2% CER, `fa-qwen3-asr` 600 MB.
-
-Each gets its **own `else if` branch** in `FluidAudioASR.loadManagerIfNeeded`, never the generic
-fallthrough: that branch sets `Repo.overrideFolderNames` only for `parakeetV3`/`parakeetV2`, so a
-new id falling through it would resolve against the bare HuggingFace slug — the bug recorded in
-`helper/docs/plans/fix-fluidaudio-model-files-looked-up-at-wrong.md`. Neither new loader needs
-the override at all; both open the `.mlmodelc` bundles directly inside the directory.
-
-**Stored ids self-heal.** `FluidAudioASR.retiredModelMigrations` maps `fa-parakeet-ctc-zh-cn` →
-`fa-paraformer-zh` and `fa-qwen3-asr` → `fa-sensevoice` — a directed migration rather than a
-reset to the English default, so a Mandarin user lands on the Mandarin replacement.
-`healStoredModelId()` **persists** the correction; the pre-existing half-fix in `ASRSettingView`
-fell back in the picker but never wrote it back, so `FluidAudioASR.init` kept reading the dead id
-from iCloud KV and loading nothing. Covered by `FluidAudioASRDispatchTests`.
-
-### 3.8 LOW — download-stack surface is entirely new code
-
-Every byte the app fetches from HuggingFace for FluidAudio now goes through code written in this
-range (resume, stall watchdog, concurrency, artifact validation). It is better-tested upstream than
-what it replaces and has explicit regression tests (`DownloadArtifactValidationTests`,
-`DownloadCancellationTests`), but it is new. The app's own `DownloadManagerCoreML` does the actual
-staging, so the blast radius is limited to the paths the fork deliberately gates with
-`skipDownload` / the cache override.
-
-### 3.9 PRE-EXISTING, NOW FIXED — `fa-parakeet-ctc-ja` named a dead repo and the wrong file set
-
-`FluidAudioASR` loads Japanese with `AsrModels.load(from:version:.tdtJa)`, whose
-`ModelNames.TDTJa.requiredModels` is `Preprocessor.mlmodelc`, `Encoder.mlmodelc`,
-`Decoderv2.mlmodelc`, `Jointerv2.mlmodelc`. The app's config instead required
-`Preprocessor.mlmodelc`, `Encoder.mlmodelc`, `CtcDecoder.mlmodelc`, `vocab.json`. `TDTJa` did
-**not** change in this range, so this predates the upgrade.
-
-Building the schema gate surfaced the rest of it: the row's `repo` was
-`FluidInference/parakeet-ctc-0.6b-ja-coreml`, which **no longer exists** (the HF tree API returns
-404), while `Repo.parakeetJa` is `FluidInference/parakeet-0.6b-ja-coreml`. So Japanese ASR could
-not work on any fresh install — the download either failed outright or staged CTC files the TDT
-loader never opens.
-
-Fixed: the row now points at `FluidInference/parakeet-0.6b-ja-coreml` with the TDT file set
-(619 MB measured from the live tree), `cache_folder` and `FluidAudioASR.repoMap` follow, and
-`FluidAudioCatalogueSchemaTests` asserts the components against `ModelNames.TDTJa.requiredModels`.
-Devices holding the old folder re-download. The transcript itself still has **no oracle** in the
-repo — the regression harness records the Japanese row as `oracle: false` rather than implying a
-verified result.
-
-### 3.11 PRE-EXISTING, NOW FIXED — `fa-parakeet-tdt-v3` never downloaded its joint decoder
-
-Found by the same schema gate. `AsrModels.load(from:)` defaults to `version: .v3`, and
-`getModelFileNames` returns `Names.jointV3File` — `JointDecisionv3.mlmodelc` — for v3
-**exclusively**; the unsuffixed `JointDecision.mlmodelc` is the v2/110m/ja file. The catalogue
-listed only the unsuffixed one, so a fresh download produced a directory that throws
-`AsrModelsError.loadingFailed("Failed to load joint model JointDecisionv3.mlmodelc")` at load.
-
-It went unnoticed because developer machines were staged before `jointV3File` became the v3
-default and still have both bundles on disk. Fixed by adding `JointDecisionv3.mlmodelc` to the
-row's components (and correcting `size` to 620 MB); gated by `FluidAudioCatalogueSchemaTests`
-against `ModelNames.ASR.requiredModelsV3(precision: .int8)`.
-
-**This is the argument for the static tier.** Three of the five breakages in this document are
-one catalogue string disagreeing with one engine constant, and none of them produced a compile
-error, a failing test, or a runtime error anywhere a developer would see it.
-
-### 3.12 OPEN, PRE-EXISTING — `fa-silero-vad` never loads the bundle we download
-
-Found by the first FluidAudio regression baseline, 2026-09-18. **Not fixed here.**
-
-`VadManager(config:modelDirectory:)` hands the directory straight to
-`ModelHub.loadModels(.vad, directory:)`, which resolves
-`directory.appendingPathComponent(repo.folderName)`. `FluidAudioVAD` passes the pack root, so
-the loader looks in `…/FluidInference_silero-vad-coreml/silero-vad-coreml/` — a directory
-`DownloadManagerCoreML` never creates. No `Repo.overrideFolderNames[.vad]` is set, and
-`ModelHub` has no flat-root fallback on this path.
-
-Consequence: the app re-downloads the ~1 MB bundle into a nested subdirectory on first use and
-then works, so this has been invisible; the selective download we pay for is discarded. On a
-read-only model stage it surfaces as an EPERM instead.
-
-Two-line fix, mirroring the Parakeet paths: set `Repo.overrideFolderNames[.vad] = cacheFolder`
-and pass the PARENT directory to `VadManager`. Worth confirming against §3.4 before shipping —
-the v6.2.1 component bump is correct either way, but nobody has yet seen the app load the
-staged file.
-
-### 3.13 MEASURED — Paraformer cannot transcribe past 30 s in one call
-
-The regression ladder measured a ceiling the plan had wrong. `decoderEncFrames = 512` and
-`decoderMaxTokens = 128` are real, but they are not what bites first: the PREPROCESSOR rejects
-anything outside `3200..480000` samples, so a 39.19 s clip throws
-`Size (626960) of dimension (1) is not in allowed range` before the decoder is reached.
-
-`FluidAudioASR` does no chunking for Paraformer, so Mandarin transcription of anything longer
-than 30 s currently fails outright rather than truncating. The harness pins this as the 5x
-rung's PASS condition, so it will notice if the cap ever moves — but the app-side chunking is
-an open product question, not something the gate can fix.
-
-Also measured, for the record: Paraformer returns
-`…在北京见证…较长的监督史` for `…在北京建政…较长的建都史` on the test clip — two homophone
-substitutions, 13.3% CER on a 30-hanzi sentence. Upstream's 2.12% is a corpus average; a single
-short utterance is a much noisier estimate, and the gate's ceiling is set at 20% accordingly.
-
-### 3.10 LOW — Swift 6.2+ manifest shadowing
-
-`Package@swift-6.2.swift` is new upstream and **shadows `Package.swift` on Swift 6.2+ toolchains**.
-The fork's `.swiftLanguageMode(.v5)` pin lived only in `Package.swift`, so on the Swift 6.4
-toolchain in use it silently stopped applying and the fork's mutable statics
-(`Repo.overrideFolderNames`, `TtsCacheDirectory.overrideDirectory`) failed strict-concurrency
-checks. The pin is now duplicated into both manifests. **Any future upgrade that touches either
-manifest must keep them in sync.**
+| **Parakeet Ultra** (`AsrModelVersion.ultra`) | **No**, a branch in `FluidAudioASR` | Mirror `FluidInference/parakeet-ultra-coreml`, add an `fa-parakeet-ultra` row + `repoMap` entry, and dispatch `loadLocal(from:version: .ultra)` (the §5.1 change makes this one line). Same size class as v3 (~620 MB). **Best candidate**: more accurate than v3 on every set upstream measured, at ~v3 speed, and upstream now recommends it |
+| **Parakeet Redux** (`.redux`) | **No**, same branch | Same wiring as Ultra. A smaller download (183 MB encoder) but **iOS 18+ only**, less accurate on English, ~35% slower, and a ~7 min first ANE compile on a Mac. It only makes sense as a "small download" option |
+| **Nemotron 3 Diarization** | **Yes, a new diarizer case**: a fourth `DiarizerType` in `FluidAudioDiarizer`, around `Nemotron3Diarizer` + `Nemotron3Models` | Different API shape from LS-EEND / Sortformer (`Nemotron3ChunkResult`, `Nemotron3Diarizer.segments(…)`), 8 speakers vs Sortformer's 4, 10 ms resolution. Needs catalogue rows too, and **no FluidAudio diarizer row is in any live tier today** (§3.4) |
+| **LocalVQE** (echo cancellation / noise suppression) | **Yes, a new component type**, not a speaker, ASR, VAD or diarizer | A pre-ASR enhancement stage (`LocalVqeStream`) for voice chat, where the app's own TTS leaks into the mic. **Beta**, 16 kHz only, CPU default, live-device behaviour unvalidated upstream |
+| **Kokoro Spanish / French** | **No**, extends `FluidAudioKokoroAneSpeaker` | §5.2 |
 
 ---
 
-## 4. Fork patches carried forward
-
-All re-applied and verified against the new APIs:
-
-1. `Repo.overrideFolderNames` — app-controlled local folder names (`ModelNames.swift`, no conflict).
-2. `ModelHub.loadModelsOnce` flat-layout fallback (was `DownloadUtils.loadModelsOnce`).
-3. `VadManager.loadUnifiedModel` — skip the `Models/` level when given an external directory.
-4. `TtsCacheDirectory.overrideDirectory` (was `TtsModels.overrideCacheDirectory`).
-5. `G2PModel.resolveAssetURL` — flat-layout fallback for `g2p_vocab.json` and the G2P mlmodelcs.
-6. `MultilingualG2PModel.modelsDirectory(base:)` — nested-vs-flat resolution.
-7. PocketTTS `skipDownload` gate on `ensureModels` / `ensureMimiEncoder` / `ensureVoice`, plus the
-   flat-layout fallbacks, merged with upstream's new `placement` / `computeUnits` parameters.
-8. `KokoroAneResourceDownloader.ensureModels` — explicit-directory short-circuit.
-9. `KokoroAneManager.initialize` — skip the G2P download when the override directory already holds
-   the assets, merged with upstream's new best-effort lexicon prefetch.
-10. `StreamingEouAsrManager` per-utterance EOU fix. Upstream refactored the debounce into the pure
-    `evaluateEouDebounce`, which resets the *anchor* on new tokens but still never clears the sticky
-    `eouDetected` outside `reset()`/`finish()` — so both halves of the fork patch are still needed.
-    The token clear now also clears the two new token-aligned side arrays
-    (`accumulatedTokenTimestampsMs`, `accumulatedRawTokenStrings`) to preserve their documented
-    alignment invariant.
-11. `Package.swift` Swift 5 language mode — **also added to `Package@swift-6.2.swift`** (see §3.7).
-    The stale `exclude: ["Frameworks"]` was dropped; that directory no longer exists.
-
-### New fork patches this upgrade
-
-12. `KokoroAneResourceDownloader.ensureEnglishLexicon` — flat-layout check plus a hard offline gate
-    when `TtsCacheDirectory.overrideDirectory` is set. Upstream added this best-effort fetch to
-    `KokoroAneManager.initialize`; unpatched it reaches HuggingFace from the app sandbox on every
-    English load.
-13. `KokoroAneResourceDownloader.ensureVoicePack` — convert a **locally staged** repo-root
-    `voices/<name>.json` before considering a network fetch, so all 54 English voices work offline
-    from files `DownloadManagerCoreML` already downloads.
-14. `PocketTtsResourceDownloader.ensurePackMimiEncoder` — flat-layout check and `skipDownload` gate.
-    New upstream function on the non-English voice-cloning path; unpatched it ignores the caller's
-    directory and downloads unconditionally.
-
----
-
-## 5. Performance APIs available to `libs/audio/fluidaudio/` — audit result
-
-Nothing in the app's wrappers is **broken** by the new APIs (every old signature the app calls is
-still source-compatible). These are the opt-in wins, with what each would actually cost.
-
-### 5.1 Parakeet v3 GPU encoder placement — **do not adopt unconditionally**
-
-`AsrModels.load(from:configuration:version:encoderPrecision:encoderComputeUnits:progressHandler:)`
-gained `encoderComputeUnits: MLComputeUnits?` (default `nil` → ANE). `.cpuAndGPU` is +~8% RTFx,
-WER-neutral; upstream's own doc keeps ANE as the iOS default for power efficiency.
-
-The app calls it at `FluidAudioASR.swift:238` and `:265` without the parameter. Adopting it would
-have to be gated on `!forceCPU` — `ASRProtocol.swift:215` documents `forceCPU` as existing "for the
-keyboard extension and in the background main app where GPU access is revoked". A blanket
-`.cpuAndGPU` would break background and keyboard transcription outright. 8% for a battery cost and a
-new conditional is a thin trade; **recommend leaving it.**
-
-### 5.2 Parakeet `.int8V2` encoder — needs a download-config change first
-
-`ParakeetEncoderPrecision` gained `.int8V2` (`Encoder_v2.mlmodelc`, 568 MB vs 425 MB). The app never
-passes `encoderPrecision`, so it stays on `.int8`. Adopting means adding `Encoder_v2.mlmodelc` to the
-`fa-parakeet-tdt-v3` components and shipping a bigger model for an unquantified accuracy delta.
-**Not recommended without a measured comparison.**
-
-### 5.3 EOU fused decoder — not reachable
-
-`+7–9% RTFx` sounds attractive but there is no API for it. `StreamingEouAsrManager.loadModels(from:)`
-enables it only when `FLUID_EOU_FUSED=1` **and** `decoder_joint_decision_fused.mlmodelc` sits in the
-model directory. That filename is not in `ModelNames.ParakeetEOU.requiredModels`, so the standard
-download never fetches it. Upstream keeps it off by default because the fused fp16 graph is not
-bit-exact with the two-model reference. Adopting needs a config entry *and* an env var the app
-cannot set for itself. **Not adoptable as shipped.**
-
-### 5.4 PocketTTS `.ane` / `.aneState` — needs different model files
-
-`PocketTtsManager.init` gained `placement:` and `computeUnits:`; the app passes neither, so it runs
-`.gpu` + `.default`. Note the `~1.8× RTFx` headline belongs to the **v2.1 re-conversion the app
-already gets**, not to switching placement. `.ane` loads different artifacts (`flowlm_step_ane`,
-`cond_prefill_ane`) and `.aneState` a `pocket_state.mlmodelc` multifunction package (macOS 15+/iOS
-18+ at runtime); both need new `components` entries. Upstream's own residency note is sobering: only
-`flow_decoder_fused` actually lands on the ANE, and the earlier "flowlm 1.97× on ANE" claim *"did not
-reproduce on-device."* The genuinely useful piece is `PocketTtsComputeUnits.avoidNeuralEngine` as a
-**fallback** when a stage aborts on specific hardware, mirroring the ANE speaker's existing
-`.default` → `.cpuOnly` retry. **Recommend the fallback only.**
-
-### 5.5 Kokoro ANE compute units — already correct, by accident
-
-`KokoroAneComputeUnits.default` became a **computed, OS-conditional** property:
-`majorVersion >= 27 ? .aneTailCpu : .aneTailGpu`. The app passes `.default`
-(`FluidAudioKokoroAneSpeaker.swift:394`), so it automatically picks up the OS-27 routing with no
-change. Worth knowing that `.aneTailCpu` is documented as *"the lesser evil, not a safe one"* — see
-§3.1.
-
-### 5.6 Diarizer — two free wins, both small
-
-- `OfflineDiarizerManager.process(audio:progressCallback:)` — the app calls
-  `process(audio: samples)` at `FluidAudioDiarizer.swift:84` and `:119` with no progress callback, so
-  a long meeting shows no progress. The parameter is defaulted, so wiring it is additive.
-- `prepare()` / `cluster()` split — lets segmentation+embeddings be computed once and re-clustered
-  with different settings. Only worth it if the app ever re-runs clustering, which it does not today.
-- `exposeChunkEmbeddings` / `DiarizationResult.chunkEmbeddings` — off by default; no app use case yet.
-- The LS-EEND memory-leak fix is internal and needs no app change.
-
-### 5.7 `ModelHub.offlineMode` — **not** a drop-in for `skipDownload`
-
-Process-wide, not per-call. The app deliberately passes `skipDownload: false` in one place
-(`FluidAudioPocketTTSSpeaker.swift:432`, mimi encoder on first use for voice cloning); `offlineMode`
-would block that too. It also throws `DownloadError.networkDisabled` / `.modelMissing` instead of
-`PocketTTSError.modelNotFound`, so existing catches stop matching. It does add one guarantee the fork
-flags lack — it blocks `loadModels`' retry-with-redownload fallback, so a corrupt-detected
-`.mlmodelc` surfaces the load error instead of wiping the cache. **Worth considering later as a
-belt-and-braces addition, not a replacement.**
-
----
-
-## 6. Deliberately not adopted
+## 7. Deliberately not adopted
 
 | Upstream addition | Why not |
 |---|---|
-| `ModelHub.offlineMode` | Overlaps the fork's per-call `skipDownload` flags. Consolidating is a clean follow-up, not a merge requirement |
-| ~~Paraformer-large (zh), SenseVoiceSmall~~ | **Adopted** 2026-09-18 — see §3.7 |
-| Nemotron 3.5 Multilingual (40 locales), Parakeet Unified 0.6B, Canary-1B-v2 [beta] | New ASR backends; no app wrapper |
-| Kokoro `ANE-ja` pack | Upstream ships it; the app neither downloads nor offers Japanese |
-| Supertonic-3 (**31 languages**, 44.1 kHz, ~398 MB) | New TTS backend; no app wrapper. The commit title says "10-lang results" — that is the benchmark subset, not the model's coverage |
-| LuxTTS, NeuTTS-2E [beta], Chatterbox (Multilingual + Nano), Inflect v2 [beta], StyleTTS2 | New TTS backends; no app wrapper |
-| FSMN-VAD [beta], CAM++ speaker embeddings [beta] | New VAD / speaker backends; no app wrapper |
-| PocketTTS `.ane` / `.aneState` placements, per-stage compute units | Available and plumbed through the fork's patches; the app still passes the `.gpu` default |
-| Parakeet v3 GPU encoder placement, int8 Encoder_v2, EOU fused decoder | Opt-in perf flags the app does not set |
+| CUA-S1-FORMS decision scorer | Not audio; the app's decision engine is Laya |
+| LuxTTS chunking and pause fixes | LuxTTS has no app wrapper |
+| Custom-vocabulary SIGBUS fix | The app does not use vocabulary boosting |
+| `normalizedText` / `phonemes` on `KokoroAneSynthesisResult` | No word-highlighting consumer for this engine |
+| NemoTextProcessing v0.3.1 | The trait stays disabled in the fork (tag-20260918 §3.2) |
+| Diarizer `revisionOverrides` | Nothing to override until a diarizer row ships (§3.4) |
+
+---
+
+## 8. Verification (2026-09-28)
+
+| Check | Result |
+|---|---|
+| iOS Simulator test build (`AIAssistantFunctionTests`) | build succeeded |
+| macOS test host (`AIAssistantMacUnitTests`, built by the harness) | build succeeded |
+| `FluidAudioCatalogueSchemaTests` (incl. the new `testKokoroAneStageNamesMatchTheMirroredRevision`) | 10/10 pass |
+| `FluidAudioASRDispatchTests` | 11/11 pass |
+| `FluidAudioKokoroAneSpeakerTests` | 4/4 pass |
+| `run_fluidaudio_tests.py --type stt` on real weights (`/Volumes/ssd2t/fluidaudio`) | **5/5 PASS**: Parakeet v3 via `loadLocal` similarity 1.0; Japanese via `loadLocal` loads and decodes (no oracle); SenseVoice CER 0.10; Paraformer CER 0.133; EOU similarity 0.909 |
+| `run_fluidaudio_tests.py --only kokoro`, before the mirror upload | **2/2 FAIL, as predicted by §3.1**: `KokoroAneError: KokoroAne model 'KokoroProsody_v2.mlmodelc' not loaded`, for both `ANE` and `ANE-zh` |
+| Same, after the upload, with `KokoroProsody_v2.mlmodelc` re-staged **from our mirror** | `ANE` (English) **PASS**, 3.375 s of audio, rms 0.047. `ANE-zh` fails with `You don't have permission to save the file "g2p" in the folder "ANE-zh"`. That is the known read-only-stage limit documented in `helper/docs/audio-fluidaudio.md` (Mandarin G2P fetches its text assets lazily), identical to both tag-20260918 runs, and it now fails *after* the stage models load instead of at the missing prosody bundle |
+
+Reports: `/Volumes/ssd2t/modeltests/reports/fluidaudio-20260928-143244.md` (stt),
+`fluidaudio-20260928-143336.md` (kokoro, before the upload), `fluidaudio-20260928-143955.md`
+(kokoro, after).
