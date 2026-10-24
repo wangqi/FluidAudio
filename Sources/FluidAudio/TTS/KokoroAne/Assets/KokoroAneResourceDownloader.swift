@@ -100,6 +100,24 @@ public enum KokoroAneResourceDownloader {
         return repoDir
     }
 
+    /// Folder of the Mandarin bundle that holds the pinyin dicts and jieba HMM tables as the
+    /// repo publishes them (`ANE-zh/assets/`, the last path component of
+    /// `KokoroAneConstants.g2pRemoteSubdir`). A host app that stages the pack itself has them here.
+    // wangqi modified 2026-10-24
+    static let stagedMandarinAssetsSubdir = "assets"
+
+    /// First `<repoDirectory>/<subdir>` (in order) that holds every one of `files`, or nil.
+    // wangqi modified 2026-10-24
+    static func stagedDirectory(in repoDirectory: URL, subdirs: [String], files: [String]) -> URL? {
+        for subdir in subdirs {
+            let dir = repoDirectory.appendingPathComponent(subdir)
+            if files.allSatisfy({ FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path) }) {
+                return dir
+            }
+        }
+        return nil
+    }
+
     /// Ensure the Mandarin G2P binary dictionaries (`pinyin_phrases.bin`,
     /// `pinyin_single.bin`) are resident under `<repoDir>/g2p/`. The
     /// uncompressed `.bin` artefacts are pulled from
@@ -113,6 +131,26 @@ public enum KokoroAneResourceDownloader {
         repoDirectory: URL,
         progressHandler: ProgressHandler? = nil
     ) async throws -> URL {
+        // Flat lookup + offline gate, as the lexicon / multilingual G2P gates have: a host app
+        // that points `TtsCacheDirectory.overrideDirectory` at its own download folder stages the
+        // pack as the repo ships it (`ANE-zh/assets/pinyin_*.bin`), not under the lazy `g2p/`
+        // cache. Use `g2p/` (a cache a previous lazy fetch filled) or `assets/`, else throw
+        // instead of fetching from HuggingFace in the app sandbox. Checked before anything is
+        // created so a read-only stage works.
+        // wangqi modified 2026-10-24
+        if let override = TtsCacheDirectory.overrideDirectory {
+            let files = [KokoroAneConstants.g2pPinyinPhrasesFile, KokoroAneConstants.g2pPinyinSingleFile]
+            if let staged = stagedDirectory(
+                in: repoDirectory, subdirs: [KokoroAneConstants.g2pSubdir, stagedMandarinAssetsSubdir],
+                files: files)
+            {
+                return staged
+            }
+            throw KokoroAneError.downloadFailed(
+                "Mandarin G2P assets \(files) not staged under \(repoDirectory.path) "
+                    + "(override \(override.path)); downloads are disabled by the cache override")
+        }
+
         let g2pDir = repoDirectory.appendingPathComponent(KokoroAneConstants.g2pSubdir)
         if !FileManager.default.fileExists(atPath: g2pDir.path) {
             try FileManager.default.createDirectory(
@@ -322,6 +360,27 @@ public enum KokoroAneResourceDownloader {
     public static func ensureMandarinJiebaHmm(
         repoDirectory: URL
     ) async -> URL? {
+        // Same staged-pack lookup + offline gate as `ensureMandarinG2P`: with the cache override
+        // set, read `g2p/` or the shipped `assets/` and return nil (dict-only segmentation)
+        // instead of downloading when a table is missing.
+        // wangqi modified 2026-10-24
+        if let override = TtsCacheDirectory.overrideDirectory {
+            let files = [
+                KokoroAneConstants.jiebaHmmStartFile, KokoroAneConstants.jiebaHmmTransFile,
+                KokoroAneConstants.jiebaHmmEmitFile,
+            ]
+            if let staged = stagedDirectory(
+                in: repoDirectory, subdirs: [KokoroAneConstants.g2pSubdir, stagedMandarinAssetsSubdir],
+                files: files)
+            {
+                return staged
+            }
+            logger.warning(
+                "Jieba HMM tables \(files) not staged under \(repoDirectory.path) (override \(override.path)); "
+                    + "downloads are disabled by the cache override, HMM segmentation disabled.")
+            return nil
+        }
+
         let g2pDir = repoDirectory.appendingPathComponent(KokoroAneConstants.g2pSubdir)
         if !FileManager.default.fileExists(atPath: g2pDir.path) {
             do {
@@ -392,6 +451,30 @@ public enum KokoroAneResourceDownloader {
     public static func ensureMandarinG2pw(
         repoDirectory: URL
     ) async -> URL? {
+        // Offline gate: with the cache override set, the staged pack ships `g2pw/vocab.txt` and
+        // `g2pw/POLYPHONIC_CHARS.txt` at the repo's own path. Use them, or return nil (dict-only
+        // Mandarin) instead of fetching from HuggingFace in the app sandbox.
+        // wangqi modified 2026-10-24
+        if let override = TtsCacheDirectory.overrideDirectory {
+            let files = [KokoroAneConstants.g2pwVocabFile, KokoroAneConstants.g2pwPolyphonicCharsFile]
+            guard
+                let staged = stagedDirectory(
+                    in: repoDirectory, subdirs: [KokoroAneConstants.g2pwSubdir], files: files)
+            else {
+                logger.warning(
+                    "g2pW assets \(files) not staged under \(repoDirectory.path) (override \(override.path)); "
+                        + "downloads are disabled by the cache override, Mandarin G2P will run dict-only")
+                return nil
+            }
+            let modelURL = staged.appendingPathComponent(KokoroAneConstants.g2pwModelBundle)
+            guard FileManager.default.fileExists(atPath: modelURL.path) else {
+                logger.warning(
+                    "g2pW CoreML bundle missing at \(modelURL.path) — Mandarin G2P will run dict-only")
+                return nil
+            }
+            return staged
+        }
+
         let g2pwDir = repoDirectory.appendingPathComponent(KokoroAneConstants.g2pwSubdir)
         if !FileManager.default.fileExists(atPath: g2pwDir.path) {
             do {
