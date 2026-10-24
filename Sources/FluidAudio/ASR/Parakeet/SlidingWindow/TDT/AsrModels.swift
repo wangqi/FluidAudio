@@ -12,6 +12,10 @@ public enum AsrModelVersion: Sendable {
     /// Parakeet Ultra (moondream): full-precision post-training of v3. Same
     /// architecture and contract as v3; the encoder ships int8-linear.
     case ultra
+    /// Phonon-2 (Fermion Research): quantization-aware re-training of v3,
+    /// English only. Same architecture and contract as v3; the encoder ships
+    /// as exact five-value palettes (iOS 18+).
+    case phonon2
     /// 110M parameter hybrid TDT-CTC model with fused preprocessor+encoder
     case tdtCtc110m
     /// 600M parameter TDT model for Japanese (ja) - hybrid CTC preprocessor/encoder + TDT decoder/joint v2
@@ -23,6 +27,7 @@ public enum AsrModelVersion: Sendable {
         case .v3: return .parakeetV3
         case .redux: return .parakeetRedux
         case .ultra: return .parakeetUltra
+        case .phonon2: return .phonon2
         case .tdtCtc110m: return .parakeetTdtCtc110m
         case .tdtJa: return .parakeetJa
         }
@@ -49,7 +54,7 @@ public enum AsrModelVersion: Sendable {
     public var blankId: Int {
         switch self {
         case .v2, .tdtCtc110m: return 1024
-        case .v3, .redux, .ultra: return 8192
+        case .v3, .redux, .ultra, .phonon2: return 8192
         case .tdtJa: return 3072
         }
     }
@@ -62,12 +67,12 @@ public enum AsrModelVersion: Sendable {
         }
     }
 
-    /// v3 and its weight-compatible derivatives (Redux, Ultra). Gates the v3-only
+    /// v3 and its weight-compatible derivatives (Redux, Ultra, Phonon-2). Gates the v3-only
     /// decode behaviours: `TdtDecoderV3`, silence-aligned chunking, blank
     /// recovery and the JointDecisionv3 top-K contract.
     public var isV3Family: Bool {
         switch self {
-        case .v3, .redux, .ultra: return true
+        case .v3, .redux, .ultra, .phonon2: return true
         default: return false
         }
     }
@@ -85,6 +90,11 @@ public struct AsrModels: Sendable {
     public let joint: MLModel
     /// Optional CTC decoder head for custom vocabulary (encoder features → CTC logits)
     public let ctcHead: MLModel?
+    /// Shorter-window functions of a multifunction encoder, ascending by
+    /// length; empty for a single-shape encoder. A window runs on the
+    /// smallest function that holds it, so it pays Neural Engine time for
+    /// the audio it carries rather than for the full 15 s shape.
+    public let encoderLadder: [EncoderLadderFunction]
     public let configuration: MLModelConfiguration
     public let vocabulary: [Int: String]
     public let version: AsrModelVersion
@@ -97,11 +107,13 @@ public struct AsrModels: Sendable {
         decoder: MLModel,
         joint: MLModel,
         ctcHead: MLModel? = nil,
+        encoderLadder: [EncoderLadderFunction] = [],
         configuration: MLModelConfiguration,
         vocabulary: [Int: String],
         version: AsrModelVersion
     ) {
         self.encoder = encoder
+        self.encoderLadder = encoderLadder
         self.preprocessor = preprocessor
         self.decoder = decoder
         self.joint = joint
@@ -114,6 +126,72 @@ public struct AsrModels: Sendable {
     /// Whether this model uses a separate preprocessor and encoder (true for 0.6B, false for 110m fused)
     public var usesSplitFrontend: Bool {
         !version.hasFusedEncoder
+    }
+}
+
+/// One window length of a multifunction encoder (`enc_<milliseconds>ms`).
+public struct EncoderLadderFunction: Sendable {
+    public let seconds: Double
+    /// Mel frames the function consumes (1 + 100 × seconds).
+    public let melFrames: Int
+    public let model: MLModel
+
+    /// Multifunction encoder function names are `enc_<milliseconds>ms`
+    /// (integer: Core ML's Neural Engine compiler crashes on a '.' in a
+    /// function name).
+    static func seconds(fromFunctionName name: String) -> Double? {
+        guard name.hasPrefix("enc_"), name.hasSuffix("ms"), let ms = Int(name.dropFirst(4).dropLast(2)) else {
+            return nil
+        }
+        return Double(ms) / 1000
+    }
+}
+
+extension AsrModels {
+    /// Load every `enc_<N>ms` function of a multifunction encoder at `path`.
+    /// Returns an empty array for a single-function encoder, or when the
+    /// platform predates multifunction models (macOS 15 / iOS 18).
+    static func loadEncoderLadder(
+        at path: URL, computeUnits: MLComputeUnits, defaultEncoder: MLModel
+    ) async -> [EncoderLadderFunction] {
+        guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, *) else { return [] }
+        let names: [String]
+        do {
+            names = try await MLModelAsset(url: path).functionNames
+        } catch {
+            return []
+        }
+        // The default function is already loaded as `defaultEncoder`; reuse it
+        // rather than hold a second instance of the same program.
+        let defaultMelFrames =
+            defaultEncoder.modelDescription.inputDescriptionsByName["mel"]?.multiArrayConstraint?.shape.last?.intValue
+        var ladder: [EncoderLadderFunction] = []
+        for name in names {
+            guard let seconds = EncoderLadderFunction.seconds(fromFunctionName: name) else { continue }
+            if let defaultMelFrames, defaultMelFrames == 1 + Int(seconds * 100) {
+                ladder.append(
+                    EncoderLadderFunction(seconds: seconds, melFrames: defaultMelFrames, model: defaultEncoder))
+                continue
+            }
+            let config = MLModelConfiguration()
+            config.computeUnits = computeUnits
+            config.allowLowPrecisionAccumulationOnGPU = true
+            config.functionName = name
+            let start = Date()
+            do {
+                let model = try MLModel(contentsOf: path, configuration: config)
+                let melFrames =
+                    model.modelDescription.inputDescriptionsByName["mel"]?.multiArrayConstraint?.shape.last?.intValue
+                    ?? (1 + Int(seconds * 100))
+                ladder.append(EncoderLadderFunction(seconds: seconds, melFrames: melFrames, model: model))
+                logger.info(
+                    "Loaded encoder function \(name) in \(String(format: "%.0f", Date().timeIntervalSince(start) * 1000)) ms"
+                )
+            } catch {
+                logger.warning("Encoder function \(name) failed to load: \(error.localizedDescription)")
+            }
+        }
+        return ladder.sorted { $0.seconds < $1.seconds }
     }
 }
 
@@ -155,13 +233,18 @@ extension AsrModels {
         ]
     }
 
-    /// Redux's 2-bit encoder uses iOS 18 Core ML ops, so it has no iOS 17 build.
-    /// Fails fast there and points at `.ultra` (same languages, more accurate).
+    /// Redux's 2-bit and Phonon-2's five-value encoders use iOS 18 Core ML ops,
+    /// so they have no iOS 17 build. Fails fast there and points at `.ultra`.
     static func checkPlatformSupport(for version: AsrModelVersion) throws {
-        guard version == .redux else { return }
-        if #available(macOS 15, iOS 18, *) { return }
+        let name: String
+        switch version {
+        case .redux: name = "Parakeet Redux"
+        case .phonon2: name = "Phonon-2"
+        default: return
+        }
+        if #available(macOS 15, iOS 18, tvOS 18, *) { return }
         throw AsrModelsError.loadingFailed(
-            "Parakeet Redux requires iOS 18 / macOS 15 (its 2-bit encoder uses iOS 18 Core ML ops). "
+            "\(name) requires iOS 18 / macOS 15 (its compressed encoder uses iOS 18 Core ML ops). "
                 + "Use AsrModelVersion.ultra on iOS 17 / macOS 14.")
     }
 
@@ -173,7 +256,7 @@ extension AsrModels {
 
     private static func inferredVersion(from directory: URL) -> AsrModelVersion? {
         let directoryPath = directory.path.lowercased()
-        let knownVersions: [AsrModelVersion] = [.tdtCtc110m, .v2, .v3, .redux, .ultra, .tdtJa]
+        let knownVersions: [AsrModelVersion] = [.tdtCtc110m, .v2, .v3, .redux, .ultra, .phonon2, .tdtJa]
 
         for version in knownVersions {
             if directoryPath.contains(version.repo.folderName.lowercased()) {
@@ -211,7 +294,7 @@ extension AsrModels {
                 joint: Names.jointV3File,
                 vocabulary: Names.vocabularyFile
             )
-        case .redux, .ultra:
+        case .redux, .ultra, .phonon2:
             // Same contract as v3 with a single encoder build.
             return (
                 encoder: Names.encoderFile,
@@ -238,7 +321,7 @@ extension AsrModels {
             return ModelNames.TDTJa.requiredModels
         case .v3:
             return Names.requiredModelsV3(precision: encoderPrecision)
-        case .redux, .ultra:
+        case .redux, .ultra, .phonon2:
             return Names.requiredModelsV3()
         default:
             return version.hasFusedEncoder ? Names.requiredModelsFused : Names.requiredModels
@@ -366,6 +449,17 @@ extension AsrModels {
         if !version.hasFusedEncoder && encoderModel == nil {
             throw AsrModelsError.loadingFailed("Failed to load encoder model (required for split frontend)")
         }
+        var encoderLadder: [EncoderLadderFunction] = []
+        if let encoderModel, let encoderSpec = specs.first(where: { $0.fileName == fileNames.encoder }) {
+            encoderLadder = await loadEncoderLadder(
+                at: directory.appendingPathComponent(fileNames.encoder),
+                computeUnits: encoderSpec.computeUnits,
+                defaultEncoder: encoderModel
+            )
+            if !encoderLadder.isEmpty {
+                logger.info("Encoder ladder: \(encoderLadder.map { "\($0.seconds) s" }.joined(separator: ", "))")
+            }
+        }
 
         // Load decoder first
         let decoderModels = try await ModelHub.loadModels(
@@ -448,6 +542,7 @@ extension AsrModels {
             decoder: decoderModel,
             joint: jointModel,
             ctcHead: ctcHeadModel,
+            encoderLadder: encoderLadder,
             configuration: config,
             vocabulary: try loadVocabulary(from: directory, version: version),
             version: version

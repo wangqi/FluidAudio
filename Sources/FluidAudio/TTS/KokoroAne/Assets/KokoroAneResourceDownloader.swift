@@ -1,3 +1,4 @@
+#if TTS
 import Foundation
 
 /// Downloads the laishere/kokoro 7-stage CoreML chain + auxiliary files
@@ -210,7 +211,18 @@ public enum KokoroAneResourceDownloader {
         // missing file throws instead of reaching HuggingFace from the app sandbox. Spanish
         // catches this and runs on its spelling rules; French cannot run without its lexicon.
         // wangqi modified 2026-09-28
-        if directory == nil, let override = TtsCacheDirectory.overrideDirectory {
+        // Upstream #1023 now passes the store's `directory` (non-nil for the host app), which
+        // skipped this `directory == nil` gate and reached HuggingFace. Gate on the override alone:
+        // the nested `<directory>/kokoro/` file wins when present, else the flat root, else throw.
+        // wangqi modified 2026-10-24
+        if let override = TtsCacheDirectory.overrideDirectory {
+            if let directory {
+                let nestedURL = directory.appendingPathComponent(Repo.kokoro.folderName)
+                    .appendingPathComponent(fileName)
+                if FileManager.default.fileExists(atPath: nestedURL.path) {
+                    return nestedURL
+                }
+            }
             let flatURL = override.appendingPathComponent(fileName)
             if FileManager.default.fileExists(atPath: flatURL.path) {
                 return flatURL
@@ -251,7 +263,21 @@ public enum KokoroAneResourceDownloader {
         // complete flat pair is all that is needed; an incomplete one throws rather than
         // downloading into the nested path from the app sandbox.
         // wangqi modified 2026-09-28
-        if directory == nil, let override = TtsCacheDirectory.overrideDirectory {
+        // Upstream #1023 now passes the store's `directory` (non-nil for the host app), which
+        // skipped this `directory == nil` gate and downloaded into `<directory>/kokoro/`. Gate on
+        // the override alone; a complete nested pair under `directory` also counts.
+        // wangqi modified 2026-10-24
+        if let override = TtsCacheDirectory.overrideDirectory {
+            if let directory {
+                let nested = directory.appendingPathComponent(Repo.kokoro.folderName)
+                let nestedComplete = ModelNames.MultilingualG2P.requiredModels.allSatisfy { bundle in
+                    compiledBundleFiles.allSatisfy {
+                        FileManager.default.fileExists(
+                            atPath: nested.appendingPathComponent(bundle).appendingPathComponent($0).path)
+                    }
+                }
+                if nestedComplete { return }
+            }
             let base = MultilingualG2PModel.modelsDirectory(base: override)
             for bundle in ModelNames.MultilingualG2P.requiredModels.sorted() {
                 let bundleDir = base.appendingPathComponent(bundle)
@@ -448,6 +474,12 @@ public enum KokoroAneResourceDownloader {
             return
         }
         logger.info("Downloading shared kokoro G2P assets from HuggingFace...")
+        // Fetches exactly `ModelNames.G2P.requiredModels` (the required set
+        // for `.kokoro` regardless of variant). `Repo.kokoro` opts out of
+        // ModelHub's loose root `.json` sweep, so the per-language lexicon
+        // caches beside these assets are not pulled here; each frontend
+        // fetches its own via `ensureLexiconCache` / `ensureEnglishLexicon`
+        // (#1044).
         try await ModelHub.download(
             .kokoro,
             to: modelsDirectory,
@@ -628,3 +660,4 @@ public enum KokoroAneResourceDownloader {
         return try TtsCacheDirectory.ensure().appendingPathComponent(modelsSubdirectory)
     }
 }
+#endif

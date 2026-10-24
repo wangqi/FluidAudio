@@ -1,6 +1,7 @@
+#if TTS
 import Foundation
 
-/// High-level facade for the Kokoro 82M 7-stage CoreML chain
+/// High-level facade for the legacy Kokoro chain or opt-in ANE-v3 runtime
 /// (ANE-resident, derived from [laishere/kokoro-coreml](https://github.com/laishere/kokoro-coreml)).
 ///
 /// Splits the model into 7 CoreML graphs with per-stage compute-unit
@@ -49,78 +50,55 @@ public actor KokoroAneManager {
     private var englishPhonemizer: KokoroAneEnglishPhonemizer?
     private var englishCustomLexicon: [String: String] = [:]
     private let englishLexiconCache = LexiconAssetCache()
+    /// Set once ``prepareEnglishFrontend()`` has fetched and loaded the
+    /// English G2P assets.
+    private var englishFrontendReady = false
+    /// BART G2P fallback bound to the store's models root (#1023).
+    nonisolated let englishG2P: G2PModel
 
+    /// Select `.v3` for the pinned hybrid ANE/GPU pipeline (macOS 15 / iOS 18+).
+    /// A supplied model store owns the runtime version and compute policy.
     public init(
         variant: KokoroAneVariant = .english,
         defaultVoice: String? = nil,
         directory: URL? = nil,
         computeUnits: KokoroAneComputeUnits = .default,
-        modelStore: KokoroAneModelStore? = nil
+        modelStore: KokoroAneModelStore? = nil,
+        version: KokoroAneVersion = .legacy
     ) {
         self.variant = variant
         self.defaultVoice = defaultVoice ?? variant.defaultVoice
-        self.store =
+        let store =
             modelStore
             ?? KokoroAneModelStore(
-                directory: directory, computeUnits: computeUnits, variant: variant)
+                directory: directory, computeUnits: computeUnits, variant: variant, version: version)
+        self.store = store
+        self.englishG2P = G2PModel.shared(directory: store.directory)
     }
 
     // MARK: - Lifecycle
 
-    /// Download (if missing), load all 7 mlmodelcs + vocab + default voice
+    /// Download (if missing), load the selected runtime + vocab + default voice
     /// pack. Optionally pre-warm additional voice packs.
     public func initialize(preloadVoices: Set<String>? = nil) async throws {
         if let advisory = Self.osAdvisory(for: ProcessInfo.processInfo.operatingSystemVersion) {
             logger.warning(advisory)
         }
         try await store.loadIfNeeded()
-        // English G2P CoreML assets live in the kokoro repo and are loaded
-        // from ~/.cache/fluidaudio/Models/kokoro/. The Mandarin variant
-        // routes through the in-process MandarinG2P pipeline (loaded by
-        // store.loadIfNeeded()) and never calls G2PModel.shared, so the
-        // English G2P bundle would just be wasted bandwidth + memory.
-        //
-        // For English: G2PModel.loadIfNeeded only reads from cache (it
-        // never downloads), so first-time KokoroAne users who have never
-        // run the regular kokoro backend would otherwise hit a cryptic
-        // G2PModelError.vocabLoadFailed. Fetch G2P assets explicitly
-        // before warming the in-process G2P model.
-        //
-        // NOTE: pass nil (not `directory`) — `G2PModel.shared` is a singleton
-        // that hardcodes the default cache path (TtsCacheDirectory.ensure()
-        // /Models/kokoro). If we honoured the caller's custom `directory` here
-        // we'd download to a path G2PModel can't see and still hit
-        // vocabLoadFailed. The KokoroAne mlmodelc chain itself does respect
-        // `directory` (via store), only the shared G2P assets are pinned.
-        //
-        // App override: if the caller already set TtsCacheDirectory.overrideDirectory
-        // (e.g. to a flat download folder containing G2P files), G2PModel.shared
-        // can load from there without a HuggingFace download. Skip ensureG2PAssets
-        // in that case to avoid an unnecessary network call from the app sandbox.
-        // wangqi modified 2026-05-02
+        // English G2P CoreML assets live in the kokoro repo under
+        // `<models root>/kokoro/`. The Mandarin variant routes through the
+        // in-process MandarinG2P pipeline (loaded by store.loadIfNeeded())
+        // and never touches the BART G2P model, so the English G2P bundle
+        // would just be wasted bandwidth + memory.
         if variant == .english {
-            var g2pLoadable = false
-            do {
-                try await G2PModel.shared.ensureModelsAvailable()
-                g2pLoadable = true
-            } catch {
-                // G2P not available from current paths; fall through to download.
-            }
-            if !g2pLoadable {
-                try await KokoroAneResourceDownloader.ensureG2PAssets(directory: nil)
-                try await G2PModel.shared.ensureModelsAvailable()
-            }
-            // Best-effort pre-fetch of the Misaki lexicon cache (weak
-            // function-word forms, issue #691). Missing lexicon degrades
-            // to the BART-G2P-only path rather than failing initialize.
-            _ = await KokoroAneResourceDownloader.ensureEnglishLexicon(directory: nil)
+            try await prepareEnglishFrontend()
         }
         switch variant {
         case .french:
             // Lexicon + CharsiuG2P fallback, fetched up front so the first
             // synthesis does not stall on (or fail without) the network.
             _ = try await store.frenchG2PPipeline()
-            try await KokoroAneResourceDownloader.ensureMultilingualG2PAssets(directory: nil)
+            try await KokoroAneResourceDownloader.ensureMultilingualG2PAssets(directory: store.directory)
         case .spanish:
             _ = await store.spanishLexicon()
         case .english, .mandarin, .japanese:
@@ -212,13 +190,66 @@ public actor KokoroAneManager {
     /// first, then the lower-cased form, before the bundled Misaki
     /// lexicon and the BART G2P fallback. Pass `[:]` to clear.
     ///
-    /// Only meaningful for ``KokoroAneVariant/english`` — calling on the
-    /// Mandarin variant stores the value but has no synthesis effect
-    /// (use ``setMandarinCustomLexicon(_:)`` there).
+    /// Used by the English variant's text path, and on any variant by
+    /// ``englishPhonemes(for:)``. It does not change how Mandarin text is
+    /// read (use ``setMandarinCustomLexicon(_:)`` there).
     public func setEnglishCustomLexicon(_ entries: [String: String]) {
         englishCustomLexicon = entries
         // Rebuild the cached frontend with the new overrides on next use.
         englishPhonemizer = nil
+    }
+
+    /// English text → phonemes in this variant's vocab, through the English
+    /// frontend (NeMo text normalization, Misaki lexicon, per-word BART G2P
+    /// fallback), without loading the English chain.
+    ///
+    /// For callers that mix English into another variant's input and feed
+    /// the result to ``synthesizeFromPhonemes(_:voice:speed:)``: Kokoro
+    /// v1.1-zh was trained with English runs phonemized this way (misaki's
+    /// `ZHG2P(version="1.1", en_callable=…)`). How to split mixed text is
+    /// left to the caller. Punctuation and lexicon entries are limited to
+    /// this variant's vocab, so every token is one its chain can encode.
+    /// The first call fetches the English G2P assets
+    /// (``prepareEnglishFrontend()``); ``setEnglishCustomLexicon(_:)``
+    /// applies.
+    public func englishPhonemes(for text: String) async throws -> String {
+        try await prepareEnglishFrontend()
+        return try await phonemize(text: EnglishTextNormalizer.normalizeForFrontend(text))
+    }
+
+    /// Fetch (if missing) and load the English G2P assets that
+    /// ``englishPhonemes(for:)`` needs. The English variant does this in
+    /// ``initialize(preloadVoices:)``; other variants can call it up front so
+    /// the first English text doesn't wait for it. Idempotent.
+    ///
+    /// The assets live under the store's `directory` (`<directory>/kokoro/`),
+    /// next to the CoreML chain, or the default TTS cache when none was given.
+    public func prepareEnglishFrontend() async throws {
+        guard !englishFrontendReady else { return }
+        // G2PModel.loadIfNeeded only reads from disk (it never downloads),
+        // so fetch the assets explicitly before warming the in-process model.
+        //
+        // App override: if the caller already set TtsCacheDirectory.overrideDirectory
+        // (e.g. to a flat download folder containing G2P files), the G2P model
+        // can load from there without a HuggingFace download. Try loading first and
+        // skip ensureG2PAssets when it succeeds, to avoid a network call from the app sandbox.
+        // wangqi modified 2026-10-24
+        var g2pLoadable = false
+        do {
+            try await englishG2P.ensureModelsAvailable()
+            g2pLoadable = true
+        } catch {
+            logger.debug("English G2P not loadable from current paths, fetching: \(error.localizedDescription)")
+        }
+        if !g2pLoadable {
+            try await KokoroAneResourceDownloader.ensureG2PAssets(directory: store.directory)
+            try await englishG2P.ensureModelsAvailable()
+        }
+        // Best-effort pre-fetch of the Misaki lexicon cache (weak
+        // function-word forms, issue #691). Missing lexicon degrades
+        // to the BART-G2P-only path rather than failing.
+        _ = await KokoroAneResourceDownloader.ensureEnglishLexicon(directory: store.directory)
+        englishFrontendReady = true
     }
 
     /// Drop loaded mlmodelcs + voice packs. The store reloads on next call.
@@ -408,13 +439,14 @@ public actor KokoroAneManager {
         let phonemeCount = KokoroAneVocab.phonemeLength(phonemes)
         let (styleS, styleTimbre) = pack.slice(for: phonemeCount)
 
-        var result = try await KokoroAneSynthesizer.synthesize(
-            inputIds: inputIds,
-            styleS: styleS,
-            styleTimbre: styleTimbre,
-            speed: speed,
-            store: store
-        )
+        var result: KokoroAneSynthesisResult
+        if store.version == .v3 {
+            result = try await store.synthesizeV3(
+                inputIds: inputIds, styleS: styleS, styleTimbre: styleTimbre, speed: speed)
+        } else {
+            result = try await KokoroAneSynthesizer.synthesize(
+                inputIds: inputIds, styleS: styleS, styleTimbre: styleTimbre, speed: speed, store: store)
+        }
         result.normalizedText = normalizedText
         result.phonemes = phonemes
         return result
@@ -426,9 +458,18 @@ public actor KokoroAneManager {
     /// and vocab-supported punctuation kept as prosody/pause tokens.
     private func phonemize(text: String) async throws -> String {
         let phonemizer = await ensureEnglishPhonemizer()
-        return try await phonemizer.phonemize(text) { word in
-            try await G2PModel.shared.phonemize(word: word)
+        let raw = try await phonemizer.phonemize(text) { [englishG2P] word in
+            try await englishG2P.phonemize(word: word)
         }
+        return Self.misakiOutputForm(raw)
+    }
+
+    /// misaki's flap step for Kokoro v1.0 (`G2P.__call__`): `ɾ` → `T`. The
+    /// lexicon stores the raw flap ("metal" was read as "mattle"). misaki also
+    /// maps the glottal stop `ʔ` → `t`, but this chain reads `ʔn` better than
+    /// `tn` ("button" became "butt"), so `ʔ` is kept.
+    static func misakiOutputForm(_ phonemes: String) -> String {
+        phonemes.replacingOccurrences(of: "ɾ", with: "T")
     }
 
     /// Build (and cache) the English frontend: chain vocab → allowed
@@ -452,7 +493,7 @@ public actor KokoroAneManager {
             punctuation = Set(
                 vocab.map.keys.filter { !$0.isLetter && !$0.isNumber && !$0.isWhitespace })
 
-            if let kokoroDir = await KokoroAneResourceDownloader.ensureEnglishLexicon(directory: nil) {
+            if let kokoroDir = await KokoroAneResourceDownloader.ensureEnglishLexicon(directory: store.directory) {
                 let allowedTokens = Set(vocab.map.keys.map(String.init))
                 try await englishLexiconCache.ensureLoaded(
                     kokoroDirectory: kokoroDir, allowedTokens: allowedTokens)
@@ -515,3 +556,4 @@ public actor KokoroAneManager {
             }
     }
 }
+#endif

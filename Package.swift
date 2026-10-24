@@ -7,6 +7,8 @@ let package = Package(
     platforms: [
         .macOS(.v14),
         .iOS(.v17),
+        .visionOS(.v2),
+        .tvOS(.v17),
     ],
     products: [
         .library(
@@ -25,17 +27,30 @@ let package = Package(
             dependencies: [
                 "FastClusterWrapper",
                 "MachTaskSelfWrapper",
-                "NemoTextProcessing",
+                // The prebuilt xcframework has no visionOS or tvOS slice.
+                .target(name: "NemoTextProcessing", condition: .when(platforms: [.macOS, .iOS, .macCatalyst])),
+                "LuxTtsG2pResources",
             ],
             path: "Sources/FluidAudio",
             exclude: ["ASR/Parakeet/Unified/benchmark.md"],
+            swiftSettings: [
+                // Package@swift-6.2.swift exposes these as opt-out traits (#990).
+                .define("TTS"),
+                .define("Diarizer"),
+                // Build under Swift 5 language mode until strict concurrency issues are resolved.
+                // Upstream moved the G2P resources into LuxTtsG2pResources, so the pin now sits
+                // on the FluidAudio target itself (where the fork's mutable overrides live).
+                // wangqi modified 2026-10-24
+                .swiftLanguageMode(.v5),
+            ]
+        ),
+        .target(
+            name: "LuxTtsG2pResources",
+            path: "Sources/LuxTtsG2pResources",
             resources: [
                 // Keep .process: .copy of a Resources-named directory breaks Apple code signing on iOS.
-                .process("TTS/LuxTts/G2p/Resources")
-            ],
-            // Build under Swift 5 language mode until strict concurrency issues are resolved
-            // wangqi modified 2026-03-24
-            swiftSettings: [.swiftLanguageMode(.v5)]
+                .process("Resources")
+            ]
         ),
         // Byte-exact NeMo text normalization (FST engine, all 7 languages).
         // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.1

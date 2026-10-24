@@ -6,7 +6,8 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20iOS-blue.svg)](https://developer.apple.com)
 [![Documentation](https://img.shields.io/badge/Documentation-docs.fluidinference.com-008574.svg)](https://docs.fluidinference.com/introduction)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-7289da.svg)](https://discord.gg/WNsvaCtmDe)
-[![Hugging Face Models](https://img.shields.io/badge/Hugging%20Face%20Models-500k%2B%20Monthly%20Downloads-brightgreen?logo=huggingface)](https://huggingface.co/FluidInference)[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/FluidInference/FluidAudio)
+[![Hugging Face Models](https://img.shields.io/badge/Hugging%20Face%20Models-500k%2B%20Monthly%20Downloads-brightgreen?logo=huggingface)](https://huggingface.co/FluidInference)
+
 
 <div align="center">
 
@@ -43,7 +44,7 @@ Want to convert your own model? Check [möbius](https://github.com/FluidInferenc
 
 - **Automatic Speech Recognition (ASR)**: [Parakeet TDT v3](Documentation/Models.md#batch-transcription-near-real-time) (0.6b) and other TDT/CTC models for batch transcription supporting 25 European languages and Japanese, plus SenseVoice and Paraformer for Mandarin Chinese; [Parakeet EOU](Documentation/Models.md#streaming-transcription-true-real-time) (120m) for streaming ASR with end-of-utterance detection (English only). See all [ASR models](Documentation/Models.md#asr-models).
 - **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs). Optional: ASR-only apps can drop the engine (~8 MB per slice) with `traits: []` (Swift 6.2+), see [PostProcessing.md](Documentation/ASR/PostProcessing.md#opting-out-of-the-engine)
-- **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (EN, DE, ES, FR, IT, PT — 6L and 24L variants); Chatterbox Multilingual (520M, 18 languages) and Chatterbox Nano (110M, English with `[laugh]`/`[chuckle]` paralinguistic tags) in beta — see [Documentation/TTS/Chatterbox.md](Documentation/TTS/Chatterbox.md)
+- **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (EN, DE, ES, FR, IT, PT — 6L and 24L variants); Chatterbox Multilingual (520M, 18 languages) and Chatterbox Nano (110M, English with `[laugh]`/`[chuckle]` paralinguistic tags) in beta — see [Documentation/TTS/Chatterbox.md](Documentation/TTS/Chatterbox.md); Paradee (8M Kokoro distill, English, 12 MB) in beta — see [Documentation/TTS/Paradee.md](Documentation/TTS/Paradee.md); Gradium's Phonon 31m (Apache-2.0, English, 103 voices) on the Neural Engine at ~20x real time — see [Documentation/TTS/PocketTTS.md](Documentation/TTS/PocketTTS.md#phonon-31m-gradium)
 - **Speaker Diarization (Online + Offline)**: Speaker separation and identification across audio streams. Streaming pipeline for real-time processing and offline batch pipeline with advanced clustering.
 - **Speaker Embedding Extraction**: Generate speaker embeddings for voice comparison and clustering, you can use this for speaker identification
 - **Voice Activity Detection (VAD)**: Voice activity detection with Silero models
@@ -122,6 +123,7 @@ Make a PR if you want to add your app, please keep it in chronological order.
 | **[oats](https://github.com/ariso-ai/oats)** | ✓ | Open-source (MIT) meeting notes app for macOS and Windows built with Tauri and Vue. One-click recording, real-time transcription with speaker labels, and on-device LLM note generation in Markdown. Uses FluidAudio on the Apple Neural Engine for macOS transcription. |
 | **[Orca One](https://orcaone.com/)** | — | Private Mac dictation and meeting transcription with on-device processing. Uses FluidAudio's Parakeet ASR and Silero VAD. |
 | **[Banter](https://github.com/arvindvenkataramani/banter)** | ✓ | Open-source (Apache-2.0), self-hosted voice interface for OpenClaw, adaptable to other agent harnesses. Runs in the browser on desktop or phone. Its two Swift servers put FluidAudio behind OpenAI-compatible HTTP and streaming WebSocket APIs: Parakeet TDT v3, Parakeet Unified and Nemotron streaming ASR, and Pocket TTS, Kokoro and LuxTTS for speech, all on Apple Silicon. |
+| **[Wisp](https://smw.ai/projects/wisp)** | — | FREE, ultrafast English dictation for Mac that puts cleaned-up text in your app in 200-300ms after you stop talking. 3-10× faster than Wispr Flow, Superwhisper, MacWhisper, or OpenAI's GPT Transcribe, and nothing leaves your Mac. Uses Parakeet Unified ASR. |
 
 More apps built with FluidAudio are listed in [Documentation/Showcase.md](Documentation/Showcase.md).
 
@@ -144,6 +146,21 @@ dependencies: [
 ```swift
 .product(name: "FluidAudio", package: "FluidAudio")
 ```
+
+**Package traits (Swift 6.2+ / Xcode 26+):** all three are on by default. Drop the subsystems an app never reaches to shrink the build:
+
+| Trait | Covers |
+|-------|--------|
+| `TTS` | All TTS backends plus the ~1 MB LuxTTS G2P resource bundle |
+| `Diarizer` | Speaker diarization (pyannote, Sortformer, LS-EEND, Nemotron 3) |
+| `NemoTextProcessing` | NeMo text normalization engine, see [PostProcessing.md](Documentation/ASR/PostProcessing.md#opting-out-of-the-engine) |
+
+```swift
+.package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.17.7", traits: [])            // ASR + VAD only
+.package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.17.7", traits: ["Diarizer"])  // + diarization
+```
+
+`traits: []` turns off all three. Before #990 it only dropped the NeMo engine, so apps that use diarization and pass `traits: []` should switch to `traits: ["Diarizer"]`. Older toolchains always build everything.
 
 **CocoaPods:** We recommend using [cocoapods-spm](https://github.com/trinhngocthuyen/cocoapods-spm) for better SPM integration, but if needed, you can also use our podspec: `pod 'FluidAudio', '~> 0.12.4'`
 
@@ -324,6 +341,7 @@ claude mcp add -s user -t http deepwiki https://mcp.deepwiki.com/mcp
   - `FluidInference/parakeet-tdt-0.6b-v3-coreml` (multilingual, 25 European languages; library default)
   - `FluidInference/parakeet-redux-coreml` (multilingual, smallest download at ~220 MB; iOS 18+ / macOS 15+ only, see [Parakeet Redux](Documentation/ASR/ParakeetRedux.md))
   - `FluidInference/parakeet-tdt-0.6b-v2-coreml` (English-only, highest recall)
+  - `FluidInference/phonon-2-coreml` (English-only; Fermion Research's five-value re-training of v3, iOS 18+ / macOS 15+, see [Phonon-2](Documentation/ASR/Phonon2.md))
 - **Processing Mode**: Batch transcription for complete audio files
 - **Real-time Factor**: ~190x on M4 Pro (processes 1 hour of audio in ~19 seconds)
 - **Streaming Support**: Real-time streaming via `SlidingWindowAsrManager` with sliding window processing and cancellation support
@@ -672,29 +690,75 @@ swift run fluidaudiocli tts "Hello world." --output out.wav --backend pocket --c
 See [Documentation/TTS/PocketTTS.md](Documentation/TTS/PocketTTS.md#languages)
 for the full language table.
 
+#### Phonon 31m (Gradium)
+
+Gradium's [Phonon](https://gradium.ai/phonon) 31m, Apache-2.0, is the Pocket TTS recipe
+trained by the Kyutai founders' spin-off. It runs on the Neural Engine with 103 voices,
+including 12 characters, and Gradium's English text normalizer, so numbers, currency,
+emails and URLs are read correctly. Requires macOS 15 / iOS 18.
+
+```swift
+let tts = PocketTtsSmallManager(model: .phonon31m)   // downloads phonon/phonon-31m-en (~171 MB)
+try await tts.initialize()
+let wav = try await tts.synthesize(text: "Your order of $42.50 ships today.", voice: "en_us_Easton")
+```
+
+```bash
+swift run fluidaudiocli tts "Hello from Phonon." --backend pocket-small --model phonon \
+  --voice en_gb_Maeve --output phonon.wav
+
+# demo app: a ring that speaks
+cd Examples/PhononDemo && swift run -c release PhononDemo
+```
+
 ### KokoroAne
 
-ANE-resident Kokoro 82M (4-stage on Neural Engine, 3-stage on GPU). Yields
-3-11× RTFx on Apple Silicon vs. the prior single-graph Kokoro path. English
-(`af_heart`) and Mandarin variants ship with a built-in G2P pipeline (BART
-CoreML for English OOV, jieba + sandhi + G2pW for Mandarin).
+Kokoro ANE v3 is available in **v0.17.6** for English, Japanese and Mandarin,
+with native text frontends. Opt in with `version: .v3`; existing callers keep
+`.legacy`. V3 requires macOS 15 / iOS 18 and combines CPU/ANE model stages,
+a CPU/GPU generator and native Accelerate DSP. It is not ANE-only or `.all`.
 
 ```swift
 import FluidAudio
 
-Task {
-    let manager = KokoroAneManager()
-    try await manager.initialize()
-    let samples = try await manager.synthesize(text: "Hello from FluidAudio.")
-    // `samples` is 24 kHz mono Float32 PCM
-}
+let manager = KokoroAneManager(version: .v3)
+try await manager.initialize()
+let result = try await manager.synthesizeDetailed(text: "Hello from FluidAudio.")
+// result.samples: 24 kHz mono Float32 PCM
+
+let japanese = KokoroAneManager(variant: .japanese, version: .v3)
+let mandarin = KokoroAneManager(variant: .mandarin, version: .v3)
 ```
 
 ```bash
-swift run fluidaudiocli tts "Hello from FluidAudio." --backend kokoroAne --output out.wav
+swift run -c release fluidaudiocli tts "Hello from FluidAudio." \
+  --backend kokoro-ane --kokoro-version v3 --output out.wav
 ```
 
-Model assets are cached under `~/.cache/fluidaudio/Models/kokoro/`.
+Selected M5 Pro demo inputs produced 3.05–3.68 seconds of audio in
+**36–54 ms median inference**, excluding text processing and loading. These
+are bounded local checks; see [benchmark methodology and live-demo timings](Documentation/TTS/Benchmarks.md#kokoro-ane-v3-selected-m5-pro-measurements).
+Models compile/cache on first use. Physical iOS inference remains unvalidated.
+See [setup, voices, model pins, caches and platform limits](Documentation/TTS/KokoroAne.md).
+
+Base weights: [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+(English/Japanese) and [hexgrad/Kokoro-82M-v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)
+(Mandarin). Core ML assets: [FluidInference/kokoro-82m-coreml](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE-v3).
+
+### Paradee (beta)
+
+Kokoro-82M distilled into 8M parameters (one voice, `af_heart`, English), 12 MB of int8 weights,
+~100× real time on CPU. Uses the Kokoro English frontend. See [Documentation/TTS/Paradee.md](Documentation/TTS/Paradee.md).
+
+```swift
+let manager = ParadeeManager()
+try await manager.initialize()
+let samples = try await manager.synthesize(text: "Hello from FluidAudio.")  // 24 kHz Float32
+```
+
+```bash
+swift run fluidaudiocli tts "Hello from FluidAudio." --backend paradee --output out.wav
+```
 
 ## Continuous Integration
 
@@ -728,6 +792,8 @@ Parakeet-mlx: <https://github.com/senstella/parakeet-mlx>
 silero-vad: <https://github.com/snakers4/silero-vad>
 
 Kokoro-82M: <https://huggingface.co/hexgrad/Kokoro-82M>
+
+Paradee-8M: <https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.0>
 
 ### Citation
 

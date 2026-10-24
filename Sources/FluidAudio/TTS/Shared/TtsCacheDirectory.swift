@@ -1,3 +1,4 @@
+#if TTS
 import Foundation
 
 /// Cross-backend TTS cache root.
@@ -57,3 +58,4 @@ public enum TtsCacheDirectory {
         return cacheDirectory
     }
 }
+#endif

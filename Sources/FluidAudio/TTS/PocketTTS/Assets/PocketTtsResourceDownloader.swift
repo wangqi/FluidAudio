@@ -1,3 +1,4 @@
+#if TTS
 import Foundation
 
 /// Downloads PocketTTS models and constants from HuggingFace.
@@ -581,3 +582,4 @@ public enum PocketTtsResourceDownloader {
         return try TtsCacheDirectory.ensure()
     }
 }
+#endif

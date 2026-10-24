@@ -66,6 +66,28 @@ Use v2 if you only need English, it is a bit more accurate
    Overall RTFx: 145.8x (19452.5s / 133.4s)
 ```
 
+### v3 family: v3 vs Ultra vs Phonon-2 (Neural Engine)
+
+M5 Pro, macOS 27, default encoder compute units (ANE), models run back to back in one session. WER is corpus-level
+(total edit distance / total reference words); RTFx = total audio / total processing time. Full LibriSpeech sets plus
+the 60-minute Earnings-22 concatenation (`earnings22_top4_1h.wav`, four calls, reference = the chunk transcripts).
+
+| Model (`--model-version`) | Download | test-clean WER | test-other WER | test-clean RTFx | test-other RTFx | 60-min RTFx | 60-min WER |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `v3` | ~480 MB | 2.27 % | 4.12 % | 149–152× | 138× | 335× | 16.5 % |
+| `ultra` | ~630 MB | **2.13 %** | **3.81 %** | 151× | 142× | 457× | **13.5 %** |
+| `phonon2` | ~360 MB | 2.47 % | 4.62 % | **159×** | **146×** | **480×** | 17.2 % |
+
+Phonon-2 ([FluidInference/phonon-2-coreml](https://huggingface.co/FluidInference/phonon-2-coreml), English only,
+iOS 18+) is the fastest of the three on every set; Ultra is the most accurate; v3 is the multilingual default. Details
+and the other Phonon-2 encoder files: [ASR/Phonon2.md](ASR/Phonon2.md), [ASR/ParakeetUltra.md](ASR/ParakeetUltra.md).
+
+```bash
+swift run fluidaudiocli asr-benchmark --subset test-clean --model-version phonon2
+swift run fluidaudiocli asr-benchmark --subset test-other --model-version phonon2
+swift run fluidaudiocli transcribe earnings22_top4_1h.wav --model-version phonon2 --output-json out.json
+```
+
 ### ASR Model Compilation
 
 Core ML first-load compile times captured on iPhone 16 Pro Max and iPhone 13 running the
@@ -225,6 +247,21 @@ Derived metrics:
 | F-Score   | 2 × P × R / (P + R) | Harmonic mean of precision and recall                |
 
 ## Text-to-Speech
+
+### Kokoro ANE v3 (FluidAudio v0.17.6)
+
+Selected M5 Pro / macOS 27.0 checks measured **49.45 / 35.85 / 53.97 ms**
+median inference for English / Japanese / Mandarin, producing 3.350 / 3.050 /
+3.675 seconds of audio. Each median uses five calls after two warmups; input
+phonemes are prepared in advance. Current v3 uses per-stage CPU/ANE and CPU/GPU
+policies plus native CPU DSP, rather than `.all` or an ANE-only policy.
+
+Applying CPU+ANE to every graph measured 511.40 / 474.45 / 584.19 ms; `.all`
+and CPU+GPU aborted in Apple's GPU RNN path before completing warmups.
+These are bounded local checks, not full-corpus results. See the
+[complete protocol, inputs, ranges, raw records and separate live-demo timings](TTS/Benchmarks.md#kokoro-ane-v3-selected-m5-pro-measurements).
+
+### Historical M4 Pro comparison
 
 We generated the same strings with to generate audio between 1s to ~300s in order to test the speed across a range of varying inputs on Pytorch CPU, MPS, and MLX pipeline, and compared it against the native Swift version with Core ML models.
 
