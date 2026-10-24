@@ -232,9 +232,9 @@ Phonon-2 as a faster English Parakeet; Kokoro v3 Japanese; streaming small Pocke
 | `swift build` (macOS), fork worktree after merge (P3) | `Build complete!`, exit 0 |
 | `swift build` after `59d2b4ae` (P3b) | `Build complete!`, exit 0 |
 | P1 baseline (`run_fluidaudio_tests.py`) | 17 pass; standing FAIL `fa-silero-vad` (doc OPEN) and `fa-kokoro-82m:ANE-zh` (to be fixed by `59d2b4ae` + mirror uploads) |
-| App builds (iOS sim + macOS), P5 | **pending** |
-| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | **pending** (P10) |
-| `run_fluidaudio_tests.py --compare <P1 report>` | **pending** (P10) |
+| App builds (iOS sim + macOS) | macOS BUILD SUCCEEDED (P5, slot 9); iOS build succeeded (P10, slot 9, 487 s) |
+| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | 11/11 passed (P10) |
+| `run_fluidaudio_tests.py --compare <P1 report>` | no REGRESSED. Sweep 14/5/0 vs baseline (fixed: `fa-parakeet-tdt-v3`); the 4 Kokoro rows then passed 4/0/0 after the stage was moved to `components.revision` 4, **including ANE-zh** (standing pre-merge FAIL, fixed). Effective 18/1/0; only `fa-silero-vad` standing (doc OPEN) |
 
 **macOS cannot verify:** the iOS 27 Kokoro advisory (R1: `isBnnsCrashProneOS` is false on macOS 27); #1038 was
 verified only on macOS 27 and only for v3; A12 behaviour (R5); background (ANE-only) behaviour of every row.
