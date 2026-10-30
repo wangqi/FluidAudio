@@ -192,7 +192,9 @@ added.
 | P1 baseline (`run_fluidaudio_tests.py`) | 18 passed, 1 failed, 0 skipped; standing FAIL `fa-silero-vad` (permission error saving into the staged folder, doc OPEN) |
 | P3 patch audit | 49 / 13 files intact; no shipped `ModelNames` change; no new network path on a shipped variant |
 | `swift build` (fork, P3) | Skipped (cold build during a running sweep); covered by the app build |
-| App builds, `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests`, `run_fluidaudio_tests.py --compare <P1>` | Pending P10 |
+| App builds (P5 macOS, P10 iOS) | Both BUILD SUCCEEDED |
+| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | All passed |
+| `run_fluidaudio_tests.py --compare <P1>` (`fluidaudio-20261030-180721`) | 17 passed, 2 failed. `fa-silero-vad` = the standing baseline FAIL. `fa-pocket-tts-english` 3.12 s vs 2.48 s (25 %, band 20 %): two reruns gave 2.64 s and 2.80 s, both PASS; PocketTTS sampling varies run to run (Spanish 3.12 s → 3.60 s in the same pair), so not a regression |
 
 **macOS cannot verify:** the iOS 27 Kokoro advisory (R1: `isBnnsCrashProneOS` is false on macOS 27); keyboard
 dictation cancel on device (R2); background (ANE-only) behaviour of every row.
