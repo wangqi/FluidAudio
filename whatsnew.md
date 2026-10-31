@@ -67,7 +67,12 @@ No new models, languages or voices reach users in this merge; they need app code
 **Problem:** `KokoroAneManager.swift` is byte-identical to tag-20261024 (P3), so `isBnnsCrashProneOS` is still
 **false on macOS 27** and true on every non-macOS OS ≥ 26.4. A green macOS row says nothing about iOS 27 (#889:
 libBNNS `vadd_fp16_sme_internal` on the Metal-free route, MPSGraph abort on the Metal route). Nothing in this
-range touches it. **Verify:** physical iOS 27 device, long English Text to Audio export. **Status:** needs device.
+range touches it. **Verify:** physical iOS 27 device, long English Text to Audio export. **Status (2026-10-30):
+not reproduced on an A18 Pro.** `FluidAudioKokoroAneDeviceSoakTests` (app suite, opt-in `KOKORO_SOAK=1`) ran the
+app's own `generateAudioFile` path on an iPhone 16 Pro Max, iOS 27.2, for 65 min: route as shipped
+(`aneTailCpu`: noise + tail on CPU, the rest on the ANE; no CPU-only fallback), 1 348 exports, 42 042 s
+(11.7 h) of audio at ~11.5x real time, no crash, no failed or silent export, available memory flat at
+5.56-5.89 GB. The advisory is not disproved for other chips or longer runs; re-run the soak after upgrades.
 
 ### R2 — EOU `CancellationError` on cancelled tasks (LOW)
 **Problem:** #1033 makes `process(audioBuffer:)` and `finish()` throw when their task is cancelled. In
@@ -106,7 +111,14 @@ No `ModelNames` constant used by a live row changed and no catalogue `components
 
 **Inventory:** 13 files, **49 → 49** markers (`git grep -c "wangqi modified"` at `925f32f4` and the merged tree
 match file by file). The other 10 patched files and both manifests are byte-identical to `925f32f4`.
-Nothing absorbed, nothing added.
+Nothing absorbed, nothing added in the merge.
+
+**Added after the run (2026-10-30), `VAD/VadManager.swift`, 1 marker:** `VadManager(modelDirectory:)` now
+loads `silero-vad-unified-256ms-v6.2.1.mlmodelc` from that folder directly. Before, the 2026-03-28 patch only
+skipped `Models/`, and `ModelHub.loadModels` still appended `Repo.vad.folderName` (`silero-vad`), found
+nothing, and downloaded a second copy from upstream HuggingFace into `<folder>/silero-vad/`. That was a hidden
+network path in the app (a duplicate copy dated 2026-10-07 sat in the iCloud models folder; offline, VAD failed
+to load) and was the "standing" `fa-silero-vad` FAIL (the regression stage folder is not writable).
 
 ### Dependencies
 
@@ -195,6 +207,8 @@ added.
 | App builds (P5 macOS, P10 iOS) | Both BUILD SUCCEEDED |
 | `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | All passed |
 | `run_fluidaudio_tests.py --compare <P1>` (`fluidaudio-20261030-180721`) | 17 passed, 2 failed. `fa-silero-vad` = the standing baseline FAIL. `fa-pocket-tts-english` 3.12 s vs 2.48 s (25 %, band 20 %): two reruns gave 2.64 s and 2.80 s, both PASS; PocketTTS sampling varies run to run (Spanish 3.12 s → 3.60 s in the same pair), so not a regression |
+| After the run: VadManager patch + PocketTTS median-of-3 probe (`fluidaudio-20261030-193624`) | **19 passed, 0 failed.** Temperature 0 was tried for PocketTTS first and rejected: deterministic, but French gave 9.4 s of near-silence and Spanish ran 3x long |
+| iOS 27 Kokoro soak (`FluidAudioKokoroAneDeviceSoakTests`, iPhone 16 Pro Max, iOS 27.2) | PASS, 65 min, 1 348 exports, no crash (R1) |
 
-**macOS cannot verify:** the iOS 27 Kokoro advisory (R1: `isBnnsCrashProneOS` is false on macOS 27); keyboard
+**macOS cannot verify:** the iOS 27 Kokoro advisory (R1; checked on device since, see above); keyboard
 dictation cancel on device (R2); background (ANE-only) behaviour of every row.
