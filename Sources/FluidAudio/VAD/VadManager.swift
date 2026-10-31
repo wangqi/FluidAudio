@@ -125,6 +125,25 @@ public actor VadManager {
         from directory: URL? = nil,
         progressHandler: ProgressHandler? = nil
     ) async throws {
+        // A caller-supplied directory holds the bundle itself. ModelHub would look one level deeper
+        // (`<directory>/silero-vad/`), find nothing, and download a second copy from HuggingFace
+        // there, which fails offline and in a read-only folder. Load the bundle in place instead;
+        // a missing bundle throws.
+        // wangqi modified 2026-10-30
+        if let directory {
+            let modelPath = directory.appendingPathComponent(ModelNames.VAD.sileroVadFile)
+            guard FileManager.default.fileExists(atPath: modelPath.path) else {
+                logger.error("VAD model not found at \(modelPath.path)")
+                throw VadError.modelLoadingFailed
+            }
+            let mlConfig = MLModelConfiguration()
+            mlConfig.computeUnits = config.computeUnits
+            mlConfig.allowLowPrecisionAccumulationOnGPU = true
+            self.vadModel = try MLModel(contentsOf: modelPath, configuration: mlConfig)
+            logger.info("VAD model loaded from \(modelPath.path)")
+            return
+        }
+
         let baseDirectory = directory ?? getDefaultBaseDirectory()
 
         // When directory is provided externally, models are already in baseDirectory — skip Models/.
