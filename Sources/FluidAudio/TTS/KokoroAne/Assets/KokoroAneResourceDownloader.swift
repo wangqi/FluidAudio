@@ -199,6 +199,27 @@ public enum KokoroAneResourceDownloader {
     public static func ensureJapaneseG2P(
         repoDirectory: URL
     ) async throws -> URL {
+        // Offline gate, as `ensureMandarinG2P` has: a host app that points
+        // `TtsCacheDirectory.overrideDirectory` at its own download folder stages the pack as the repo
+        // ships it (`ANE-ja/assets/`). Use `g2p/` (an earlier lazy fetch) or `assets/` when every file
+        // is there and valid, else throw instead of fetching from HuggingFace in the app sandbox.
+        // wangqi modified 2026-11-07
+        if let override = TtsCacheDirectory.overrideDirectory {
+            let files = KokoroAneConstants.japaneseG2PFiles
+            if let staged = stagedDirectory(
+                in: repoDirectory, subdirs: [KokoroAneConstants.g2pSubdir, stagedMandarinAssetsSubdir],
+                files: files)
+            {
+                for name in files {
+                    try JapaneseMecabDictionary.validateAsset(named: name, at: staged.appendingPathComponent(name))
+                }
+                return staged
+            }
+            throw KokoroAneError.downloadFailed(
+                "Japanese G2P assets \(files) not staged under \(repoDirectory.path) "
+                    + "(override \(override.path)); downloads are disabled by the cache override")
+        }
+
         let g2pDir = repoDirectory.appendingPathComponent(KokoroAneConstants.g2pSubdir)
         if !FileManager.default.fileExists(atPath: g2pDir.path) {
             try FileManager.default.createDirectory(at: g2pDir, withIntermediateDirectories: true)
