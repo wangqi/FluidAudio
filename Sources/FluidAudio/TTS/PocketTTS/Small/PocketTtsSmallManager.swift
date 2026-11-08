@@ -2,6 +2,7 @@
 @preconcurrency import CoreML
 import Foundation
 
+// Doc line for the caller-supplied conditioning entry points // wangqi modified 2026-11-07
 /// Text-to-speech with the small Pocket TTS models (18m / 7m / 2m): the FlowLM
 /// on the Neural Engine through one MLState multifunction package, the Mimi
 /// decoder in fp32 on the CPU by default (`mimiPrecision`, see
@@ -14,8 +15,9 @@ import Foundation
 /// ```
 ///
 /// Requires macOS 15 / iOS 18 (MLState + multifunction models). Shipped
-/// voices are the 27 upstream presets (`alba` default); live voice cloning
-/// is not wired for the small models yet.
+/// voices are the 27 upstream presets (`alba` default).
+/// Callers can also speak a voice of their own by passing its conditioning
+/// rows (`PocketTtsSmallConditioning`) to the `conditioning:` overloads.
 @available(macOS 15.0, iOS 18.0, tvOS 18.0, *)
 public actor PocketTtsSmallManager {
 
@@ -79,28 +81,111 @@ public actor PocketTtsSmallManager {
     public func makeSession(
         voice: String? = nil, temperature: Float? = nil, seed: UInt64? = nil
     ) async throws -> PocketTtsSmallSession {
+        // Split into snapshot + openSession so the conditioning entry point shares the session start
+        // wangqi modified 2026-11-07
+        let (engine, constants) = try makeEngine()
+        let snapshot = try await presetSnapshot(voice ?? defaultVoice, engine: engine, constants: constants)
+        return await openSession(
+            engine: engine, constants: constants, snapshot: snapshot, temperature: temperature, seed: seed)
+    }
+
+    // Caller-supplied conditioning entry points (the app's imported voice files) // wangqi modified 2026-11-07
+    /// Open a streaming session that speaks caller-supplied voice conditioning.
+    /// The rows are prefilled into an empty cache once per `cacheKey`; pass a
+    /// new key whenever the rows change.
+    public func makeSession(
+        conditioning: PocketTtsSmallConditioning, temperature: Float? = nil, seed: UInt64? = nil
+    ) async throws -> PocketTtsSmallSession {
+        let (engine, constants) = try makeEngine()
+        let snapshot = try await conditioningSnapshot(conditioning, engine: engine, constants: constants)
+        return await openSession(
+            engine: engine, constants: constants, snapshot: snapshot, temperature: temperature, seed: seed)
+    }
+
+    /// Synthesize caller-supplied voice conditioning to 80 ms frames.
+    public func synthesizeStreaming(
+        text: String, conditioning: PocketTtsSmallConditioning, temperature: Float? = nil, seed: UInt64? = nil
+    ) async throws -> AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error> {
+        let session = try await makeSession(conditioning: conditioning, temperature: temperature, seed: seed)
+        session.enqueue(text)
+        session.finish()
+        return session.frames
+    }
+
+    /// Synthesize caller-supplied voice conditioning to 24 kHz 16-bit WAV data.
+    public func synthesize(
+        text: String, conditioning: PocketTtsSmallConditioning, temperature: Float? = nil, seed: UInt64? = nil,
+        deEss: Bool = true
+    ) async throws -> Data {
+        let t0 = Date()
+        let frames = try await synthesizeStreaming(
+            text: text, conditioning: conditioning, temperature: temperature, seed: seed)
+        let samples = try await collectSamples(frames, startedAt: t0, deEss: deEss)
+        return try AudioWAV.data(from: samples, sampleRate: Double(PocketTtsConstants.audioSampleRate))
+    }
+
+    // Shared session start for the voice and conditioning entry points // wangqi modified 2026-11-07
+    /// One engine (one MLState) per session: concurrent sessions must not
+    /// share the mutable KV / Mimi state. The MLModel handles are shared.
+    private func makeEngine() throws -> (PocketTtsSmallEngine, PocketTtsSmallConstants) {
         guard let models, let constants else {
             throw PocketTTSError.modelNotFound("PocketTTS small model not initialized")
         }
-        // One engine (one MLState) per session: concurrent sessions must not
-        // share the mutable KV / Mimi state. The MLModel handles are shared.
-        let engine = try PocketTtsSmallEngine(models: models, constants: constants)
-        let name = voice ?? defaultVoice
+        return (try PocketTtsSmallEngine(models: models, constants: constants), constants)
+    }
+
+    /// The KV snapshot of a shipped voice, cached by name.
+    private func presetSnapshot(
+        _ name: String, engine: PocketTtsSmallEngine, constants: PocketTtsSmallConstants
+    ) async throws -> PocketTtsSmallEngine.Fp16Snapshot {
+        if let cached = voiceCache[name] { return cached }
         let snapshot: PocketTtsSmallEngine.Fp16Snapshot
-        if let cached = voiceCache[name] {
-            snapshot = cached
-        } else if constants.hasKVSnapshot(name) {
+        if constants.hasKVSnapshot(name) {
             snapshot = try await engine.fp16Snapshot(from: constants.loadVoice(name))
-            voiceCache[name] = snapshot
         } else {
             // A voice shipped as conditioning rows: prefill it into an empty cache
             // once and keep the resulting KV state as this voice's snapshot.
             let voice = try constants.loadVoiceConditioning(name)
-            try await engine.resetToZero()
-            try await engine.prefill(flatConditioning: voice.rows, tokenCount: voice.count)
-            snapshot = try await engine.captureSnapshot()
-            voiceCache[name] = snapshot
+            snapshot = try await prefillSnapshot(rows: voice.rows, frameCount: voice.count, engine: engine)
         }
+        voiceCache[name] = snapshot
+        return snapshot
+    }
+
+    /// The KV snapshot of caller-supplied conditioning, cached under a
+    /// `conditioning:` prefix so it never collides with a shipped voice name.
+    private func conditioningSnapshot(
+        _ conditioning: PocketTtsSmallConditioning, engine: PocketTtsSmallEngine,
+        constants: PocketTtsSmallConstants
+    ) async throws -> PocketTtsSmallEngine.Fp16Snapshot {
+        let dModel = constants.arch.dModel
+        guard conditioning.frameCount > 0, conditioning.rows.count == conditioning.frameCount * dModel else {
+            Self.logger.warning(
+                "Rejected conditioning: \(conditioning.rows.count) floats, expected "
+                    + "\(conditioning.frameCount)x\(dModel)")
+            throw PocketTtsConstantsLoader.LoadError.malformed(
+                "conditioning: \(conditioning.rows.count) floats, expected \(conditioning.frameCount)x\(dModel)")
+        }
+        let key = "conditioning:" + conditioning.cacheKey
+        if let cached = voiceCache[key] { return cached }
+        let snapshot = try await prefillSnapshot(
+            rows: conditioning.rows, frameCount: conditioning.frameCount, engine: engine)
+        voiceCache[key] = snapshot
+        return snapshot
+    }
+
+    private func prefillSnapshot(
+        rows: [Float], frameCount: Int, engine: PocketTtsSmallEngine
+    ) async throws -> PocketTtsSmallEngine.Fp16Snapshot {
+        try await engine.resetToZero()
+        try await engine.prefill(flatConditioning: rows, tokenCount: frameCount)
+        return try await engine.captureSnapshot()
+    }
+
+    private func openSession(
+        engine: PocketTtsSmallEngine, constants: PocketTtsSmallConstants,
+        snapshot: PocketTtsSmallEngine.Fp16Snapshot, temperature: Float?, seed: UInt64?
+    ) async -> PocketTtsSmallSession {
         var textNormalizer: (@Sendable (String) -> String)?
         if model == .phonon31m {
             textNormalizer = { @Sendable text in PhononTextNormalizer.normalize(text) }
@@ -136,12 +221,18 @@ public actor PocketTtsSmallManager {
     public func synthesizeSamples(
         text: String, voice: String? = nil, temperature: Float? = nil, seed: UInt64? = nil, deEss: Bool = true
     ) async throws -> [Float] {
+        // One frame loop shared with the conditioning path (de-ess + RTFx log) // wangqi modified 2026-11-07
         let t0 = Date()
+        let frames = try await synthesizeStreaming(text: text, voice: voice, temperature: temperature, seed: seed)
+        return try await collectSamples(frames, startedAt: t0, deEss: deEss)
+    }
+
+    private func collectSamples(
+        _ stream: AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error>, startedAt t0: Date, deEss: Bool
+    ) async throws -> [Float] {
         var samples: [Float] = []
         var frames = 0
-        for try await frame in try await synthesizeStreaming(
-            text: text, voice: voice, temperature: temperature, seed: seed)
-        {
+        for try await frame in stream {
             samples.append(contentsOf: frame.samples)
             frames += 1
         }
@@ -163,6 +254,24 @@ public actor PocketTtsSmallManager {
     ) async throws {
         let wav = try await synthesize(text: text, voice: voice, temperature: temperature, seed: seed)
         try wav.write(to: outputURL)
+    }
+}
+
+// Caller-supplied voice conditioning for imported voices (the app's Voice Clone voice files)
+// wangqi modified 2026-11-07
+/// Voice conditioning supplied by the caller: `emb` rows `[frameCount, dModel]`
+/// flattened row-major. `cacheKey` names these rows in the manager's voice
+/// cache and must change whenever the rows do.
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, *)
+public struct PocketTtsSmallConditioning: Sendable {
+    public let rows: [Float]
+    public let frameCount: Int
+    public let cacheKey: String
+
+    public init(rows: [Float], frameCount: Int, cacheKey: String) {
+        self.rows = rows
+        self.frameCount = frameCount
+        self.cacheKey = cacheKey
     }
 }
 
