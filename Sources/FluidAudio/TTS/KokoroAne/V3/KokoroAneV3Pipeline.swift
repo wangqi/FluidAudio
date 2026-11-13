@@ -5,7 +5,8 @@ import Foundation
 /// ANE-v3 runtime. Owned and called synchronously by KokoroAneModelStore.
 /// Supply the selected language's pinned base assets,
 /// export-fast-pipeline assets, and the masked split-decoder assets separately.
-/// Uses original models for requests outside available static buckets.
+/// Uses original models for requests outside available static buckets, and for
+/// every request on a Metal-free routing (see ``usesFastVocoder(_:)``).
 /// A pipeline serializes calls; create separate instances for independent streams.
 final class KokoroAneV3Pipeline {
     struct Result: Sendable {
@@ -17,13 +18,16 @@ final class KokoroAneV3Pipeline {
     }
     private let models: [String: MLModel]
     private let albertBuckets: [Int]
+    /// Empty when the fast vocoder is off.
     private let decoderBuckets: [Int]
-    private let source: KokoroAneV3NativeSource
+    private let source: KokoroAneV3NativeSource?
     private let lock = NSLock()
     private typealias Arrays = KokoroAneV3Arrays
 
-    init(baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL) throws {
-        source = try KokoroAneV3NativeSource(parametersURL: fastDirectory.appendingPathComponent("native-source.json"))
+    init(
+        baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL,
+        computeUnits: KokoroAneComputeUnits
+    ) throws {
         func open(
             _ directory: URL, _ name: String, _ units: MLComputeUnits, lowPrecision: Bool = false
         ) throws -> MLModel {
@@ -76,27 +80,47 @@ final class KokoroAneV3Pipeline {
             ).sorted()
         }
         albertBuckets = try buckets(fastDirectory, "KokoroAlbert_")
-        decoderBuckets = try buckets(decoderDirectory, "KokoroDecoderPre_")
-        guard !albertBuckets.isEmpty, !decoderBuckets.isEmpty else {
-            throw KokoroAneV3Error.missingModel("Static buckets")
-        }
+        guard !albertBuckets.isEmpty else { throw KokoroAneV3Error.missingModel("Static buckets") }
         var loaded: [String: MLModel] = [:]
-        for stage in ["Albert", "PostAlbert", "Alignment", "Prosody", "Noise", "Vocoder", "Tail"] {
-            let suffix = ["Noise", "Prosody", "Tail"].contains(stage) ? "_v2" : ""
-            let units: MLComputeUnits = ["Noise", "Tail"].contains(stage) ? .cpuAndGPU : .cpuAndNeuralEngine
-            loaded[stage] = try open(baseDirectory, "Kokoro" + stage + suffix, units, lowPrecision: true)
+        // Base stages follow the caller's routing, so the OS 27 default
+        // (`aneTailCpu`) keeps Noise and Tail off Metal like the legacy chain (#1103).
+        for stage in KokoroAneStage.allCases {
+            let name = stage.rawValue.prefix(1).uppercased() + stage.rawValue.dropFirst()
+            let suffix = [.noise, .prosody, .tail].contains(stage) ? "_v2" : ""
+            loaded[name] = try open(
+                baseDirectory, "Kokoro" + name + suffix, computeUnits.units(for: stage), lowPrecision: true)
         }
         for bucket in albertBuckets {
             loaded["Albert_\(bucket)"] = try open(fastDirectory, "KokoroAlbert_\(bucket)", .cpuAndNeuralEngine)
         }
-        for bucket in decoderBuckets {
-            loaded["Decoder_\(bucket)"] = try open(decoderDirectory, "KokoroDecoderPre_\(bucket)", .cpuAndNeuralEngine)
+        if Self.usesFastVocoder(computeUnits) {
+            source = try KokoroAneV3NativeSource(
+                parametersURL: fastDirectory.appendingPathComponent("native-source.json"))
+            decoderBuckets = try buckets(decoderDirectory, "KokoroDecoderPre_")
+            guard !decoderBuckets.isEmpty else { throw KokoroAneV3Error.missingModel("Static buckets") }
+            for bucket in decoderBuckets {
+                loaded["Decoder_\(bucket)"] = try open(
+                    decoderDirectory, "KokoroDecoderPre_\(bucket)", .cpuAndNeuralEngine)
+            }
+            loaded["SourceGenerator"] = try open(fastDirectory, "KokoroSourceGenerator", computeUnits.tail)
+        } else {
+            source = nil
+            decoderBuckets = []
         }
-        loaded["SourceGenerator"] = try open(fastDirectory, "KokoroSourceGenerator", .cpuAndGPU)
         models = loaded
     }
 
-    func synthesize(inputIds: [Int32], style: [Float], speed: Float = 1) throws -> Result {
+    /// The fast vocoder (masked decoder + SourceGenerator) only pays off when
+    /// SourceGenerator, a dynamic-shape fp32 graph, runs on the GPU. On CPU it
+    /// is ~4x slower than the base Vocoder/Noise/Tail chain (M5 Pro, #1103),
+    /// so a Metal-free routing uses the base chain at every length.
+    static func usesFastVocoder(_ computeUnits: KokoroAneComputeUnits) -> Bool {
+        computeUnits.tail == .cpuAndGPU
+    }
+
+    func synthesize(
+        inputIds: [Int32], style: [Float], speed: Float = 1, pauses: [KokoroAnePauses.Span] = []
+    ) throws -> Result {
         guard (2...512).contains(inputIds.count), inputIds.allSatisfy({ (0..<178).contains($0) }),
             style.count == 256, style.allSatisfy(\.isFinite), speed.isFinite, speed > 0,
             (Float(0x1p-24)...65504).contains(speed)
@@ -106,10 +130,12 @@ final class KokoroAneV3Pipeline {
         }
         lock.lock()
         defer { lock.unlock() }
-        return try autoreleasepool { try run(inputIds: inputIds, style: style, speed: speed) }
+        return try autoreleasepool { try run(inputIds: inputIds, style: style, speed: speed, pauses: pauses) }
     }
 
-    private func run(inputIds: [Int32], style voice: [Float], speed: Float) throws -> Result {
+    private func run(
+        inputIds: [Int32], style voice: [Float], speed: Float, pauses: [KokoroAnePauses.Span]
+    ) throws -> Result {
         var timings: [String: Double] = [:]
         func time() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
         func predict(_ stage: String, _ input: [String: MLMultiArray]) throws -> MLFeatureProvider {
@@ -152,9 +178,13 @@ final class KokoroAneV3Pipeline {
         guard values.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 2000 }) else {
             throw KokoroAneV3Error.invalidInput("Invalid predicted durations")
         }
-        let durations = values.map { max(1, Int32($0.rounded())) }
+        var durations = values.map { max(1, Int32($0.rounded())) }
+        let silentFrames = KokoroAnePauses.apply(pauses, to: &durations)
         let frames = durations.reduce(0) { $0 + Int($1) }
-        guard frames >= 2, frames <= 2000 else { throw KokoroAneV3Error.invalidInput("Audio exceeds 2000-frame limit") }
+        guard frames <= KokoroAneConstants.maxAcousticFrames else {
+            throw KokoroAneError.acousticFramesExceedCap(have: frames, cap: KokoroAneConstants.maxAcousticFrames)
+        }
+        guard frames >= 2 else { throw KokoroAneV3Error.invalidInput("Expected at least 2 acoustic frames") }
         let alignment = try predict(
             "Alignment",
             [
@@ -163,14 +193,21 @@ final class KokoroAneV3Pipeline {
             ])
         let asr = try Self.half(Self.array(alignment, "asr"))
         let prosody = try predict("Prosody", ["en": Self.half(Self.array(alignment, "en")), "style_s": style])
-        let f0 = try Self.array(prosody, "F0")
-        let noise = try Self.array(prosody, "N")
+        var f0 = try Self.array(prosody, "F0")
+        var noise = try Self.array(prosody, "N")
+        if !silentFrames.isEmpty {
+            var f0Values = Arrays.readFloats(f0)
+            var noiseValues = Arrays.readFloats(noise)
+            try KokoroAnePauses.silence(f0: &f0Values, n: &noiseValues, frames: silentFrames, durations: durations)
+            f0 = try Arrays.float32Array(shape: f0.shape.map(\.intValue), from: f0Values)
+            noise = try Arrays.float32Array(shape: noise.shape.map(\.intValue), from: noiseValues)
+        }
         let f16 = try Self.half(f0)
         let n16 = try Self.half(noise)
         var xPre: MLMultiArray?
         var generatedAudio: MLMultiArray?
         let bucket = decoderBuckets.first(where: { $0 >= frames })
-        if let bucket {
+        if let bucket, let source {
             let start = time()
             let har = try source.build(f0: Arrays.readFloats(f0))
             let spectrum = try Arrays.float32Array(shape: [1, 22, frames * 120 + 1], from: har)

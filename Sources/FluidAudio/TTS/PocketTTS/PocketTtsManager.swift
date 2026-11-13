@@ -30,7 +30,8 @@ public actor PocketTtsManager {
     /// - Parameters:
     ///   - defaultVoice: Default voice identifier (default: "alba").
     ///   - language: Which upstream language pack to load. Defaults to
-    ///     `.english` for backward compatibility.
+    ///     `.english`, Kyutai's current English checkpoint (`.english2026Apr` is the
+    ///     pack it replaced, #1087).
     ///   - directory: Optional override for the base cache directory.
     ///     When `nil`, uses the default platform cache location.
     ///   - precision: Which FlowLM precision to load (default: `.fp16`,
@@ -84,16 +85,18 @@ public actor PocketTtsManager {
     /// - Parameters:
     ///   - text: The text to synthesize.
     ///   - voice: Voice identifier (default: uses the manager's default voice).
-    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - temperature: Generation temperature (default: the language pack's
+    ///     `defaultTemperature`, 0.7 for most packs and 0.3 for `.english`).
     ///   - deEss: Whether to apply de-essing post-processing (default: true).
     /// - Returns: WAV audio data at 24kHz.
     public func synthesize(
         text: String,
         voice: String? = nil,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         deEss: Bool = true,
         maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk
     ) async throws -> Data {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -124,7 +127,8 @@ public actor PocketTtsManager {
     /// - Parameters:
     ///   - text: The text to synthesize.
     ///   - voiceData: Voice conditioning data (e.g., from cloneVoice).
-    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - temperature: Generation temperature (default: the language pack's
+    ///     `defaultTemperature`, 0.7 for most packs and 0.3 for `.english`).
     ///   - deEss: Whether to apply de-essing post-processing (default: true).
     /// - Returns: WAV audio data at 24kHz.
     ///
@@ -136,10 +140,11 @@ public actor PocketTtsManager {
     public func synthesize(
         text: String,
         voiceData: PocketTtsVoiceData,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         deEss: Bool = true,
         maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk
     ) async throws -> Data {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -163,10 +168,11 @@ public actor PocketTtsManager {
     public func synthesizeDetailed(
         text: String,
         voice: String? = nil,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         deEss: Bool = true,
         maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk
     ) async throws -> PocketTtsSynthesizer.SynthesisResult {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -195,7 +201,8 @@ public actor PocketTtsManager {
     /// - Parameters:
     ///   - text: The text to synthesize.
     ///   - voice: Voice identifier (default: uses the manager's default voice).
-    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - temperature: Generation temperature (default: the language pack's
+    ///     `defaultTemperature`, 0.7 for most packs and 0.3 for `.english`).
     /// - Returns: An `AsyncThrowingStream` of audio frames. Throws if a model
     ///   inference error occurs during generation.
     ///
@@ -211,9 +218,10 @@ public actor PocketTtsManager {
     public func synthesizeStreaming(
         text: String,
         voice: String? = nil,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk
     ) async throws -> AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error> {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -239,15 +247,17 @@ public actor PocketTtsManager {
     /// - Parameters:
     ///   - text: The text to synthesize.
     ///   - voiceData: Voice conditioning data (e.g., from cloneVoice).
-    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - temperature: Generation temperature (default: the language pack's
+    ///     `defaultTemperature`, 0.7 for most packs and 0.3 for `.english`).
     /// - Returns: An `AsyncThrowingStream` of audio frames. Throws if a model
     ///   inference error occurs during generation.
     public func synthesizeStreaming(
         text: String,
         voiceData: PocketTtsVoiceData,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk
     ) async throws -> AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error> {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -276,7 +286,8 @@ public actor PocketTtsManager {
     ///
     /// - Parameters:
     ///   - voice: Voice identifier (default: uses the manager's default voice).
-    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - temperature: Generation temperature (default: the language pack's
+    ///     `defaultTemperature`, 0.7 for most packs and 0.3 for `.english`).
     ///   - seed: Random seed for reproducibility (nil for random).
     /// - Returns: A session ready to accept text via `enqueue()`.
     ///
@@ -292,9 +303,10 @@ public actor PocketTtsManager {
     /// ```
     public func makeSession(
         voice: String? = nil,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         seed: UInt64? = nil
     ) async throws -> PocketTtsSession {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -313,14 +325,16 @@ public actor PocketTtsManager {
     ///
     /// - Parameters:
     ///   - voiceData: Voice conditioning data (e.g., from cloneVoice).
-    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - temperature: Generation temperature (default: the language pack's
+    ///     `defaultTemperature`, 0.7 for most packs and 0.3 for `.english`).
     ///   - seed: Random seed for reproducibility (nil for random).
     /// - Returns: A session ready to accept text via `enqueue()`.
     public func makeSession(
         voiceData: PocketTtsVoiceData,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         seed: UInt64? = nil
     ) async throws -> PocketTtsSession {
+        let temperature = temperature ?? language.defaultTemperature
         guard isInitialized else {
             throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
         }
@@ -351,10 +365,11 @@ public actor PocketTtsManager {
         text: String,
         outputURL: URL,
         voice: String? = nil,
-        temperature: Float = PocketTtsConstants.temperature,
+        temperature: Float? = nil,
         deEss: Bool = true,
         maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk
     ) async throws {
+        let temperature = temperature ?? language.defaultTemperature
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }

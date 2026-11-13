@@ -58,13 +58,13 @@ public struct VocabularyRescorer: Sendable {
         public let shortTermCbwTaperExponent: Float
 
         /// Minimum string similarity for a single-word spotter-anchored rescue
-        /// (#702, opt-in). `0.0` disables (default), preserving the
-        /// acoustic-only rescue; a positive value (e.g. 0.30) suppresses
-        /// near-zero-similarity over-fires at some recall cost.
+        /// (#702). Default `0.30` (#1151), which stops near-zero-similarity
+        /// over-fires at some recall cost; `0.0` disables the floor, restoring
+        /// the acoustic-only rescue.
         public let spotterRescueMinSimilarity: Float
 
         /// Minimum string similarity for a multi-word spotter-anchored rescue.
-        /// `0.0` disables (default). Recommended opt-in: 0.50.
+        /// Default `0.50` (#1151); `0.0` disables.
         public let spotterRescueMultiWordMinSimilarity: Float
 
         /// Whether the spotter-anchored acoustic rescue pass runs at all (#724).
@@ -79,6 +79,14 @@ public struct VocabularyRescorer: Sendable {
         /// above that this switch has no effect.
         public let spotterRescueEnabled: Bool
 
+        /// Whether a span every word of which the decoder heard at
+        /// `ContextBiasingConstants.confidentWordMinConfidence` or more loses the
+        /// context-bias bonus against a term it isn't a close spelling of (#967).
+        /// `true` (default) is calibrated on TDT token confidences; the Unified
+        /// engines' `VocabularyBoostingSession.itnDefaultConfig` turns it off, since
+        /// their emission probabilities are a different scale and weren't measured.
+        public let confidentWordBiasGate: Bool
+
         public static let `default` = Config()
 
         public init(
@@ -89,7 +97,8 @@ public struct VocabularyRescorer: Sendable {
             spotterRescueMinSimilarity: Float = ContextBiasingConstants.defaultSpotterRescueMinSimilarity,
             spotterRescueMultiWordMinSimilarity: Float = ContextBiasingConstants
                 .defaultSpotterRescueMultiWordMinSimilarity,
-            spotterRescueEnabled: Bool = ContextBiasingConstants.defaultSpotterRescueEnabled
+            spotterRescueEnabled: Bool = ContextBiasingConstants.defaultSpotterRescueEnabled,
+            confidentWordBiasGate: Bool = true
         ) {
             self.useAdaptiveThresholds = useAdaptiveThresholds
             self.referenceTokenCount = referenceTokenCount
@@ -98,6 +107,7 @@ public struct VocabularyRescorer: Sendable {
             self.spotterRescueMinSimilarity = spotterRescueMinSimilarity
             self.spotterRescueMultiWordMinSimilarity = spotterRescueMultiWordMinSimilarity
             self.spotterRescueEnabled = spotterRescueEnabled
+            self.confidentWordBiasGate = confidentWordBiasGate
         }
 
         // MARK: - Adaptive Threshold Functions
@@ -413,6 +423,10 @@ public struct VocabularyRescorer: Sendable {
         public let startTime: Double
         public let endTime: Double
         let tokenRange: Range<Int>?
+        /// Lowest TDT token confidence over the word's letters and digits; nil when the timings carry none or
+        /// the word is punctuation alone. A punctuation token doesn't count: TDT is often unsure of a
+        /// sentence-final `.` or a `,` after a word it heard at full confidence (#1151).
+        var minConfidence: Float? = nil
     }
 
     /// Build word-level timings from token timings.
@@ -425,6 +439,7 @@ public struct VocabularyRescorer: Sendable {
         var wordTokenStart = 0
         var wordTokenEnd = 0
         var wordTokensAreContiguous = true
+        var wordMinConfidence = Float.infinity
 
         for (tokenIndex, timing) in tokenTimings.enumerated() {
             let token = timing.token
@@ -446,7 +461,8 @@ public struct VocabularyRescorer: Sendable {
                             word: trimmedWord,
                             startTime: wordStart,
                             endTime: wordEnd,
-                            tokenRange: wordTokensAreContiguous ? wordTokenStart..<wordTokenEnd : nil
+                            tokenRange: wordTokensAreContiguous ? wordTokenStart..<wordTokenEnd : nil,
+                            minConfidence: wordMinConfidence.isFinite ? wordMinConfidence : nil
                         ))
                 }
                 currentWord = ""
@@ -457,6 +473,7 @@ public struct VocabularyRescorer: Sendable {
                 wordStart = timing.startTime
                 wordTokenStart = tokenIndex
                 wordTokensAreContiguous = true
+                wordMinConfidence = .infinity
             } else {
                 if tokenIndex != wordTokenEnd {
                     wordTokensAreContiguous = false
@@ -465,6 +482,9 @@ public struct VocabularyRescorer: Sendable {
             }
             wordEnd = timing.endTime
             wordTokenEnd = tokenIndex + 1
+            if token.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains) {
+                wordMinConfidence = min(wordMinConfidence, timing.confidence)
+            }
         }
 
         // Save final word
@@ -475,7 +495,8 @@ public struct VocabularyRescorer: Sendable {
                     word: trimmedWord,
                     startTime: wordStart,
                     endTime: wordEnd,
-                    tokenRange: wordTokensAreContiguous ? wordTokenStart..<wordTokenEnd : nil
+                    tokenRange: wordTokensAreContiguous ? wordTokenStart..<wordTokenEnd : nil,
+                    minConfidence: wordMinConfidence.isFinite ? wordMinConfidence : nil
                 ))
         }
 

@@ -7,7 +7,7 @@ public actor AsrManager {
 
     internal let logger = AppLogger(category: "ASR")
     internal let config: ASRConfig
-    private let audioConverter: AudioConverter = AudioConverter()
+    private let audioConverter: AudioConverter
 
     internal var preprocessorModel: MLModel?
     internal var encoderModel: MLModel?
@@ -95,6 +95,7 @@ public actor AsrManager {
 
     public init(config: ASRConfig = .default, models: AsrModels? = nil) {
         self.config = config
+        self.audioConverter = AudioConverter(resamplerQuality: config.resamplerQuality)
 
         if let models {
             self.asrModels = models
@@ -288,6 +289,7 @@ public actor AsrManager {
         decoderState: inout TdtDecoderState,
         contextFrameAdjustment: Int = 0,
         isLastChunk: Bool = false,
+        flushPendingTokens: Bool? = nil,
         globalFrameOffset: Int = 0,
         language: Language? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
@@ -359,6 +361,7 @@ public actor AsrManager {
                 decoderState: &decoderState,
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
+                flushPendingTokens: flushPendingTokens,
                 globalFrameOffset: globalFrameOffset,
                 language: language,
                 vocabulary: vocabulary,
@@ -387,6 +390,7 @@ public actor AsrManager {
                 decoderState: &decoderState,
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
+                flushPendingTokens: flushPendingTokens,
                 globalFrameOffset: globalFrameOffset,
                 punctuationTokenIds: punctuationTokenIds,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
@@ -475,7 +479,8 @@ public actor AsrManager {
         let factory = AudioSourceFactory()
         let (sampleSource, _) = try factory.makeDiskBackedSource(
             from: url,
-            targetSampleRate: config.sampleRate
+            targetSampleRate: config.sampleRate,
+            resamplerQuality: config.resamplerQuality
         )
 
         let totalSamples = sampleSource.sampleCount

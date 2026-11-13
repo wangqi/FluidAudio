@@ -224,6 +224,7 @@ enum TranscribeCommand {
         var melChunkContext: Bool? = nil
         var dualDecodeArbitration = false
         var seamGapRepair = true
+        var seamGapRepairMinGapSeconds: Double? = nil
         var seamTimingRealignment = true
         var streamingMode = false
 
@@ -403,6 +404,11 @@ enum TranscribeCommand {
                 parsed.dualDecodeArbitration = true
             case "--no-seam-gap-repair":
                 parsed.seamGapRepair = false
+            case "--seam-gap-min":
+                if i + 1 < args.count {
+                    parsed.seamGapRepairMinGapSeconds = Double(args[i + 1])
+                    i += 1
+                }
             case "--no-seam-timing-realignment":
                 parsed.seamTimingRealignment = false
 
@@ -647,6 +653,8 @@ enum TranscribeCommand {
                 melChunkContext: args.melChunkContext,
                 dualDecodeArbitration: args.dualDecodeArbitration,
                 seamGapRepair: args.seamGapRepair,
+                seamGapRepairMinGapSeconds: args.seamGapRepairMinGapSeconds
+                    ?? ASRConfig.default.seamGapRepairMinGapSeconds,
                 seamTimingRealignment: args.seamTimingRealignment
             )
             let asrManager = AsrManager(config: asrConfig)
@@ -1236,11 +1244,12 @@ enum TranscribeCommand {
                 --local-model-dir <path>       Exact compiled model directory; never downloads
                 --encoder-precision <int8|int8-v2|int4> Encoder quantization (default: int8;
                                                int8-v2 = int8-linear rebuild, avoids #760)
-                --language <code>              Language hint (e.g., en, de, fr, es)
+                --language <code>              Script hint (e.g., en, de, fr, es): keeps v3 to the language's
+                                               script; Latin languages decode alike, except fr (#1063)
                 --custom-vocab <file>          Apply vocabulary boosting in batch mode
                 --no-mel-context               Disable 80ms mel-context prepend for long-form batch ASR
-                                               (default: disabled on v3, enabled otherwise)
-                --mel-context                  Force-enable the mel-context prepend (v3 opt-in)
+                                               (default: disabled on v3 and tdt-ja, enabled otherwise)
+                --mel-context                  Force-enable the mel-context prepend (v3/tdt-ja opt-in)
                 --dual-decode-arbitration      Enable v3/no-mel long-form boundary arbitration
                 --no-seam-gap-repair           Skip the post-merge re-decode of chunk-seam gaps (#758)
                 --no-seam-timing-realignment   Keep the left window's timing for seam tokens (pre-fix timings)
@@ -1259,12 +1268,12 @@ enum TranscribeCommand {
                 --vocab-cbw <float>              Context-biasing weight boost (default: auto)
                 --vocab-margin <sec>             CTC frame alignment margin (default: 0.5)
 
-              Short-term over-fire controls (#702, opt-in; default off — these
-              improve precision on SHORT keyword vocabularies at some recall
-              cost on distinctive-name vocabularies):
-                --vocab-short-term-taper-pivot <n>   Reduce boost for terms with < n tokens (e.g. 5)
-                --vocab-spotter-min-sim <0-1>        Min similarity for acoustic single-word rescue (e.g. 0.30)
-                --vocab-spotter-min-sim-multi <0-1>  Min similarity for multi-word rescue (e.g. 0.50)
+              Short-term over-fire controls (#702; these improve precision on
+              SHORT keyword vocabularies at some recall cost on
+              distinctive-name vocabularies):
+                --vocab-short-term-taper-pivot <n>   Reduce boost for terms with < n tokens (e.g. 5; default off)
+                --vocab-spotter-min-sim <0-1>        Min similarity for acoustic one-word rescue (default 0.30; 0 = off)
+                --vocab-spotter-min-sim-multi <0-1>  Min similarity for multi-word rescue (default 0.50; 0 = off)
                 --vocab-disable-spotter-rescue       Turn the acoustic rescue OFF entirely (#724; pre-#634
                                                      behavior — biggest over-fire reduction for short vocabs;
                                                      the rescue only runs for vocabularies of <= 10 terms)

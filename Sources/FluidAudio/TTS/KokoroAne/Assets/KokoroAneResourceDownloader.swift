@@ -24,10 +24,14 @@ public enum KokoroAneResourceDownloader {
 
     /// Ensure all required mlmodelc + vocab + default voice files are present.
     /// Returns the repo directory containing them.
+    ///
+    /// - Parameter additionalModelNames: Opt-in bundles fetched on top of the
+    ///   variant's required set (e.g. the fp32 Vocoder, #1135).
     @discardableResult
     public static func ensureModels(
         variant: KokoroAneVariant = .english,
         directory: URL? = nil,
+        additionalModelNames: Set<String> = [],
         progressHandler: ProgressHandler? = nil
     ) async throws -> URL {
         // When an explicit directory is provided, use it as the repo root directly —
@@ -61,7 +65,7 @@ public enum KokoroAneResourceDownloader {
         let repo = variant.repo
         let repoDir = try repositoryDirectory(variant: variant, directory: modelsDirectory)
 
-        let required: Set<String>
+        var required: Set<String>
         switch variant {
         case .english, .spanish, .french:
             required = ModelNames.KokoroAne.requiredModels
@@ -70,6 +74,7 @@ public enum KokoroAneResourceDownloader {
         case .japanese:
             required = ModelNames.KokoroAne.requiredModelsJa
         }
+        required.formUnion(additionalModelNames)
 
         // ModelHub deliberately skips existing files. Repair legacy compiled
         // bundles before the existence-only fast path so caches created before
@@ -91,6 +96,7 @@ public enum KokoroAneResourceDownloader {
             try await ModelHub.download(
                 repo,
                 to: modelsDirectory,
+                additionalModelNames: additionalModelNames,
                 progressHandler: progressHandler
             )
         } else {

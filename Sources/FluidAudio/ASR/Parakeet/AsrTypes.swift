@@ -27,9 +27,10 @@ public struct ASRConfig: Sendable {
     /// blank-boundary fix). `nil` (default) resolves per model version:
     /// `false` on v3 — the no-mel path's silence-aligned chunk starts avoid
     /// both the multilingual drift (issue #594) and quiet-speech drops near
-    /// long silence runs (issue #803) — and `true` elsewhere. Set via the
-    /// `melChunkContext:` init parameter. See "Current Paths" in
-    /// Documentation/ASR/LongTranscription.md.
+    /// long silence runs (issue #803) — and on tdtJa, where the mel-context
+    /// path loses text at Japanese long-form seams (issue #1031); `true`
+    /// elsewhere. Set via the `melChunkContext:` init parameter. See
+    /// "Current Paths" in Documentation/ASR/LongTranscription.md.
     public let melChunkContextOverride: Bool?
 
     /// Legacy Boolean view of `melChunkContextOverride`. Reports the explicit
@@ -49,8 +50,12 @@ public struct ASRConfig: Sendable {
     /// (Documentation/ASR/LongTranscription.md).
     public let seamGapRepair: Bool
 
-    /// Minimum inter-token gap, in seconds, that triggers a seam-gap repair
-    /// probe when `seamGapRepair` is enabled.
+    /// Minimum inter-word gap, in seconds, that triggers a seam-gap repair
+    /// probe when `seamGapRepair` is enabled (default 0.5, the floor): the
+    /// dropped phrases measured on non-English oral history sit in 0.5–1.4 s
+    /// gaps, which the earlier 1.5 s default never probed. A vocabulary
+    /// without word boundaries (tdtJa) probes only gaps of 1.5 s or more
+    /// (issue #1031).
     public let seamGapRepairMinGapSeconds: Double
 
     /// Take seam-token timing from the window that decoded the token away
@@ -58,6 +63,12 @@ public struct ASRConfig: Sendable {
     /// (Documentation/ASR/LongTranscription.md). Text is unaffected by the
     /// rule itself; set `false` to reproduce pre-change timings.
     public let seamTimingRealignment: Bool
+
+    /// Resampler for audio that is not already at `sampleRate` (default
+    /// `.balanced`). `transcribe(url)` uses it on every path; a host that
+    /// converts audio itself and calls `transcribe(samples)` gets the same
+    /// transcript by passing the same quality to its `AudioConverter`.
+    public let resamplerQuality: AudioConverter.ResamplerQuality
 
     public static let `default` = ASRConfig()
 
@@ -71,8 +82,9 @@ public struct ASRConfig: Sendable {
         melChunkContext: Bool? = nil,
         dualDecodeArbitration: Bool = false,
         seamGapRepair: Bool = true,
-        seamGapRepairMinGapSeconds: Double = 1.5,
-        seamTimingRealignment: Bool = true
+        seamGapRepairMinGapSeconds: Double = 0.5,
+        seamTimingRealignment: Bool = true,
+        resamplerQuality: AudioConverter.ResamplerQuality = .balanced
     ) {
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
@@ -85,11 +97,12 @@ public struct ASRConfig: Sendable {
         self.seamGapRepair = seamGapRepair
         self.seamGapRepairMinGapSeconds = max(0.5, seamGapRepairMinGapSeconds)
         self.seamTimingRealignment = seamTimingRealignment
+        self.resamplerQuality = resamplerQuality
     }
 
     /// Resolve the mel-context tri-state against the loaded model version.
     func resolvedMelChunkContext(for modelVersion: AsrModelVersion?) -> Bool {
-        melChunkContextOverride ?? (modelVersion?.isV3Family != true)
+        melChunkContextOverride ?? !(modelVersion?.isV3Family == true || modelVersion == .tdtJa)
     }
 
     /// A copy with the decoder-shape fields replaced and every other setting
@@ -108,7 +121,8 @@ public struct ASRConfig: Sendable {
             dualDecodeArbitration: dualDecodeArbitration,
             seamGapRepair: seamGapRepair,
             seamGapRepairMinGapSeconds: seamGapRepairMinGapSeconds,
-            seamTimingRealignment: seamTimingRealignment
+            seamTimingRealignment: seamTimingRealignment,
+            resamplerQuality: resamplerQuality
         )
     }
 }

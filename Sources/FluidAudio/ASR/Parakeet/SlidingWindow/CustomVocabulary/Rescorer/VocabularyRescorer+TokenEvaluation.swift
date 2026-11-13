@@ -123,12 +123,30 @@ extension VocabularyRescorer {
         let marginFrames = Int(marginSeconds / frameDuration)
         let originalSearchStart = max(0, Int(candidate.spanStartTime / frameDuration) - marginFrames)
         let originalSearchEnd = min(logProbs.count, Int(candidate.spanEndTime / frameDuration) + marginFrames)
-        let (originalCtcScore, _, _) = spotter.ctcWordSpotConstrained(
+        var (originalCtcScore, _, _) = spotter.ctcWordSpotConstrained(
             logProbs: logProbs,
             keywordTokens: originalTokens,
             searchStartFrame: originalSearchStart,
             searchEndFrame: originalSearchEnd
         )
+        // The transcript's punctuation is not speech. CTC emits a mark at some pauses (`Okay,`) and not at others
+        // (a sentence-final `matter.`), and an unspoken mark drags the per-token average down far enough that a
+        // term beats the word that was said (`matter.` -2.96 and `matter` -1.15 against a boosted `Matterport`
+        // -1.52, #1151). Score the phrase as spoken too and keep the better of the two, as the term keeps the
+        // better of its two tokenizations.
+        let spokenPhrase = Self.strippingBoundaryPunctuation(candidate.originalPhrase)
+        if spokenPhrase != candidate.originalPhrase {
+            let spokenTokens = tokenizer.encode(spokenPhrase)
+            if !spokenTokens.isEmpty && spokenTokens != originalTokens {
+                let (spokenScore, _, _) = spotter.ctcWordSpotConstrained(
+                    logProbs: logProbs,
+                    keywordTokens: spokenTokens,
+                    searchStartFrame: originalSearchStart,
+                    searchEndFrame: originalSearchEnd
+                )
+                originalCtcScore = max(originalCtcScore, spokenScore)
+            }
+        }
 
         // Apply adaptive context-biasing weight, scaled to the variant
         // tokenization that actually scored best.
@@ -136,8 +154,15 @@ extension VocabularyRescorer {
         // already recognized name on bias alone. Close spellings and aliases
         // retain the normal bonus so genuine repetitions can still be corrected.
         let configuredBoost = config.adaptiveCbw(baseCbw: cbw, tokenCount: vocabTokensUsed.count)
+        // A span the TDT decoder heard confidently is most likely what was said: unless it is a close spelling
+        // of the term (where the listed spelling should win), the term gets no bias against it and must beat
+        // the span on CTC evidence alone (#967).
+        let confidentlyHeardOtherWord =
+            config.confidentWordBiasGate && !Self.isCloseSpelling(candidate)
+            && Self.isConfidentlyHeard(candidate, wordTimings: wordTimings)
         let adaptiveCbwValue =
-            searchWindow.createsAdjacentDuplicate && !Self.isTextSupportedRepetition(candidate)
+            (searchWindow.createsAdjacentDuplicate && !Self.isTextSupportedRepetition(candidate))
+                || confidentlyHeardOtherWord
             ? min(0, configuredBoost) : configuredBoost
         let boostedVocabScore = vocabCtcScore + adaptiveCbwValue
 
@@ -199,6 +224,23 @@ extension VocabularyRescorer {
             acousticFrameRange: acousticFrameRange,
             sourceFrameRange: sourceFrameRange
         )
+    }
+
+    /// Whether the TDT decoder heard every word of the candidate's span with at least
+    /// `ContextBiasingConstants.confidentWordMinConfidence`. A word of punctuation alone (a standalone `-`) isn't
+    /// speech and doesn't count either way (#1151).
+    static func isConfidentlyHeard(_ candidate: CTCMatchCandidate, wordTimings: [WordTiming]) -> Bool {
+        let spoken = candidate.spanIndices.filter { index in
+            !wordTimings.indices.contains(index)
+                || wordTimings[index].word.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains)
+        }
+        guard !spoken.isEmpty else { return false }
+        return spoken.allSatisfy { index in
+            guard wordTimings.indices.contains(index), let confidence = wordTimings[index].minConfidence else {
+                return false
+            }
+            return confidence >= ContextBiasingConstants.confidentWordMinConfidence
+        }
     }
 
     /// Build a truthful display reason for an available numeric CTC comparison.
@@ -310,8 +352,9 @@ extension VocabularyRescorer {
     ) {
         guard let firstIdx = candidate.spanIndices.first else { return }
 
-        // Replace first word with the replacement, mark rest as empty
-        modifiedWords[firstIdx].word = result.replacement
+        // Replace first word with the replacement, keeping the span's outer punctuation; mark rest as empty
+        let spanWords = candidate.spanIndices.map { modifiedWords[$0].word }
+        modifiedWords[firstIdx].word = Self.preservingBoundaryPunctuation(result.replacement, spanWords: spanWords)
         for idx in candidate.spanIndices.dropFirst() {
             modifiedWords[idx].word = ""  // Will be filtered out
         }
@@ -343,6 +386,7 @@ extension VocabularyRescorer {
     ///   - spanLength: Length of the span (1 for single word)
     ///   - spanWords: All normalized words in the span (for multi-word checks)
     ///   - vocabTerm: The vocabulary term being considered
+    ///   - termForms: The term's normalized canonical and alias forms
     ///   - currentSimilarity: Current similarity threshold
     /// - Returns: Tuple of (shouldSkip, adjustedMinSimilarity)
     func checkStopwordRules(
@@ -350,12 +394,13 @@ extension VocabularyRescorer {
         spanLength: Int,
         spanWords: [String],
         vocabTerm: String,
+        termForms: Set<String>,
         currentSimilarity: Float
     ) -> (shouldSkip: Bool, adjustedMinSimilarity: Float) {
         var minSimilarity = currentSimilarity
 
         // Single-word stopword check - skip entirely
-        if spanLength == 1 && Self.stopwords.contains(normalizedWord) {
+        if spanLength == 1 && Self.isSkippedStopword(normalizedWord, termForms: termForms) {
             debugLog("    [STOPWORD] '\(normalizedWord)' is a stopword, skipping replacement with '\(vocabTerm)'")
             return (shouldSkip: true, adjustedMinSimilarity: minSimilarity)
         }
@@ -373,6 +418,13 @@ extension VocabularyRescorer {
         }
 
         return (shouldSkip: false, adjustedMinSimilarity: minSimilarity)
+    }
+
+    /// Whether a lone word is skipped as a stopword. A word that exactly spells one of the term's normalized
+    /// forms (canonical or a registered alias) is not: that spelling was listed on purpose (#1115). The
+    /// similarity and CTC gates still apply to it.
+    static func isSkippedStopword(_ normalizedWord: String, termForms: Set<String>) -> Bool {
+        stopwords.contains(normalizedWord) && !termForms.contains(normalizedWord)
     }
 
     /// Check length ratio rules for single-word matches.

@@ -53,7 +53,7 @@ final class VocabularySpanPreservationTests: XCTestCase {
             .appendingPathComponent("Vocabulary")
         let fixtures = try JSONDecoder().decode(
             [Fixture].self, from: Data(contentsOf: root.appendingPathComponent("tdt-v3.json")))
-        for fixture in fixtures where fixture.id != "solanki" {
+        for fixture in fixtures where fixture.id.hasPrefix("quilter") {
             let audio = try AudioConverter().resampleAudioFile(root.appendingPathComponent(fixture.id + ".wav"))
             let probabilities = try await spotter.computeLogProbs(for: audio)
             let vocabulary = CustomVocabularyContext(terms: [
@@ -109,6 +109,72 @@ final class VocabularySpanPreservationTests: XCTestCase {
         }
     }
 
+    /// "…form a sort of shell": TDT heard `sort` at full confidence, and a similar listed term
+    /// must not replace it on bias alone (#967). With the default bias, `sort` became `Sora`.
+    func testAConfidentlyHeardWordIsNotReplacedBySimilarTerm() async throws {
+        let directory = CtcModels.defaultCacheDirectory()
+        let models = try await installedCtcModels()
+        let spotter = CtcKeywordSpotter(models: models)
+        let tokenizer = try await CtcTokenizer.load(from: directory)
+        let root = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
+            .appendingPathComponent("Vocabulary")
+        let fixtures = try JSONDecoder().decode(
+            [Fixture].self, from: Data(contentsOf: root.appendingPathComponent("tdt-v3.json")))
+        let fixture = try XCTUnwrap(fixtures.first { $0.id == "sort-of-shell" })
+        let audio = try AudioConverter().resampleAudioFile(root.appendingPathComponent("sort-of-shell.wav"))
+        let probabilities = try await spotter.computeLogProbs(for: audio)
+        // The #967 reporter's visible list; `Sora` is the term that replaced `sort`.
+        let terms = [
+            "Qwen", "EMEA", "Tuist", "Codex", "EnviousWispr", "EnviousStaging", "Envious Labs", "PostHog",
+            "Qualtrics", "Saurabh", "Sora", "Astra",
+        ]
+        let vocabulary = CustomVocabularyContext(
+            terms: terms.map { CustomVocabularyTerm(text: $0, ctcTokenIds: tokenizer.encode($0)) })
+        let size = ContextBiasingConstants.rescorerConfig(forVocabSize: terms.count)
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: spotter, vocabulary: vocabulary, config: .default, ctcModelDirectory: directory)
+        let result = rescorer.ctcTokenRescore(
+            transcript: fixture.text, tokenTimings: fixture.tokenTimings,
+            logProbs: probabilities.logProbs, frameDuration: probabilities.frameDuration,
+            cbw: size.cbw, marginSeconds: 0.5, minSimilarity: size.minSimilarity)
+        XCTAssertEqual(result.text, fixture.text)
+        XCTAssertFalse(result.wasModified)
+    }
+
+    /// A one-term vocabulary of a word nobody says must leave the speech alone (#1151). Without the rescue's
+    /// similarity floors, `zzqqxvwj` replaced "is mister Quilter's" on CTC evidence alone.
+    func testAnUnspokenTermDoesNotReplaceSpeechThroughTheRescue() async throws {
+        let (output, _, transcript) = try await rescore("quilter-possessive", listing: "zzqqxvwj")
+        XCTAssertEqual(output.text, transcript)
+        XCTAssertFalse(output.wasModified)
+    }
+
+    /// "…than his matter.": the transcript's period is not speech, and scored with it `matter.` lost to a listed
+    /// `Matterport` (#1151). The original phrase is also scored as spoken.
+    func testASentenceFinalWordIsScoredWithoutItsPeriod() async throws {
+        let (output, evidence, transcript) = try await rescore("quilter-possessive", listing: "Matterport")
+        XCTAssertEqual(output.text, transcript)
+        XCTAssertFalse(output.wasModified)
+        // Weighed and rejected, not skipped before the comparison.
+        XCTAssertTrue(
+            evidence.candidates.contains {
+                $0.basePhrase == "matter." && $0.canonicalTerm == "Matterport" && !$0.comparisonPassed
+            })
+    }
+
+    /// "…form a sort of shell.": TDT heard `shell` at full confidence and the period at 0.92. The period
+    /// doesn't make the word uncertain, so a listed `Shelby` gets no bias against it and loses on CTC (#1151).
+    func testAConfidentlyHeardWordKeepsItsGuardBeforePunctuation() async throws {
+        let (output, evidence, transcript) = try await rescore("sort-of-shell", listing: "Shelby")
+        XCTAssertEqual(output.text, transcript)
+        XCTAssertFalse(output.wasModified)
+        XCTAssertTrue(
+            evidence.candidates.contains {
+                $0.basePhrase == "shell." && $0.canonicalTerm == "Shelby" && $0.effectiveBoost == 0
+                    && !$0.comparisonPassed
+            })
+    }
+
     func testMisspelledAndSplitNamesAreCorrectedWithoutBorrowingTheirEvidenceTwice() async throws {
         let directory = CtcModels.defaultCacheDirectory()
         let models = try await installedCtcModels()
@@ -118,7 +184,7 @@ final class VocabularySpanPreservationTests: XCTestCase {
             .appendingPathComponent("Vocabulary")
         let fixtures = try JSONDecoder().decode(
             [Fixture].self, from: Data(contentsOf: root.appendingPathComponent("tdt-v3.json")))
-        for fixture in fixtures where fixture.id != "solanki" {
+        for fixture in fixtures where fixture.id.hasPrefix("quilter") {
             let audio = try AudioConverter().resampleAudioFile(root.appendingPathComponent(fixture.id + ".wav"))
             let probabilities = try await spotter.computeLogProbs(for: audio)
             // Perturb the spelling/segmentation of the recorded TDT tokens only;
@@ -196,6 +262,42 @@ final class VocabularySpanPreservationTests: XCTestCase {
             XCTAssertEqual(result.text, "Quilter Quilter's", "coarse=\(coarse)")
             XCTAssertTrue(result.wasModified, "coarse=\(coarse)")
         }
+    }
+
+    /// A recording rescored with a one-term vocabulary, the default config and the session's thresholds for
+    /// one term, with the evidence for every candidate.
+    private func rescore(
+        _ id: String, listing term: String
+    ) async throws -> (
+        output: VocabularyRescorer.RescoreOutput, evidence: VocabularyRescorer.CandidateEvidenceOutput,
+        transcript: String
+    ) {
+        let directory = CtcModels.defaultCacheDirectory()
+        let models = try await installedCtcModels()
+        let spotter = CtcKeywordSpotter(models: models)
+        let tokenizer = try await CtcTokenizer.load(from: directory)
+        let root = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
+            .appendingPathComponent("Vocabulary")
+        let fixtures = try JSONDecoder().decode(
+            [Fixture].self, from: Data(contentsOf: root.appendingPathComponent("tdt-v3.json")))
+        let fixture = try XCTUnwrap(fixtures.first { $0.id == id })
+        let audio = try AudioConverter().resampleAudioFile(root.appendingPathComponent(id + ".wav"))
+        let probabilities = try await spotter.computeLogProbs(for: audio)
+        let vocabulary = CustomVocabularyContext(terms: [
+            CustomVocabularyTerm(text: term, ctcTokenIds: tokenizer.encode(term))
+        ])
+        let size = ContextBiasingConstants.rescorerConfig(forVocabSize: 1)
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: spotter, vocabulary: vocabulary, config: .default, ctcModelDirectory: directory)
+        let output = rescorer.ctcTokenRescore(
+            transcript: fixture.text, tokenTimings: fixture.tokenTimings,
+            logProbs: probabilities.logProbs, frameDuration: probabilities.frameDuration,
+            cbw: size.cbw, marginSeconds: 0.5, minSimilarity: size.minSimilarity)
+        let evidence = rescorer.ctcTokenEvaluateCandidates(
+            transcript: fixture.text, tokenTimings: fixture.tokenTimings,
+            logProbs: probabilities.logProbs, frameDuration: probabilities.frameDuration,
+            cbw: size.cbw, marginSeconds: 0.5, minSimilarity: size.minSimilarity)
+        return (output, evidence, fixture.text)
     }
 
     private var taperedConfig: VocabularyRescorer.Config {

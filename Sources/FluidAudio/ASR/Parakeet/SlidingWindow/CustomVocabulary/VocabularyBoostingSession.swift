@@ -64,12 +64,13 @@ public struct VocabularyBoostingSession: Sendable {
     /// written words, so short word spans cover long acoustic stretches and
     /// become eligible for the spotter-anchored rescue pass at garbage
     /// spotter scores ('yen, down by 35.3%' → term at sim 0.20). The #702
-    /// similarity floors close exactly that hole; spelled-out engines
-    /// (SlidingWindow TDT) keep `.default`, where the rescue recovers brand
-    /// names the model mangles past the similarity gate.
+    /// similarity floors close exactly that hole. `.default` has the same
+    /// floors since #1151; this config also turns off `confidentWordBiasGate`,
+    /// which is calibrated on TDT token confidences.
     public static let itnDefaultConfig = VocabularyRescorer.Config(
         spotterRescueMinSimilarity: 0.30,
-        spotterRescueMultiWordMinSimilarity: 0.50
+        spotterRescueMultiWordMinSimilarity: 0.50,
+        confidentWordBiasGate: false
     )
 
     /// Create a session from a tokenized vocabulary and pre-loaded CTC models.
@@ -80,11 +81,14 @@ public struct VocabularyBoostingSession: Sendable {
     ///     shipped alongside `ctcModels` (#851); pre-tokenized terms (e.g. via
     ///     `CustomVocabularyContext.loadWithCtcTokens(from:ctcVariant:)`) are
     ///     used as-is.
-    ///   - ctcModels: Pre-loaded CTC models for keyword spotting
+    ///   - ctcModels: Pre-loaded CTC models for keyword spotting. Boosting
+    ///     reads `tokenizer.json` from their `directory`, or from
+    ///     `CtcModels.defaultCacheDirectory(for:)` when that is `nil`.
     ///   - config: Optional rescorer configuration (default: `.default`)
     ///   - thresholds: Rescoring thresholds (default: vocabulary-size defaults)
-    /// - Throws: Error if the CTC tokenizer cannot be loaded for untokenized
-    ///   terms, or if rescorer initialization fails
+    /// - Throws: `CtcTokenizer.Error.tokenizerNotFound` if that folder has no
+    ///   `tokenizer.json` (for any vocabulary, tokenized or not), or another
+    ///   error if the tokenizer or rescorer fails to initialize
     public init(
         vocabulary: CustomVocabularyContext,
         ctcModels: CtcModels,
@@ -92,7 +96,7 @@ public struct VocabularyBoostingSession: Sendable {
         thresholds: Thresholds = .default
     ) async throws {
         self.thresholds = thresholds
-        let ctcModelDir = CtcModels.defaultCacheDirectory(for: ctcModels.variant)
+        let ctcModelDir = CtcModels.tokenizerDirectory(loadedFrom: ctcModels.directory, variant: ctcModels.variant)
 
         // Terms built in code arrive without CTC token IDs, and every consumer
         // (spotter, rescorer) skips such terms without a word — the documented

@@ -139,6 +139,18 @@ public enum ContextBiasingConstants {
     /// - Used in: `VocabularyRescorer+ConstrainedCTC.swift` stopword check
     public static let stopwordSpanSimilarity: Float = 0.85
 
+    /// Lowest TDT token confidence at which a transcript word counts as confidently heard.
+    ///
+    /// A vocabulary term gets no context bias against a span whose words were all heard this
+    /// confidently, so it must beat the span on CTC evidence alone (#967). Below this, misheard
+    /// names keep the full bias; the 13 #967 dictation clips' correct fixes all sit at 0.70 or less.
+    /// Only the word's letter and digit tokens count, not its punctuation (#1151).
+    public static let confidentWordMinConfidence: Float = 0.99
+
+    /// Similarity at and above which a confidently heard span is a close spelling of the term
+    /// ("Quiltor" / "Quilter", "Rashid" / "Rasyid") and keeps its bias, so the listed spelling still wins.
+    public static let closeSpellingSimilarity: Float = 0.80
+
     // MARK: - Context Biasing Weights
 
     /// Default context-biasing weight (CBW) per NeMo paper.
@@ -287,7 +299,7 @@ public enum ContextBiasingConstants {
     /// - Used in: `VocabularyRescorer.Config.default` and init
     public static let defaultReferenceTokenCount: Int = 3
 
-    // MARK: - Short-Term Over-Fire Controls (#702, opt-in)
+    // MARK: - Short-Term Over-Fire Controls (#702)
     //
     // The blank-aware DP score is a per-token average log-prob. A short
     // keyword (few tokens) can free-start align to its single best-matching
@@ -296,12 +308,18 @@ public enum ContextBiasingConstants {
     // `Hall of Q4.` → `Snyk`). Benchmarking shows that gating this hard enough
     // to suppress short-vocab false positives also costs KWS recall on
     // distinctive-name vocabularies (earnings22), because the same mechanisms
-    // produce both. These controls therefore DEFAULT TO DISABLED (no behavior
-    // change) and are opt-in for short-keyword KWS via `VocabularyRescorer.Config`,
-    // the `transcribe` CLI flags, or the `FLUID_*` env overrides below.
+    // produce both. The cbw taper therefore DEFAULTS TO DISABLED and is opt-in
+    // for short-keyword KWS via `VocabularyRescorer.Config`, the `transcribe`
+    // CLI flags, or the `FLUID_*` env overrides below (recommended: pivot 5 /
+    // exponent 2.0).
     //
-    // Recommended short-vocab opt-in values: taper pivot 5 / exponent 2.0,
-    // spotter floors 0.30 (single) / 0.50 (multi-word).
+    // The spotter-rescue similarity floors default to 0.30 (single word) / 0.50
+    // (multi-word) since #1151. Without them the rescue replaces unrelated
+    // speech with a term on CTC evidence alone (a one-term `zzqqxvwj`
+    // vocabulary took four spoken words), and on earnings22 turning them off
+    // adds 51 terms at the right position and 798 at a wrong one. They cost
+    // some recall of names TDT mangles past the similarity gate; `0.0` turns a
+    // floor off.
 
     /// Default token-count pivot for the short-term cbw taper. A value `<= 1`
     /// disables the taper (the default). When enabled (e.g. 5), terms with
@@ -318,17 +336,17 @@ public enum ContextBiasingConstants {
     }
 
     /// Default minimum string similarity for a single-word spotter-anchored
-    /// rescue. `0.0` disables the floor (the default), preserving the
+    /// rescue: `0.30` (#1151). `0.0` disables the floor, restoring the
     /// acoustic-only rescue. Env: `FLUID_SPOTTER_MIN_SIM`.
     public static var defaultSpotterRescueMinSimilarity: Float {
-        envFloat("FLUID_SPOTTER_MIN_SIM") ?? 0.0
+        envFloat("FLUID_SPOTTER_MIN_SIM") ?? 0.30
     }
 
     /// Default minimum string similarity for a multi-word spotter-anchored
-    /// rescue (replacing several words with one term is more error-prone).
-    /// `0.0` disables. Env: `FLUID_SPOTTER_MIN_SIM_MULTI`.
+    /// rescue (replacing several words with one term is more error-prone):
+    /// `0.50` (#1151). `0.0` disables. Env: `FLUID_SPOTTER_MIN_SIM_MULTI`.
     public static var defaultSpotterRescueMultiWordMinSimilarity: Float {
-        envFloat("FLUID_SPOTTER_MIN_SIM_MULTI") ?? 0.0
+        envFloat("FLUID_SPOTTER_MIN_SIM_MULTI") ?? 0.50
     }
 
     /// Whether the spotter-anchored acoustic rescue pass runs at all (#724).

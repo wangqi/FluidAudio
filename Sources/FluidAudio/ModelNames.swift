@@ -665,6 +665,12 @@ public enum ModelNames {
             melSpectrogramPath,
             audioEncoderPath,
         ]
+
+        /// `requiredModels` plus `vocab.json`: what a CTC cache needs to load.
+        /// `ModelHub` and `CtcModels.modelsExist` judge the cache by the same
+        /// set, so a missing vocabulary triggers the download that fetches it
+        /// (issue #1147).
+        public static let requiredFiles: Set<String> = requiredModels.union([vocabularyPath])
     }
 
     /// SenseVoiceSmall (FunASR) model names. 3-stage pipeline:
@@ -787,10 +793,15 @@ public enum ModelNames {
 
     /// CAM++ speaker-embedding model names (2 CoreML stages).
     ///   Preprocessor (fp32/CPU): waveform -> 80-d fbank
-    ///   CamPlusPlus (fp16/ANE): fbank -> 192-d speaker embedding
+    ///   CamPlusPlus (fp32, CPU/GPU): mean-normalized fbank -> 192-d speaker embedding
+    ///
+    /// `_v2` (issue #985): the preprocessor computes 3D-Speaker's Kaldi fbank (Povey window,
+    /// log floor after the mel filterbank), and CamPlusPlus averages each segment-pooling tail
+    /// over its own frames and runs in fp32. The fp16 v1 gave unrelated embeddings for some
+    /// lengths (e.g. 17.9–20.4 s).
     public enum CampPlus {
-        public static let preprocessor = "CamPlusPreprocessor"
-        public static let model = "CamPlusPlus"
+        public static let preprocessor = "CamPlusPreprocessor_v2"
+        public static let model = "CamPlusPlus_v2"
 
         public static let preprocessorFile = preprocessor + ".mlmodelc"
         public static let modelFile = model + ".mlmodelc"
@@ -1095,6 +1106,19 @@ public enum ModelNames {
         public static let encoderFile = encoder + ".mlmodelc"
         public static let decoderFile = decoder + ".mlmodelc"
         public static let jointFile = joint + ".mlmodelc"
+
+        /// `encoder.mlmodelc` with the conv-cache slice of a concat rewritten so
+        /// M2 and M3 Neural Engines compile it; the original makes Core ML run
+        /// the encoder on the CPU there (issue #1141). Same weights, inputs and
+        /// outputs, byte-identical results. Published once per tier in
+        /// `encoder-v2/<tier>ms/` for both `latin` and `multilingual`, outside
+        /// the tier folders that older releases download whole. Loaded in place
+        /// of `encoder.mlmodelc` when a model directory has it.
+        public static let encoderV2File = "encoder_v2.mlmodelc"
+        /// Tiers with ``encoderV2File``. 4480 ms has no such slice.
+        public static let encoderV2ChunkMs: Set<Int> = [560, 1120, 2240]
+
+        static func encoderV2Subdirectory(chunkMs: Int) -> String { "encoder-v2/\(chunkMs)ms" }
 
         /// Same model names with the uncompiled `.mlpackage` extension that
         /// `mobius/.../coreml/build_int8/` ships before CoreML compilation.
@@ -1855,6 +1879,10 @@ public enum ModelNames {
         // re-download. See mobius laishere-coreml docs/trials-and-errors.md.
         public static let noise = "KokoroNoise_v2.mlmodelc"
         public static let vocoder = "KokoroVocoder.mlmodelc"
+        // Opt-in v2 (`KokoroAneVocoderPrecision.float32`): fp32 compute. The fp16
+        // Core ML CPU path on SME chips (A19 Pro, A20, M5) corrupts the first
+        // ~1 s of long utterances (robotic onset). See issue #1135.
+        public static let vocoderFloat32 = "KokoroVocoder_v2.mlmodelc"
         // v2: COLA-normalized iSTFT deconv weights (raw output was exactly 1.5x
         // the PyTorch reference). Renamed (not overwritten) so cached clients
         // re-download. See issue #852.
@@ -2031,7 +2059,7 @@ public enum ModelNames {
         case .parakeetTdtCtc110m:
             return ModelNames.ASR.requiredModelsFused
         case .parakeetCtc110m, .parakeetCtc06b:
-            return ModelNames.CTC.requiredModels
+            return ModelNames.CTC.requiredFiles
         case .senseVoiceSmall:
             return ModelNames.SenseVoice.requiredModels(precision: variant)
         case .nemotron35TranscribeLite:
