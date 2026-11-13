@@ -1,103 +1,114 @@
-# FluidAudio Upgrade Notes: tag-20261024 → tag-20261030
+# FluidAudio Upgrade Notes: tag-20261030 → tag-20261113
 
-**Merged:** 2026-10-30 · **Upstream:** FluidInference/FluidAudio `main` (**21 commits**, `925f32f4..58db32f0`),
-podspec **v0.17.7 → v0.18.0** · **Merge:** `58db32f0` (conflict-free) · **Fork patch on top:** none
+**Merged:** 2026-11-13 · **Upstream:** FluidInference/FluidAudio `main` (**61 commits**, up to `d653a34a`,
+2026-11-11), podspec **v0.18.0 → v0.18.3** · **Merge:** `c4f36c1b` (old fork head `dcf2ea9b`)
 **Integration doc:** `helper/docs/audio-fluidaudio.md` · **Consumers:** `libs/audio/fluidaudio/`,
 `libs/audio/voiceclone/fluidaudio/VoiceCloneFluidPocketBuilder.swift`, `libs/audio/ITNHelper.swift`,
 `SpeechHelper.createFluidAudioSpeaker` / `makeJobSpeaker`, `views/audio/fluidaudio/FluidAudioModelManager.swift`
 
-Most of the 21 commits add backends the app does not wrap: LFM3-Audio-2B (ASR, live ASR and TTS on Core ML
-and Core AI), Phonon-2.5 multilingual GPU ASR, Underdog Bark 3.0 / 3.0 Clean, Nemotron Unified ASR 0.6B,
-Nemotron 3.5 Transcribe Lite and Paradee-8M v1.2. The rest is vocabulary-boosting and sliding-window
-streaming work (#1041, #1080, #929, #1079, #1035), which the app does not call either. Only **three commits
-reach a shipped row**, and all three are small: Parakeet transcripts drop a stray `<unk>` (#1054), the EOU
-streaming manager now throws `CancellationError` from a cancelled task (#1033), and the PocketTTS tokenizer
-no longer matches literal special-piece text such as `<s>` (#1068). **No silent ship-blocker**: no fork patch
-was lost or moved (49 markers / 13 files, P3), no `ModelNames` constant of a shipped row changed, no new
-network path is reachable from a shipped variant, and no app code needs an edit to compile.
+Most of the 61 commits are quality fixes on paths the app already runs. Long-form Parakeet v3 / Japanese
+decoding gets several seam and opening-speech repairs. Cohere cuts Japanese and Chinese long audio at pauses.
+PocketTTS sentence chunking is smarter. Kokoro ANE Mandarin follows misaki v1.1 more closely. **One
+ship-blocker was found in the tests, not in shipped behaviour (#1089):** `PocketTtsLanguage.english` now names
+Kyutai's new `english_2026-10` checkpoint (`v2.1/english_2026-10`). The April pack the
+`fa-pocket-tts-english` row ships, in `v2.1/english`, is now `.english2026Apr`. The app now maps the row to
+`.english2026Apr` (option A), so users keep the files they already have; adopting 2026-10 is a P8 candidate.
+No fork patch was lost (P3: 13 source files / 55 markers, unchanged). No new network path is reachable from a
+shipped row. `Package.swift` is unchanged.
 
 ---
 
 ## 1. Upstream changes, by area
 
-### 1.1 ASR, the shipped paths (`AsrManager` batch for v3 / ja, `StreamingEouAsrManager` for EOU)
+### 1.1 ASR, the shipped paths (`AsrManager` batch v3 / tdtJa, `StreamingEouAsrManager`, Cohere, Paraformer, SenseVoice)
 
 | Commit | What it does | Reaches the app? |
 |---|---|---|
-| `6dac59a7` #1054 | Adds `.bark3` / `.bark3Clean`. Also: `<unk>` tokens are dropped before text and timings are built (`droppingUnknownTokens`, plus a filter in `AsrManager`'s token join) for **every** TDT version | **Yes**, `fa-parakeet-tdt-v3` and `fa-parakeet-ctc-ja`: a literal `<unk>` can no longer appear in a transcript. Text otherwise unchanged |
-| `6924debc` #1033 | `SlidingWindowAsrManager.cancel()` joins its worker. **EOU** `process(audioBuffer:)`, `finish()` and `processBufferedAudio()` now `try Task.checkCancellation()`; the Nemotron streaming managers too | **Yes**, `fa-parakeet-eou-120m`: a cancelled feed/finish task now throws `CancellationError` instead of running to the end. Stop paths audited in §5.1: no user-visible effect |
-| `2d0ef4bc` #1075 | `AsrModelVersion.phonon25`; `resolvedEncoderComputeUnits` only changes the placement for `.phonon25`; `inferredVersion` exact-folder match; pinned-revision download short-circuit | No: for `.v3` / `.tdtJa` the encoder units are still `requested ?? configuration`; the app passes the version explicitly and loads with `loadLocal` |
-| `4d1b57bc` #1035 | `SlidingWindowTokenUpdate` / `SlidingWindowTokenCursor` token-revision stream; a monotonic stable-prefix floor in the re-decode (`stableTokenFloor`, default 0) | No: the app does not use `SlidingWindowAsrManager`; with floor 0 the shared re-decode helper is unchanged |
-| `1aa042c7` #1041 | Vocabulary rescoring keeps names, possessives and the word after a hyphenated name | No: the app configures no custom vocabulary |
-| `2cbae2b5` #1080 | `VocabularyBoostingSession.Thresholds`; `detectedTerms` floor −6.5; StreamingUnified double-space fix | No (no vocabulary boosting, no Unified manager) |
-| `2faffc23` #929 | `ASRResult.ctcReplacements` (defaulted, `nil` without boosting); `TextNormalizer` forwards it | No behaviour change; ITN path unchanged |
-| `6f793893` #1079 | `CtcModels` MelSpectrogram forced to `.cpuOnly` (macOS 27.0.1 put part of it on the ANE and the CTC encoder emitted blank) | No: `CtcModels` serves keyword spotting / vocabulary boosting only; `fa-parakeet-ctc-ja` runs on `AsrManager(.tdtJa)`, which never loads `CtcModels` |
-| `55f65d9c` #1071 | Nemotron Unified ASR 0.6B (25 European languages) on the Unified managers | Not adopted (§6) |
-| `c9cad1bb` #1069, `6ea419dc` #1070 | Nemotron 3.5 Transcribe Lite (encoder + CTC words, speakers from Nemotron-3-Diarization); OS check before download. `AudioMelSpectrogram` gained optional `window:` / `filterbank:` | Not adopted (§6). The mel change is defaulted (`nil`), so EOU and `Nemotron3Diarizer` compute the same features |
-| `4e2985fc` #1076, `6b516c3d` #1078, `fc5c5f06` #1077 | LFM3-Audio-2B (Core ML + Core AI), low-disk hardening, `ModelCachePreservingError` in `ModelHub.loadWithRecovery`, TTS host-work trims | Not adopted (§6). The `ModelHub` change only skips a purge-and-redownload for that error type |
+| `8ff96513` #1056 | Long-form v3: the post-merge repair also probes the span before the first token, so lost opening speech is recovered | **Yes**: `fa-parakeet-tdt-v3` with audio longer than one window |
+| `b20d2098` #1061, `f59050ed` #1097, `30379135` #1128, `e000dfde` #1111 | Seam-gap repair probes every inter-word gap ≥ 0.5 s (was 1.5 s). A window that opens mid-word joins the previous text. A re-spelled word at a seam replaces the kept one. Pending tokens are flushed at an interior window ending in a pause | **Yes**: v3 long-form text at window seams. More probes, so long files decode a little slower |
+| `b3eda843` #1098, `70f44050` #1125, `eff40bde` #1143, `a99f5e4a` | tdtJa long-form: no mel context by default; only gaps ≥ 1.5 s are probed; the seam re-decodes a time tail and drops duplicate kept tokens | **Yes**: `fa-parakeet-ctc-ja` long audio |
+| `9c9f630b` #1134, `b7610fcf` #1021 | `ASRConfig.resamplerQuality` (default `.balanced`); `AudioConverter(resamplerQuality:)`; streaming file conversion without the 4 GiB cap | No: the app resamples to 16 kHz itself and calls `transcribe(samples)`; all new parameters are defaulted |
+| `a31f1515` #1136 | EOU `rearm(keepTranscript:)` (opt-in). Buffered-chunk drains now run one at a time; `reset()` waits for a running drain | **Partly**: `fa-parakeet-eou-120m`. `rearm` is not called. The drain serialization runs on every `process` / `finish` / `reset` and is bounded (a cancelled drain throws at the next chunk) |
+| `9a404d63` #1109 | Raw encoder-outputs callback on streaming managers | No (opt-in) |
+| `ba90110a` #1146 | Cohere `transcribeLong`: Japanese / Chinese audio is cut into 10–20 s chunks at pauses, joined without a separator | **Yes**: the Cohere row with `ja` / `zh` audio over 35 s |
+| `b5813507` #1082, `d11c64d3` #1096 | SenseVoice emotion / event / language confidence from the query logits; pads to the lengths the loaded encoder accepts (fp32) | Compiles unchanged. The app reads `transcribeDetailed` text + language only; it ships int8 |
+| `e1bc22be` #1120 | Currency symbols are script-neutral in `TokenLanguageFilter` | v3 with a language hint only |
+| vocab: `66a239a3`, `5fff83ae`, `ca9fece9`, `bc025775`, `02bcb9a4`, `9e07b657`, `9e6723c5`, `8303caeb`, `608ec6a7` | Vocabulary boosting / CTC rescoring fixes | No (no custom vocabulary) |
+| `653386fa` #1142, `a36629c2` #1145 | Nemotron multilingual: opt-in split 2240 ms encoder, `encoder_v2.mlmodelc` for M2/M3 ANEs | No (§6) |
 
 ### 1.2 TTS
 
 | Commit | What it does | Reaches the app? |
 |---|---|---|
-| `4c65ad49` #1068 | `SentencePieceTokenizer` matches only normal / user-defined pieces; an uncovered scalar becomes byte pieces (byte fallback on) or one `<unk>` per run (off) | **Yes, edge case only**, all 6 `fa-pocket-tts-*` rows: every shipped `tokenizer.model` has byte fallback on (upstream checked all 28), so ordinary text tokenizes as before. Input that literally contains `<s>`, `<unk>`, `<0x41>` now tokenizes as text instead of the control piece. Upstream: 184/184 token-ID matches with Google `sentencepiece` (was 145/184) |
-| `a7c887af` #1073 | Paradee-8M v1.2 (four voices, `.v12` default), British G2P: `gb_lexicon_cache.json`, `MisakiBritishFallback`, `KokoroAneEnglishPhonemizer(british:)` (default `false`), `LexiconAssetCache.englishFileName(british:)`, `ensureEnglishLexicon(british:)` | Not adopted (§6). Kokoro ANE stays on the US lexicon (`british: false`); the fork's flat-lookup gate keys on the chosen filename (P3) |
-| `1b0ed50d` #1052 | Pocket small demo app fixes | No (Examples) |
+| `a3303b54` #1089 | **`.english` = `v2.1/english_2026-10`** (new weights, voices incl. `daan`, temperature 0.3, re-projects cloned voices). The April pack becomes `.english2026Apr` (`v2.1/english`). All synthesize / session APIs take `temperature: Float? = nil` → `language.defaultTemperature` | **Yes, handled**: the app maps `fa-pocket-tts-english` → `.english2026Apr` (§5). It passes its own temperature (0.7), so the default change does not reach it |
+| `16d0a174` #935, `da7a72ce` #1122, `9599521c` #1121, `22f0ffb1` #1132 | PocketTTS chunking: oversized sentences cut at more punctuation with balanced word splits; no sentence end at a period inside a word or at a decimal; closing quotes stay with their sentence | **Yes**: all 6 `fa-pocket-tts-*` rows; better pauses and fewer mid-number cuts |
+| `e43ff1a5` #1058 | Session-lifetime test + docs | No |
+| `810a0bd7` #1137, `e63b5230` #1138 | `KokoroAneVocoderPrecision`: opt-in fp32 `KokoroVocoder_v2.mlmodelc` fixes a robotic first ~1 s of long utterances on SME chips (A19 Pro, A20, M5) on the Core ML CPU path. Default stays fp16 | **No change by default** (the app passes nothing). The bug it fixes **does affect the app** on those chips: an opportunity (§7) |
+| `d98ec82b` #1131 | `KokoroAneManager.setPunctuationPauses(_:)` | No: not called, so `KokoroAnePauses.spans` returns `[]` and the chain is unchanged |
+| `d2bfd78d` #1129, `4b53afa7` #1130, `74f2ed5a` #1055 | Kokoro Mandarin G2P: misaki v1.1 spaces, word slashes, erhua R; g2pW keeps to the mainland dict; word order around a custom-lexicon hit. `/` is now a chunk boundary | **Yes**: Kokoro `ANE-zh` voices; Mandarin phonemes differ |
+| `ee78635d` #1104 | Kokoro ANE-v3 follows the OS 27 default routing | No (the app runs the legacy chain) |
 
-### 1.3 Packaging and other
+### 1.3 Diarization, speaker, download, other
 
-- `e1528798` podspec 0.18.0. No `Package.swift` / `Package@swift-6.2.swift` change in this range.
-- `09359e2c`, `55d9dab7`, `3f6e600d`: showcase docs. Nothing.
+- `d28bde8d` #1081 offline diarizer keeps overlap; `41c53ce4` #1091 Sortformer predicts every frame;
+  `392ff8f6` #1148 drains Core ML outputs per batch. **No**: the app diarizes with `Nemotron3Diarizer` only.
+- `00efd686` #1099, `d3aab8fa` #1094 CAM++ `_v2` models + per-utterance fbank mean. **No** (the app has no CAM++).
+- `fc74bdff` #1150 `ModelCache.validateCompiledModelLayout` now requires a complete `model.mil` + every
+  `@model_path/` weight (or `model.espresso.net`, or pipeline stages); a size mismatch re-downloads.
+  `96b25669` #1090 resumes interrupted downloads instead of purging. **No**: both live on `ModelHub` / the
+  managed cache; the app's directory loaders (`loadLocal`, `ParaformerModels.load`, `SenseVoiceModels.load`,
+  the Kokoro / PocketTTS flat paths) do not call them. P3 re-ran the stricter check over every shipped flat
+  folder in `/Volumes/ssd2t/fluidaudio/`: all real bundles pass.
+- `4e8b59d1` #1083 LFM3 Core AI metadata; podspec 0.18.1–0.18.3; showcase / README / CI commits. Nothing.
 
 ---
 
 ## 2. What users get from this merge
 
-- **Parakeet transcripts never show a stray `<unk>`** (#1054). Rare on v3 and Japanese, but it could appear
-  where the audio held a character the vocabulary lacks.
-- **Live dictation stops cleanly when cancelled** (#1033): a cancelled EOU session stops decoding at once
-  instead of draining queued audio first.
-- **PocketTTS reads literal `<s>` or `<unk>` in the text as text** instead of a control token (#1068).
+- **Long Parakeet transcriptions lose fewer words**: opening speech is recovered, and short pauses at window
+  seams are repaired (v3 and Japanese).
+- **Long Japanese and Chinese Cohere transcriptions keep whole sentences**: audio is cut at pauses.
+- **PocketTTS reads long sentences with better pauses**: no breaks inside numbers, abbreviations or quotes.
+- **Kokoro Mandarin reads more naturally**: word boundaries, erhua and mainland readings.
+- English PocketTTS voices and voice clones sound exactly as before (the April pack is kept on purpose).
 
-No new models, languages or voices reach users in this merge; they need app code (§6).
+## 3. Risk assessment — 6 risks (1 high, 2 medium, 3 low)
 
-## 3. Risk assessment — 5 risks (1 high, 0 medium, 4 low)
+### R1 — iOS 27 Kokoro BNNS advisory still in force; macOS cannot verify it (HIGH, unchanged)
+**Problem:** `isBnnsCrashProneOS` changed only in its comment; it is still **false on macOS 27** and true on every
+non-macOS OS ≥ 26.4, so a green macOS row says nothing about iOS 27 (#889 libBNNS `vadd_fp16_sme_internal`;
+#1103 MPSGraph abort on the GPU route). `KokoroAneComputeUnits` (`aneTailCpu` on 27) and the default fp16
+vocoder are unchanged. The chain gained a no-op pause hook and a range-based chunker. **Verify:** physical
+iOS 27 SME device, `FluidAudioKokoroAneDeviceSoakTests` (`KOKORO_SOAK=1`, about 70 min). **Status:** the
+2026-10-30 soak passed (iPhone 16 Pro Max, iOS 27.2, `aneTailCpu`, 1 348 exports). The route did not change
+in this range, so a re-soak is advised, not required.
 
-### R1 — iOS 27 Kokoro advisory still in force; macOS cannot verify it (HIGH, unchanged)
-**Problem:** `KokoroAneManager.swift` is byte-identical to tag-20261024 (P3), so `isBnnsCrashProneOS` is still
-**false on macOS 27** and true on every non-macOS OS ≥ 26.4. A green macOS row says nothing about iOS 27 (#889:
-libBNNS `vadd_fp16_sme_internal` on the Metal-free route, MPSGraph abort on the Metal route). Nothing in this
-range touches it. **Verify:** physical iOS 27 device, long English Text to Audio export. **Status (2026-10-30):
-not reproduced on an A18 Pro.** `FluidAudioKokoroAneDeviceSoakTests` (app suite, opt-in `KOKORO_SOAK=1`) ran the
-app's own `generateAudioFile` path on an iPhone 16 Pro Max, iOS 27.2, for 65 min: route as shipped
-(`aneTailCpu`: noise + tail on CPU, the rest on the ANE; no CPU-only fallback), 1 348 exports, 42 042 s
-(11.7 h) of audio at ~11.5x real time, no crash, no failed or silent export, available memory flat at
-5.56-5.89 GB. The advisory is not disproved for other chips or longer runs; re-run the soak after upgrades.
+### R2 — PocketTTS English rename (MEDIUM, fixed in the app)
+**Problem:** with the old mapping the app and the schema test asked for `.english` = `v2.1/english_2026-10`.
+The app still loaded the April files (flat, `skipDownload: true`), but cloned voices took the new reprojection
+branch: a missing-assets warning, and the regression probe ran at 0.3.
+`testPocketTTSSubpathsMatchTheEnginesOwnLayout` failed. **Fix:** row → `.english2026Apr`; the test and the
+probe resolve the language by engine layout (§5). **Verify:** `FluidAudioCatalogueSchemaTests`; P10
+`run_fluidaudio_tests.py` `fa-pocket-tts-english` (plain + cloned pass). **Status:** pending P10.
 
-### R2 — EOU `CancellationError` on cancelled tasks (LOW)
-**Problem:** #1033 makes `process(audioBuffer:)` and `finish()` throw when their task is cancelled. In
-`FluidAudioASR.finishStreaming()` a throw skips closing the stream and leaves `isStreaming` /
-`isTranscribingPublished` set. Every caller that cancels the task also calls `cancelStreaming()`, which resets
-both, and the normal Stop path never cancels before `finish()` (§5.1). **Verify:** P10
-`run_fluidaudio_tests.py` EOU row; on device, cancel keyboard dictation mid-utterance, then dictate again.
-**Status:** audited, no fix needed.
+### R3 — Parakeet long-form decoding changes (MEDIUM)
+**Problem:** #1056 / #1061 / #1098 / #1111 / #1125 / #1128 / #1143 change which text survives at seams. The gap
+floor drops from 1.5 s to 0.5 s, so there are more probe decodes. **Verify:** P10 `fa-parakeet-tdt-v3` and
+`fa-parakeet-ctc-ja` against the P1 transcripts (the probes are short, so seam logic is barely exercised);
+a long Meetings recording on device. **Status:** pending P10.
 
-### R3 — Parakeet `<unk>` filtering (LOW)
-**Problem:** #1054 changes v3 / ja text only where `<unk>` was emitted. Timings stay aligned (the parallel arrays are
-filtered together). **Verify:** P10 `fa-parakeet-tdt-v3` and `fa-parakeet-ctc-ja` vs the P1 transcripts.
-**Status:** pending P10.
+### R4 — EOU drain serialization (LOW)
+**Problem:** #1136 makes `reset()` wait for a running drain. `cancelStreaming()` → `reset()` after a feed was
+cancelled: the drain throws at its next `checkCancellation`, so the wait is bounded by one chunk. **Verify:**
+P10 EOU row; on device, cancel keyboard dictation mid-utterance, then dictate again. **Status:** audited.
 
-### R4 — PocketTTS tokenizer rewrite (LOW)
-**Problem:** #1068 rewrites the matcher (piece types, user-defined scoring, unknown penalty from the minimum
-normal-piece score). Upstream states ordinary text is token-identical for every shipped pack; the regression
-probes have no oracle (`[no oracle]` in P1). **Verify:** P10 6 PocketTTS rows (sample count / RMS close to P1).
-**Status:** pending P10.
+### R5 — PocketTTS chunker rewrite (LOW)
+**Problem:** #935 / #1121 / #1122 / #1132 change chunk boundaries, so durations shift a little. **Verify:** P10
+6 PocketTTS rows (median-of-3 duration band). **Status:** pending P10.
 
-### R5 — Trait drift (LOW, unchanged)
-**Problem:** a future upstream default-trait change could drop TTS/Diarizer silently. Not moved in this range.
-**Verify:** the app build compiles `FluidAudioKokoroAneSpeaker` and `FluidAudioDiarizer`. **Status:** P10 build.
-
-No `ModelNames` constant used by a live row changed and no catalogue `components` change is needed (P3).
+### R6 — Kokoro Mandarin phonemes (LOW)
+**Problem:** #1129 / #1130 / #1055 change zh phonemes, and `/` is a chunk boundary. **Verify:** P10
+`fa-kokoro-82m:ANE-zh`. **Status:** pending P10.
 
 ---
 
@@ -105,110 +116,89 @@ No `ModelNames` constant used by a live row changed and no catalogue `components
 
 | File | Resolution |
 |---|---|
-| `ASR/Parakeet/Streaming/EOU/StreamingEouAsrManager.swift` | Upstream added 3 `try Task.checkCancellation()` lines (#1033); the fork's per-utterance EOU reset (2 markers) is intact |
-| `ModelNames.swift` | Additive upstream entries only; `Repo.overrideFolderNames` and the `folderName` override check intact |
-| `TTS/KokoroAne/Assets/KokoroAneResourceDownloader.swift` | `ensureEnglishLexicon(british:)` picks `gb_` / `us_lexicon_cache.json`; the fork's flat-lookup-then-nil gate uses that filename, so it holds for both (only Paradee passes `british: true`). 14 markers intact |
+| `TTS/KokoroAne/Assets/KokoroAneResourceDownloader.swift` | Upstream added `additionalModelNames` (fp32 vocoder); the explicit-directory short-circuit still runs first |
+| `TTS/PocketTTS/Assets/PocketTtsResourceDownloader.swift` | Gate is now `reprojectsSharedEncoder`; the flat return and the `skipDownload` throw both still come before any fetch |
+| `TTS/PocketTTS/Pipeline/PocketTtsModelStore.swift`, `PocketTtsManager.swift` | `isEnglish`; temperature default `nil` → pack default. Patches intact |
+| `ASR/Parakeet/Streaming/EOU/StreamingEouAsrManager.swift` | Both per-utterance EOU markers intact beside upstream's opt-in `rearm()` and serialized drain |
 
-**Inventory:** 13 files, **49 → 49** markers (`git grep -c "wangqi modified"` at `925f32f4` and the merged tree
-match file by file). The other 10 patched files and both manifests are byte-identical to `925f32f4`.
-Nothing absorbed, nothing added in the merge.
-
-**Added after the run (2026-10-30), `VAD/VadManager.swift`, 1 marker:** `VadManager(modelDirectory:)` now
-loads `silero-vad-unified-256ms-v6.2.1.mlmodelc` from that folder directly. Before, the 2026-03-28 patch only
-skipped `Models/`, and `ModelHub.loadModels` still appended `Repo.vad.folderName` (`silero-vad`), found
-nothing, and downloaded a second copy from upstream HuggingFace into `<folder>/silero-vad/`. That was a hidden
-network path in the app (a duplicate copy dated 2026-10-07 sat in the iCloud models folder; offline, VAD failed
-to load) and was the "standing" `fa-silero-vad` FAIL (the regression stage folder is not writable).
+**Inventory:** 13 source files, **55 → 55** markers (P3, `git grep -c "wangqi modified"` at `dcf2ea9b` vs the
+merge). The other 8 patched files (`ModelNames` overrides, G2P, MultilingualG2P, VadManager, TtsCacheDirectory,
+PocketTtsSmall) are not in the merge diff. Nothing absorbed, nothing added.
 
 ### Dependencies
 
-No dependency move. Both manifests keep the fork's Swift 5 language mode; TTS/Diarizer traits default-on.
+No dependency move. `Package.swift` / `Package@swift-6.2.swift` unchanged (Swift 5 mode, TTS/Diarizer traits on).
 
 ---
 
 ## 5. `libs/audio/fluidaudio/` audit
 
-What the app calls, checked against the merged sources. **No consumer fix**: every call compiles unchanged and no
-behaviour change needs app code. No app code switches exhaustively over `AsrModelVersion` (grew `.phonon25`,
-`.bark3`, `.bark3Clean`) or `ParadeeVariant`. `FluidAudioModelManager` does not import FluidAudio.
-
 | Symbol the app calls | Change | Our usage / fix |
 |---|---|---|
-| `AsrModels.loadLocal(from:version:)`, `AsrManager.transcribe(_:decoderState:)` | `<unk>` dropped from text / timings (#1054); placement unchanged for `.v3` / `.tdtJa` | none |
-| `StreamingEouAsrManager(configuration:chunkSize:)`, `loadModels(from:)`, `reset()`, `process(audioBuffer:)`, `finish()`, callbacks | `process` / `finish` throw `CancellationError` on a cancelled task (#1033) | none (§5.1) |
-| `CoherePipeline`, `ParaformerModels`, `SenseVoiceModels`, `VadManager`, `Nemotron3Models` / `Nemotron3Diarizer` | Unchanged (`AudioMelSpectrogram` gained defaulted parameters only) | none |
-| `KokoroAneManager`, `KokoroAneConstants`, `TtsCacheDirectory.overrideDirectory` | Unchanged; English phonemizer `british:` defaults `false` | none |
-| `PocketTtsManager(language:directory:skipDownload:)`, `synthesize(...)`, `PocketTtsResourceDownloader.ensureMimiEncoder` | Tokenizer edge case (#1068) | none |
-| `ASRResult` (FluidAudio) / `TextNormalizer.shared` (ITNHelper) | `ctcReplacements` added, defaulted `nil` | none |
+| `PocketTtsManager(language:directory:skipDownload:)` | `.english` now = `v2.1/english_2026-10` | **Fixed**: `FluidAudioPocketTTSSpeaker.pocketTtsLanguage(from:)` returns `.english2026Apr` for `fa-pocket-tts-english` (was `.english`) |
+| `PocketTtsManager.synthesize(text:voice:/voiceData:temperature:)` | `temperature: Float?` (nil → pack default) | none: the app passes its setting (default 0.7) |
+| `PocketTtsResourceDownloader.ensureMimiEncoder`, `cloneVoice`, `save/loadClonedVoice` | `.english2026Apr` uses the shared encoder, no reprojection (same as the old `.english`) | none |
+| `KokoroAneManager(variant:defaultVoice:directory:computeUnits:)`, `initialize`, `synthesize(text:voice:speed:)` | New defaulted `vocoderPrecision:` (.float16); no-op pauses; range chunker | none |
+| `AsrModels.loadLocal(from:version:)`, `AsrManager()`, `transcribe(_:decoderState:)` | Long-form seam / opening repairs; `ASRConfig` defaulted additions | none |
+| `StreamingEouAsrManager` `reset` / `process` / `finish` | Serialized drains; `rearm` opt-in | none |
+| `CoherePipeline.transcribeLong` | ja / zh pause chunks | none |
+| `ParaformerModels.load`, `SenseVoiceModels.load`, `SenseVoiceManager.transcribeDetailed` | SenseVoice tag scores, padding | none |
+| `Nemotron3Models` / `Nemotron3Diarizer`, `VadManager(modelDirectory:)`, `PocketTtsSmallManager`, `TextNormalizer` | Unchanged | none |
 
-### 5.1 EOU stop paths and #1033
+No app code switches exhaustively over `PocketTtsLanguage` (new `.english2026Apr`) or the new
+`KokoroAneVocoderPrecision` / `AudioConverter.ResamplerQuality`. `FluidAudioModelManager` does not import
+FluidAudio; `SpeechHelper.createFluidAudioSpeaker` / `makeJobSpeaker` dispatch by model id and are unaffected.
 
-`FluidAudioASR.feedAudio` → `mgr.process`, `finishStreaming` → `mgr.finish()`. Callers:
-- **Keyboard** (`apps/keyboard/KeyboardSessionHandler.swift`): Stop finishes the feed continuation; the consumer
-  drains and calls `finishStreaming` uncancelled, so `.final` arrives as before. Cancel / expiry cancels the
-  consumer, then calls `cancelStreaming()`; `finishStreaming` is under `try?`, so the error is swallowed and
-  state resets. A feed in flight at that moment now logs `streaming feed error: CancellationError` at
-  **warning** level (new, cosmetic).
-- **Werewolf dictation**: Stop finishes the feed; the feed task is never cancelled (the 3 s wait cancels only
-  its own group children). `finishStreaming` is under `try?`. No effect.
-- **ASR test view** (`views/audio/ASRPlayTestView.swift`): Stop finishes the feed, uncancelled. Cancel
-  (`onDisappear`, `cleanupStreamingEngine`) cancels first and checks `Task.isCancelled` before finishing; only a
-  cancel landing *inside* `finish()` reaches its `transcribeError`, and that happens only from `onDisappear`,
-  when the view is gone. The `cleanupStreamingEngine` callers are start-failure paths, before any finish.
-
-No error reaches the user, so per the brief no fix was made. Optional hardening (not built): in
-`FluidAudioASR.finishStreaming`, catch `CancellationError` and close the stream like `cancelStreaming()`, and
-in `feedAudio` rethrow it without the callers' warning.
+**Tests changed:** `FluidAudioCatalogueSchemaTests.testPocketTTSSubpathsMatchTheEnginesOwnLayout` resolves the
+pack as the one `PocketTtsLanguage` whose `repoSubdirectory` is the subpath's tail. Exactly one must match,
+so a wrong or ambiguous subpath still fails. `FluidAudioCatalogueRegressionTests.probePocketTTS` maps
+`FLUIDTEST_LANGUAGE` (the pack folder) the same way, and runs the cloned pass for both English cases.
 
 ---
 
 ## 6. New models that would need new app code
 
-Sizes are HuggingFace tree sums (2026-10-30); "load set" is the compiled subset the loader opens.
-
 | Model | Size | New class? | Upstream API it would wrap |
 |---|---|---|---|
-| **Gradium Phonon 31m** (#1053, English, Apache-2.0, iOS 18 / macOS 15) | `pocket-tts-coreml/phonon/phonon-31m-en` 667 MB tree; **load set 126 files, 173 MB** (`pocket_state.mlmodelc` 80 MB, `mimi_decoder.mlmodelc` 45 MB fp32, `arch.json`, `pocket_state.json`, `constants_bin/`, `voices/` 26 MB) | **Yes: `FluidAudioPocketTTSSmallSpeaker`** (+ SpeakerType case + catalogue row). Reported, not built | `PocketTtsSmallManager(model: .phonon31m)`, **`load(from:)`** (local, no network) + `synthesize` / `makeSession` streaming, `availableVoices()`. 4 KV-snapshot voices in `constants_bin/` (`default`, `en_gb_Maeve`, `en_us_Easton`, `en_us_Zoey`) + ~120 conditioning voices in `voices/*.safetensors`. No cloning. `initialize()` downloads via `ModelHub` with **no offline gate** (the fork's `skipDownload` covers only `PocketTtsManager`), so never call it |
-| **LFM3-Audio-2B** (#1076, ASR + live ASR + TTS) | `lfm3-audio-2b-coreml` 4.8 GB (`coreml/` 2.3 GB, `ane/` 1.8 GB, root assets 0.7 GB; the Core ML pack ~3.3 GB); `lfm3-audio-2b-coreai` 2.4 GB | **Yes**: an ASR class (`FluidAudioLFM3ASR`) and a speaker (`FluidAudioLFM3Speaker`), or one class for both. Over the 700 MB ASR / 1000 MB TTS caps | `LFM3AudioManager` (`transcribe`, `startLiveTranscription`, speech), `LFM3AudioModels.load`; GPU, foreground only |
-| **Phonon-2.5** multilingual (#1075) | `Muesli-HQ/phonon-2.5-coreml@a042ef89` 290 MB; ~480 MB peak | **No**: a `FluidAudioASR` branch + `repoMap` + row | `AsrModels.loadLocal(from:version: .phonon25)`; encoder `.cpuAndGPU` only (ANE throws), so **not background-safe** |
-| **Underdog Bark 3.0 / 3.0 Clean** (#1054, English, verbatim / no fillers) | `bark-3.0-coreml/bark-3.0` 689 MB, `bark-3.0-clean` 700 MB (whole subfolder) | **No**: same branch as Phonon-2.5 | `loadLocal(version: .bark3 / .bark3Clean)`, iOS 18+ |
-| **Nemotron Unified ASR 0.6B** (#1071, 25 European languages) | repo 14.4 GB; offline int8 load set ≈ 625 MB (`encoder_int8` 600 + decoder 18 + joint 7), fp16 ≈ 1.2 GB; streaming encoders ~595 MB int8 each | **Yes**: `FluidAudioUnifiedASR` (the app has no Unified manager wrapper) | `UnifiedAsrManager` / `StreamingUnifiedAsrManager` with `UnifiedConfig` |
-| **Nemotron 3.5 Transcribe Lite** (#1069) | repo 6.5 GB; Core ML load ≈ 1.36 GB (`lite_encoder_w48` 1263 + `lite_ctc_head_w48` 101); Core AI `lite_ctc_gpu.aimodel` 1.36 GB | **Yes**: `FluidAudioNemotronLiteASR`. Over the 700 MB ASR cap | `NemotronTranscribeLiteManager` (+ `NemotronTranscribeLiteSpeakers` with the shipped Nemotron-3 diarizer) |
-| **Paradee-8M v1.2** (#1073, 4 voices incl. 2 British) | `v1.2/int8` 12 MB, `v1.2/fp32` 35 MB; British voices also need `gb_lexicon_cache.json` | **Yes**: `FluidAudioParadeeSpeaker` | `ParadeeManager(version: .v12, variant:directory:)`, `synthesize(text:voice:)` |
+| **Kyutai PocketTTS English 2026-10** (#1089) | one `v2.1/<lang>` pack (same layout as April) + root `encoder_recover_pinv.bin` | **No**: a new row (`fa-pocket-tts-english-2026-10`) + a `-2026-10` suffix in `pocketTtsLanguage(from:)` | `PocketTtsManager(language: .english, …)`; cloning re-projects (`speaker_proj_weight.bin`, `encoder_recover_pinv.bin`) |
+| **Nemotron multilingual streaming** (`encoder_v2` #1145, split encoder #1142) | per tier: `encoder_v2.mlmodelc` in `encoder-v2/<tier>ms/` | **Yes**: `FluidAudioNemotronStreamingASR` (the app has no Nemotron streaming wrapper) | `StreamingNemotronMultilingualAsrManager`, `loadModels(from:splitEncoderDirectory:)` |
+| **CAM++ `_v2`** (#1099) | `CamPlusPreprocessor_v2` + `CamPlusPlus_v2` | **Yes**: a speaker-embedding class (e.g. `FluidAudioSpeakerEmbedder`) if speaker ID is ever wanted | `CampPlusEmbedder` / `CampPlusModels` |
 
-Carried from tag-20261024, still not built: Phonon-2, Parakeet Ultra / Redux (`FluidAudioASR` branch);
-Canary translation (new class); PocketTTS small 18m/7m/2m (same new speaker as Phonon 31m); Kokoro ANE-v3;
-Supertonic-3 v2.
+Carried from tag-20261030, still not built: PocketTTS small 18m/7m/2m (rows only, now that
+`FluidAudioPocketTTSSmallSpeaker` ships `fa-pocket-small-phonon-31m`), LFM3-Audio-2B (over cap),
+Phonon-2.5 and Bark 3.0 / 3.0 Clean (`FluidAudioASR` branch), Nemotron Unified 0.6B (`FluidAudioUnifiedASR`),
+Nemotron 3.5 Lite (over cap), Paradee v1.2 (`FluidAudioParadeeSpeaker`), Canary, Kokoro ANE-v3, Supertonic-3 v2.
 
-Opportunities (not built): Phonon-2.5 as a faster multilingual Parakeet for foreground transcription; Bark 3.0
-Clean for Meetings transcripts without fillers; the Nemotron Unified int8 encoder as a 25-language ASR within the
-cap; Paradee v1.2 as a 12 MB English voice for low-memory devices; `ctcReplacements` if custom vocabulary is ever
-added.
+## 7. Opportunities (not built)
 
----
+| Upstream feature | Consumer that would use it | Value |
+|---|---|---|
+| `vocoderPrecision: .float32` (`KokoroVocoder_v2.mlmodelc`, 47 MB per variant folder) | `FluidAudioKokoroAneSpeaker` on SME chips | Fixes the robotic first second of long utterances on A19 Pro / A20 / M5. The vocoder takes ~2.8x longer (0.53 → 1.49 s per 23.6 s of audio on an iPhone 17 Pro Max). Needs the file in `ANE/`, `ANE-ja/`, `ANE-zh/` on the mirror and a device soak |
+| `setPunctuationPauses(_:)` | Kokoro Mandarin (`、` `，` get 50–125 ms) | Natural pauses for zh long-form / Text to Audio |
+| EOU `rearm(keepTranscript:)` | `FluidAudioASR` streaming (keyboard dictation) | Could replace the fork's per-utterance EOU patch with the upstream API |
+| SenseVoice emotion / event tags | Meetings | Emotion / laughter / applause markers |
+| PocketTTS English 2026-10 | new row | Reads sentence-final numbers and years; new voice `daan` |
 
-## 7. Deliberately not adopted
+## 8. Deliberately not adopted
 
 | Upstream addition | Why not |
 |---|---|
-| Phonon 31m, Paradee v1.2, LFM3-Audio, Nemotron Unified, Nemotron 3.5 Lite, Phonon-2.5, Bark 3.0 | Need new app code / catalogue rows (§6); out of scope for an engine upgrade |
-| Vocabulary boosting thresholds, rescoring fixes, `ctcReplacements`, CTC mel on CPU | The app configures no custom vocabulary |
-| Sliding-window token-revision stream (#1035) | The app streams with EOU, not `SlidingWindowAsrManager` |
+| `.english` → `english_2026-10` for the existing `fa-pocket-tts-english` row | It would change what an installed row means: the files on disk are the April pack, while `.english` asks for 2026-10 behaviour (temperature 0.3 by default, re-projected clones that need assets the row does not ship). New weights would need new mirror files and a re-download. Kept on `.english2026Apr` (option A). **Option B, a candidate for P8:** an additive row `fa-pocket-tts-english-2026-10`, `repo_subpath pocket-tts-coreml/v2.1/english_2026-10`. Mirror additions (none uploaded yet): `v2.1/english_2026-10/{cond_prefill,flow_decoder_fused,flowlm_step,mimi_decoder}.mlmodelc`, `constants_bin/*` (incl. `speaker_proj_weight.bin`, voice `daan`), `manifest.json`, and the root `pocket-tts-coreml/encoder_recover_pinv.bin`. Needs a quality check vs April |
+| fp32 Kokoro vocoder | Opt-in upstream; needs mirror files and an iOS 27 soak (§7) |
+| Nemotron multilingual encoder_v2 / split, CAM++ v2, vocabulary boosting fixes, raw encoder callback, resampler quality | No consumer in the app |
 
 ---
 
-## 8. Verification
+## 9. Verification
 
 | Check | Result |
 |---|---|
-| P1 baseline (`run_fluidaudio_tests.py`) | 18 passed, 1 failed, 0 skipped; standing FAIL `fa-silero-vad` (permission error saving into the staged folder, doc OPEN) |
-| P3 patch audit | 49 / 13 files intact; no shipped `ModelNames` change; no new network path on a shipped variant |
-| `swift build` (fork, P3) | Skipped (cold build during a running sweep); covered by the app build |
-| App builds (P5 macOS, P10 iOS) | Both BUILD SUCCEEDED |
-| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | All passed |
-| `run_fluidaudio_tests.py --compare <P1>` (`fluidaudio-20261030-180721`) | 17 passed, 2 failed. `fa-silero-vad` = the standing baseline FAIL. `fa-pocket-tts-english` 3.12 s vs 2.48 s (25 %, band 20 %): two reruns gave 2.64 s and 2.80 s, both PASS; PocketTTS sampling varies run to run (Spanish 3.12 s → 3.60 s in the same pair), so not a regression |
-| After the run: VadManager patch + PocketTTS median-of-3 probe (`fluidaudio-20261030-193624`) | **19 passed, 0 failed.** Temperature 0 was tried for PocketTTS first and rejected: deterministic, but French gave 9.4 s of near-silence and Spanish ran 3x long |
-| iOS 27 Kokoro soak (`FluidAudioKokoroAneDeviceSoakTests`, iPhone 16 Pro Max, iOS 27.2) | PASS, 65 min, 1 348 exports, no crash (R1) |
+| P3 patch audit | 13 files / 55 markers intact; no new network path on a shipped row; `ModelNames` change on a shipped row only via `PocketTtsLanguage.english` (handled) |
+| `swift build` (fork, P3 and P6) | Build complete, 0 errors |
+| App builds (P5 macOS, P10 iOS) | pending |
+| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | pending (the schema suite fails without the §5 test change) |
+| `run_fluidaudio_tests.py --compare <P1>` | pending P10 |
+| iOS 27 Kokoro soak | not re-run; the route is unchanged since the 2026-10-30 PASS (R1) |
 
-**macOS cannot verify:** the iOS 27 Kokoro advisory (R1; checked on device since, see above); keyboard
-dictation cancel on device (R2); background (ANE-only) behaviour of every row.
+**macOS cannot verify:** the iOS 27 Kokoro BNNS advisory (R1); the SME robotic-onset bug (A19 Pro / A20 / M5,
+also M5 Macs); keyboard dictation cancel on device (R4); background (ANE-only) behaviour of every row.
