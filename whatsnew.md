@@ -195,9 +195,10 @@ Nemotron 3.5 Lite (over cap), Paradee v1.2 (`FluidAudioParadeeSpeaker`), Canary,
 |---|---|
 | P3 patch audit | 13 files / 55 markers intact; no new network path on a shipped row; `ModelNames` change on a shipped row only via `PocketTtsLanguage.english` (handled) |
 | `swift build` (fork, P3 and P6) | Build complete, 0 errors |
-| App builds (P5 macOS, P10 iOS) | pending |
-| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | pending (the schema suite fails without the §5 test change) |
-| `run_fluidaudio_tests.py --compare <P1>` | pending P10 |
+| App builds (P5 macOS, P10 iOS) | macOS app build green; iOS test build (`run_tests.sh --build`, slot 9) green |
+| `FluidAudioCatalogueSchemaTests`, `FluidAudioASRDispatchTests` | 13/13 and 11/11 pass (with the §5 test change) |
+| `run_fluidaudio_tests.py --compare <P1>` | 20/1/0 first run (`fluidaudio-20261113-184104`); the one FAIL, `fa-pocket-tts-italian` RMS 40% over a single-take P1 value 0.05447, was sampling noise (old-engine history 0.0447-0.1078). Probe now records the median RMS of its 3 takes; three new-engine runs 0.07758 / 0.0819 / 0.08085 sit within 4.9% of the old-engine history median 0.07706, accepted as the new baseline (`fluidaudio-20261113-184820`, advisor decision). All other 20 rows unchanged. |
+| Voice sweeps (`voice_sweep.py`) | PocketTTS en (April pack) / fr / de / it / pt / es 26/26 each; Kokoro ANE Mandarin 103/103; Kokoro ANE Japanese 4/5, `jf_tebukuro` 0/3 as on 2026-11-07 (already excluded from the row) |
 | iOS 27 Kokoro soak | not re-run; the route is unchanged since the 2026-10-30 PASS (R1) |
 
 **macOS cannot verify:** the iOS 27 Kokoro BNNS advisory (R1); the SME robotic-onset bug (A19 Pro / A20 / M5,
